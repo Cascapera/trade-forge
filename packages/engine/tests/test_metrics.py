@@ -166,3 +166,30 @@ def test_long_and_short_trades_are_counted_separately() -> None:
     assert metrics.long_trades == 1
     assert metrics.short_trades == 1
     assert metrics.total_trades == 2
+
+
+def test_the_first_close_at_or_below_zero_is_where_the_account_was_ruined() -> None:
+    """02/10: an account can go below zero — a crypto spread wider than an M5 stop lost more than
+    the account in one trade. It is recorded, with a drawdown past 100 %, never refused."""
+    curve = a_curve("10000", "4000", "-1500", "-1500")
+
+    metrics = compute_metrics(trades=[], equity_curve=curve, initial_capital=Decimal(10_000))
+
+    assert metrics.ruined_at == curve[2].time
+    assert metrics.max_drawdown_pct == Decimal("1.15")
+
+
+def test_an_account_that_never_reached_zero_was_never_ruined() -> None:
+    metrics = compute_metrics(
+        trades=[], equity_curve=a_curve("10000", "1", "5000"), initial_capital=Decimal(10_000)
+    )
+
+    assert metrics.ruined_at is None
+
+
+def test_exactly_zero_is_ruined() -> None:
+    metrics = compute_metrics(
+        trades=[], equity_curve=a_curve("10000", "0"), initial_capital=Decimal(10_000)
+    )
+
+    assert metrics.ruined_at == a_curve("10000", "0")[1].time

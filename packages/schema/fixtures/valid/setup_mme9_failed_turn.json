@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "name": "9.4 — a falha da virada",
+  "description": "A correcao derruba a MME9 por UMA barra e a seguinte a devolve sem perder a minima da primeira. Compra no rompimento da maxima da barra que devolveu, stop sob a minima da que falhou.",
+  "timeframe": "H1",
+  "setup": {
+    "type": "mme9_failed_turn",
+    "params": {
+      "side": "long",
+      "period": 9,
+      "stop_buffer_ticks": 0,
+      "breakeven_at_r": null
+    }
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 1 } }
+  }
+}

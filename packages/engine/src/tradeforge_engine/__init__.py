@@ -19,7 +19,14 @@ Three invariants hold here and are enforced by tests (AGENTS.md §5):
 """
 
 from tradeforge_engine.backtest_broker import BacktestBroker
-from tradeforge_engine.costs import CommissionCostModel, NoCostModel, SpreadCostModel
+from tradeforge_engine.costs import (
+    BarSpreadCostModel,
+    CombinedCostModel,
+    CommissionCostModel,
+    NoCostModel,
+    ProportionalSpreadCostModel,
+    SpreadCostModel,
+)
 from tradeforge_engine.domain import (
     AccountState,
     AssetClass,
@@ -41,7 +48,7 @@ from tradeforge_engine.domain import (
 )
 from tradeforge_engine.errors import EngineError, LookaheadError
 from tradeforge_engine.indicators import EMA, SMA, build_indicator
-from tradeforge_engine.loop import RunResult, run
+from tradeforge_engine.loop import BarOutcome, RunResult, iter_run, run
 from tradeforge_engine.metrics import BacktestMetrics, compute_metrics
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.protocols import (
@@ -54,6 +61,8 @@ from tradeforge_engine.protocols import (
 )
 from tradeforge_engine.risk import PercentRiskManager
 from tradeforge_engine.strategy import CompiledStrategy, compile_strategy
+from tradeforge_engine.swap import SwapRates
+from tradeforge_engine.warmup import HandOver, hand_over, unwarmed_indicators
 
 __all__ = [
     "EMA",
@@ -62,9 +71,12 @@ __all__ = [
     "AssetClass",
     "BacktestBroker",
     "BacktestMetrics",
+    "BarOutcome",
+    "BarSpreadCostModel",
     "Broker",
     "Candle",
     "ClosedTrade",
+    "CombinedCostModel",
     "CommissionCostModel",
     "CompiledStrategy",
     "Condition",
@@ -74,6 +86,7 @@ __all__ = [
     "EquityPoint",
     "EvalContext",
     "Fill",
+    "HandOver",
     "Indicator",
     "InstrumentSpec",
     "LookaheadError",
@@ -84,6 +97,7 @@ __all__ = [
     "PercentRiskManager",
     "Portfolio",
     "Position",
+    "ProportionalSpreadCostModel",
     "RiskManager",
     "RunResult",
     "Side",
@@ -91,12 +105,20 @@ __all__ = [
     "SignalKind",
     "SpreadCostModel",
     "Strategy",
+    "SwapRates",
     "Volume",
     "__version__",
     "build_indicator",
     "compile_strategy",
     "compute_metrics",
+    "hand_over",
+    "iter_run",
     "run",
+    "unwarmed_indicators",
 ]
 
-__version__ = "0.1.0"
+# ⚠️ **Raised by every change that can move a result** (28/09). A finished run is reused for a new
+# one only under the same version (`tradeforge_api.reuse`), so a fix that changes a trade and keeps
+# the number would hand back results the engine no longer gives. It sat at 0.1.0 from July to
+# 28/09 through many such fixes; nothing run under 0.1.0 is reused.
+__version__ = "0.7.0"

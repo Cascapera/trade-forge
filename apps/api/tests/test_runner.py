@@ -7,15 +7,28 @@ up in milliseconds without Postgres or arq.
 """
 
 import datetime as dt
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
-from tradeforge_api.runner import execute_backtest
-from tradeforge_db.models import Instrument
-from tradeforge_engine import BacktestMetrics as EngineMetrics
-from tradeforge_engine.domain import AssetClass, Candle, ClosedTrade
-from tradeforge_engine.testing import bar
+from tradeforge_api import runner
+from tradeforge_api.runner import (
+    BatchRun,
+    CandleWindow,
+    Measured,
+    execute_backtest,
+    execute_batch,
+    instrument_spec,
+    spec_document,
+    spec_for,
+    swap_rates,
+)
+from tradeforge_db.models import Backtest, Instrument
+from tradeforge_engine import compile_strategy
+from tradeforge_engine.domain import AssetClass, Candle
+from tradeforge_engine.errors import EngineError
+from tradeforge_engine.testing import BULLISH_START_EMA3, bar
 
 START = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 HOUR = dt.timedelta(hours=1)
@@ -34,6 +47,7 @@ def an_instrument() -> Instrument:
         tick_value=Decimal("1"),
         contract_size=Decimal("100000"),
         digits=5,
+        server_offset=dt.timedelta(0),
     )
 
 
@@ -81,10 +95,10 @@ def ma_cross() -> dict[str, object]:
     }
 
 
-def run_it(**overrides: object) -> tuple[list[ClosedTrade], EngineMetrics]:
+def run_it(**overrides: object) -> Measured:
     kwargs: dict[str, object] = {
         "definition": ma_cross(),
-        "instrument": an_instrument(),
+        "instrument": instrument_spec(an_instrument()),
         "timeframe": "H1",
         "date_from": START,
         "date_to": START + 100 * HOUR,
@@ -98,7 +112,7 @@ def run_it(**overrides: object) -> tuple[list[ClosedTrade], EngineMetrics]:
 
 
 def test_a_crossover_series_produces_a_trade_and_coherent_metrics() -> None:
-    trades, metrics = run_it()
+    trades, metrics, _, _ = run_it()
     assert metrics.total_trades == len(trades)
     assert metrics.total_trades >= 1
     # Reconciliation is the engine's own invariant; here we only assert the metrics summarise the
@@ -106,19 +120,107 @@ def test_a_crossover_series_produces_a_trade_and_coherent_metrics() -> None:
     assert metrics.long_trades + metrics.short_trades == metrics.total_trades
 
 
-def test_the_window_excludes_candles_outside_the_dates() -> None:
-    """A date range that ends before the series starts yields no candles — a valid, empty run."""
-    trades, metrics = run_it(date_from=START - 10 * HOUR, date_to=START - 5 * HOUR)
+def test_a_window_containing_no_candles_is_refused() -> None:
+    """This reverses an earlier decision, deliberately.
+
+    A range outside the series used to be "a valid, empty run": `done`, every metric zero.
+    But that is byte for byte what a run whose strategy found no setups looks like, and the
+    two need opposite responses — collect the data, versus nothing to do. A screen full of
+    zeroes cannot say which, so the run refuses instead and names the coverage it does have.
+    """
+    with pytest.raises(LookupError, match="contains none of it"):
+        run_it(date_from=START - 10 * HOUR, date_to=START - 5 * HOUR)
+
+
+def test_the_refusal_names_the_coverage_that_does_exist() -> None:
+    """ "No data" is a dead end; "I have January to March" is the next command to type."""
+    with pytest.raises(LookupError, match="2024-01-01"):
+        run_it(date_from=START - 10 * HOUR, date_to=START - 5 * HOUR)
+
+
+def test_a_symbol_with_nothing_collected_is_a_different_message() -> None:
+    """Empty dataset and empty window are different faults with different fixes."""
+    with pytest.raises(LookupError, match="no candles have been collected"):
+        run_it(candles=[])
+
+
+def test_a_window_full_of_candles_that_produces_no_trades_still_succeeds() -> None:
+    """The line is drawn at candles, not at trades.
+
+    A strategy that legitimately finds nothing is an answer, and must not be reported as a
+    failure — otherwise "my filter is too strict" becomes indistinguishable from an outage.
+    """
+    flat = [bar(index, open_="1.10000", close="1.10000") for index in range(10)]
+
+    trades, metrics, window, _ = run_it(candles=flat, date_to=START + 9 * HOUR)
+
     assert trades == []
     assert metrics.total_trades == 0
+    assert window.candles == 10
+
+
+def test_the_run_reports_the_window_it_actually_read() -> None:
+    """Asking for more than the dataset holds must not be recorded as if it had it."""
+    _, _, window, _ = run_it(date_from=START - 50 * HOUR, date_to=START + 500 * HOUR)
+
+    series = dip_then_rally()
+    assert window == CandleWindow(len(series), series[0].time, series[-1].time)
 
 
 def test_a_spread_cost_model_eats_into_the_result() -> None:
     """The same run with a spread nets less than costless — proof the cost model is wired, not
     ignored."""
-    _, costless = run_it(cost_model={"type": "none"})
-    _, spread = run_it(cost_model={"type": "spread", "spread_points": 20})
+    _, costless, _, _ = run_it(cost_model={"type": "none"})
+    _, spread, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
     assert spread.net_profit < costless.net_profit
+
+
+def test_a_spread_and_commission_model_charges_exactly_both() -> None:
+    """A raw-spread account pays the spread and a commission per lot (24/09). Charged together, each
+    trade costs exactly what the spread alone and the commission alone cost it — so a model that
+    read one figure for the other, 7 points of spread and $20 a lot, is caught (engine-guardian)."""
+    spread_trades, _, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
+    commission_trades, _, _, _ = run_it(cost_model={"type": "commission", "commission_per_unit": 7})
+    both_trades, _, _, _ = run_it(
+        cost_model={"type": "spread_commission", "spread_points": 20, "commission_per_unit": 7}
+    )
+
+    assert both_trades
+    assert [trade.costs for trade in both_trades] == [
+        spread.costs + commission.costs
+        for spread, commission in zip(spread_trades, commission_trades, strict=True)
+    ]
+
+
+def test_a_spread_quoted_at_a_price_is_charged_in_proportion() -> None:
+    """02/10: a crypto's spread scales with the price (`ProportionalSpreadCostModel`). Quoted at
+    twice the run's prices, it charges half of what the same points charge flat."""
+    flat, _, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20})
+    reference = dip_then_rally()[0].close * 2
+    scaled, _, _, _ = run_it(
+        cost_model={
+            "type": "spread",
+            "spread_points": 20,
+            "spread_reference_price": str(reference),
+        }
+    )
+    # A raw-spread crypto account pays its commission too, on each leg (engine-guardian, 02/10).
+    commissioned, _, _, _ = run_it(
+        cost_model={
+            "type": "spread_commission",
+            "spread_points": 20,
+            "commission_per_unit": 7,
+            "spread_reference_price": str(reference),
+        }
+    )
+
+    assert scaled
+    for one, other in zip(scaled, flat, strict=True):
+        assert one.costs < other.costs
+        assert one.costs > other.costs / 3
+    assert [trade.costs for trade in commissioned] == [
+        trade.costs + 2 * 7 * trade.volume for trade in scaled
+    ]
 
 
 def test_an_unknown_cost_model_raises() -> None:
@@ -136,3 +238,345 @@ def test_a_strategy_without_percent_risk_sizing_raises() -> None:
     definition["risk"] = {}
     with pytest.raises(ValueError, match="percent_risk sizing"):
         run_it(definition=definition)
+
+
+# --------------------------------------------------------------------------- #
+# Setup documents: the other shape the runner has to drive (ADR-0019)           #
+# --------------------------------------------------------------------------- #
+
+
+def a_stock() -> Instrument:
+    """A one-cent instrument, because the setup golden below is written in whole dollars."""
+    return Instrument(
+        symbol="AAPL",
+        name="Apple Inc.",
+        asset_class=AssetClass.STOCK,
+        currency_quote="USD",
+        tick_size=Decimal("0.01"),
+        tick_value=Decimal("0.01"),
+        contract_size=Decimal("1"),
+        digits=2,
+        server_offset=dt.timedelta(0),
+    )
+
+
+# How far behind bar 0 the golden reaches, and therefore where its window has to start.
+#
+# `run_it` defaults `date_from` to `START`, which is bar 0 — and the window added in PR-217 is a
+# real filter, not a label: left at the default it would drop every warm-up bar, the setup would
+# enter at 114 and never be conducted, and the trade these tests assert on would not exist.
+#
+# Derived from the warm-up rather than written as a number, so that a ninth bar cannot shift the
+# whole numbering in silence and surface as an unrelated golden failing.
+_GOLDEN_FROM = START - len(BULLISH_START_EMA3) * HOUR
+
+
+def pullback_to_the_average() -> list[Candle]:
+    """The Ponto Contínuo golden from the engine's own suite, candle for candle.
+
+    Two corrections (bars 4 and 5) take price back to the average; bar 6 touches it at 111 and
+    closes at 113.5 above it, so the order rests at its high of 114 and bar 7 fills there. The
+    first break of structure takes the stop to breakeven; the second trails it to the leg origin
+    at 116; bar 16 comes back and takes it.
+
+    The structure warm-up in front is `BULLISH_START_EMA3`, the shared one, taken as candles
+    rather than re-typed as levels: this file is the third place those eight bars would otherwise
+    have been written out, and two of them are enough to drift. The setup is conducted
+    structurally and `MarketStructure` begins at the indicator's `DIR = -1`, so without an uptrend
+    to break this stream would enter at 114 exactly as it does and then never be conducted — the
+    trade the assertions below are about would not exist.
+    """
+    levels = [
+        ("99", "100", "100.5", "98.5"),
+        ("100", "104", "104.5", "100"),
+        ("104", "108", "108.5", "104"),
+        ("110", "114", "115", "110"),
+        ("113.5", "113", "114", "108"),
+        ("113", "112.5", "113.5", "107"),
+        ("112", "113.5", "114", "111"),
+        ("114", "115.5", "116", "113"),
+        ("115.5", "116", "117", "115"),
+        ("116", "115", "116.5", "114.2"),
+        ("115", "116.5", "117.5", "115"),
+        ("117", "118", "118.5", "116.5"),
+        ("118", "119", "119.5", "117.5"),
+        ("119", "118", "119", "116.5"),
+        ("118", "117.5", "118.5", "116"),
+        ("117.5", "120", "121", "117"),
+        ("120", "115.5", "120.5", "115"),
+    ]
+    return [
+        *BULLISH_START_EMA3,
+        *(
+            bar(index, open_=open_, close=close, high=high, low=low)
+            for index, (open_, close, high, low) in enumerate(levels)
+        ),
+    ]
+
+
+def ponto_continuo(**params: object) -> dict[str, object]:
+    """A document that *names* a strategy instead of describing it. Note what is missing:
+    no `indicators`, no `entry`, and no `exit.stop_loss` — the setup owns all three."""
+    return {
+        "schema_version": "1.0",
+        "name": "Ponto Contínuo",
+        "timeframe": "H1",
+        "setup": {"type": "ponto_continuo", "params": {"side": "long", "period": 3, **params}},
+        "exit": {"take_profit": {"type": "risk_multiple", "params": {"rr": 5.0}}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def test_a_setup_document_reproduces_the_engine_s_own_golden() -> None:
+    """The whole point of this PR, asserted as numbers rather than as "it ran".
+
+    These are the same figures `test_ponto_continuo.py` measures inside the engine — entry at 114,
+    conducted out at 116 for +0.67R — reached here through the API's own path: a stored document,
+    the instrument row, the cost model, the risk manager. If the wiring changed the result, it
+    would change it here.
+
+    `reason == "sl"` on a *winning* trade is not a bug in the ledger. The setup ends at its
+    conducted stop, above the entry price, which is what a stop-out looks like once the trade has
+    been managed. A reader who maps "sl" to "loss" will misread this setup's best trades.
+    """
+    trades, metrics, _, _ = run_it(
+        definition=ponto_continuo(),
+        instrument=instrument_spec(a_stock()),
+        candles=pullback_to_the_average(),
+        date_from=_GOLDEN_FROM,
+        initial_capital=Decimal("100000"),
+    )
+
+    (trade,) = trades
+    assert trade.entry_price == Decimal(114)
+    assert trade.exit_price == Decimal(116)
+    assert trade.reason == "sl"
+    assert trade.net_pnl == Decimal("666.66")
+    assert metrics.total_trades == 1
+    assert metrics.long_trades == 1
+
+
+def test_a_setup_document_needs_no_indicators_entry_or_stop_block() -> None:
+    """The runner reads `risk.sizing` and `exit.take_profit` out of the document itself, so a
+    setup document still has to carry those two — they were never the strategy's to begin with.
+    Everything else it omits, and omitting it must not raise."""
+    document = ponto_continuo()
+
+    assert "indicators" not in document
+    assert "entry" not in document
+    assert "stop_loss" not in document["exit"]  # type: ignore[operator]
+
+    trades, _, _, _ = run_it(
+        definition=document,
+        instrument=instrument_spec(a_stock()),
+        candles=pullback_to_the_average(),
+        date_from=_GOLDEN_FROM,
+    )
+    assert len(trades) == 1
+
+
+def test_switching_the_breakeven_rule_off_reaches_the_setup() -> None:
+    """A parameter that travels from JSON through the factory into the state machine, proved by
+    the trade it changes rather than by reading an attribute back."""
+    with_rule, _, _, _ = run_it(
+        definition=ponto_continuo(),
+        instrument=instrument_spec(a_stock()),
+        candles=pullback_to_the_average(),
+        date_from=_GOLDEN_FROM,
+    )
+    without_rule, _, _, _ = run_it(
+        definition=ponto_continuo(breakeven_at_r=None),
+        instrument=instrument_spec(a_stock()),
+        candles=pullback_to_the_average(),
+        date_from=_GOLDEN_FROM,
+    )
+
+    # Both trade; the conducted stop is what differs, and only structure moves it once the 2x1
+    # rule is gone. Same entry either way.
+    assert with_rule[0].entry_price == without_rule[0].entry_price == Decimal(114)
+
+
+def test_an_unknown_setup_type_fails_loudly_at_compile_time() -> None:
+    document = ponto_continuo()
+    document["setup"] = {"type": "setup_9_4", "params": {}}
+
+    with pytest.raises(EngineError, match="unknown setup type"):
+        run_it(
+            definition=document,
+            instrument=instrument_spec(a_stock()),
+            candles=pullback_to_the_average(),
+            date_from=_GOLDEN_FROM,
+        )
+
+
+def test_a_swap_beside_the_costs_lands_on_every_trade_it_held_overnight() -> None:
+    """His account (24/09): -5 USD per lot per night on both sides, beside whatever the spread
+    charges. Each trade's net is its gross less its costs plus its swap, and the run nets the
+    swaps less than the same run without them."""
+    # Down, then a slow grind up: the cross fires early and the 2R target is hours away.
+    levels = [Decimal("1.10500") - Decimal("0.00100") * step for step in range(4)]
+    levels += [levels[-1] + Decimal("0.00012") * step for step in range(1, 80)]
+    # Started at 16:00 UTC, so the trade opens at 21:00 and closes at midnight — across January's
+    # rollover at 22:00 UTC (17:00 in New York).
+    slow = [
+        replace(
+            bar(index, open_=str(levels[index]), close=str(levels[index + 1])),
+            time=START + (index + 16) * HOUR,
+        )
+        for index in range(len(levels) - 1)
+    ]
+    window = {"candles": slow, "date_from": START, "date_to": START + 200 * HOUR}
+    plain, without, _, _ = run_it(cost_model={"type": "spread", "spread_points": 20}, **window)
+    trades, with_swap, _, _ = run_it(
+        cost_model={
+            "type": "spread",
+            "spread_points": 20,
+            "swap": {"long_per_lot": "-5", "short_per_lot": "-5"},
+        },
+        **window,
+    )
+
+    assert [trade.swap for trade in plain] == [0] * len(plain)
+    assert any(trade.swap < 0 for trade in trades)
+    assert all(trade.net_pnl == trade.gross_pnl - trade.costs + trade.swap for trade in trades)
+    assert with_swap.net_profit == without.net_profit + sum(trade.swap for trade in trades)
+
+
+def test_swap_rates_are_read_signed_and_refused_when_not_an_object() -> None:
+    assert swap_rates({"type": "none"}) is None
+    rates = swap_rates({"swap": {"long_per_lot": "-5", "short_per_lot": "1.5"}})
+    assert rates is not None
+    assert (rates.long_per_lot, rates.short_per_lot) == (Decimal(-5), Decimal("1.5"))
+    with pytest.raises(ValueError, match="swap must be an object"):
+        swap_rates({"swap": "-5"})
+
+
+class TestTheKeptInstrument:
+    """25/09: a run keeps the instrument it first executed with (`Backtest.instrument_spec`)."""
+
+    def row(
+        self, tick_value: str = "1.20646181", clock: dt.timedelta = dt.timedelta(hours=3)
+    ) -> Instrument:
+        # A broker three hours ahead, never zero: zero is what a clock lost on the way reads as.
+        return Instrument(
+            symbol="USDCHF",
+            name="US Dollar vs Swiss Franc",
+            asset_class=AssetClass.FOREX,
+            currency_quote="CHF",
+            currency_base="USD",
+            tick_size=Decimal("0.00001"),
+            tick_value=Decimal(tick_value),
+            contract_size=Decimal(100000),
+            digits=5,
+            server_offset=clock,
+        )
+
+    @pytest.mark.parametrize("hours", [3, -5.5])
+    def test_the_document_reads_back_as_the_same_specification(self, hours: float) -> None:
+        clock = dt.timedelta(hours=hours)
+        spec = instrument_spec(self.row(clock=clock))
+
+        assert spec.server_offset == clock
+        kept = spec_document(spec)
+        assert kept["server_offset_hours"] == hours
+        assert spec_for(Backtest(instrument_spec=kept), self.row("9", dt.timedelta(0))) == spec
+
+    def test_a_run_kept_before_the_clock_reads_back_on_utc(self) -> None:
+        """Kept before 30/09, with no clock: its bars above were cut on UTC (`htf_offset` null
+        everywhere), so it reads back as the zero it ran under, never as the catalogue's clock."""
+        kept = spec_document(instrument_spec(self.row()))
+        del kept["server_offset_hours"]
+
+        assert spec_for(Backtest(instrument_spec=kept), self.row()).server_offset == dt.timedelta(0)
+
+    def test_a_run_that_kept_one_ignores_the_catalogue_rewritten_since(self) -> None:
+        """The catalogue's tick value is today's exchange rate; the run's is the one it used."""
+        kept = spec_document(instrument_spec(self.row("1.10")))
+
+        spec = spec_for(Backtest(instrument_spec=kept), self.row("1.25"))
+
+        assert spec.tick_value == Decimal("1.10")
+
+    def test_a_run_that_kept_none_takes_the_catalogue(self) -> None:
+        assert spec_for(Backtest(), self.row("1.25")).tick_value == Decimal("1.25")
+
+
+# --------------------------------------------------------------------------- #
+# The broker's clock reaches the setup (30/09)                                  #
+# --------------------------------------------------------------------------- #
+
+THREE_HOURS = dt.timedelta(hours=3)
+
+
+def _filtered() -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "name": "choch under H4",
+        "timeframe": "H1",
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+
+def _clocks_handed(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Every `server_offset` the runner hands `compile_strategy` — the real one still builds."""
+    handed: list[object] = []
+    real = compile_strategy
+
+    def spy(document: object, **kwargs: object) -> object:
+        handed.append(kwargs.get("server_offset", "not handed"))
+        return real(document, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "compile_strategy", spy)
+    return handed
+
+
+def test_a_run_cuts_the_bars_above_on_its_instruments_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handed = _clocks_handed(monkeypatch)
+    spec = replace(instrument_spec(an_instrument()), server_offset=THREE_HOURS)
+
+    run_it(definition=_filtered(), instrument=spec)
+
+    assert handed == [THREE_HOURS]
+
+
+def test_a_batch_cuts_every_member_on_its_instruments_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handed = _clocks_handed(monkeypatch)
+    spec = replace(instrument_spec(an_instrument()), server_offset=THREE_HOURS)
+    one = BatchRun(
+        definition=_filtered(), initial_capital=Decimal(10_000), cost_model={"type": "none"}
+    )
+
+    execute_batch(
+        key=(4 * HOUR, THREE_HOURS, False),
+        runs=[one, one],
+        instrument=spec,
+        timeframe="H1",
+        date_from=START,
+        date_to=START + 100 * HOUR,
+        candles=dip_then_rally(),
+    )
+
+    assert handed == [THREE_HOURS, THREE_HOURS]
+
+
+def test_a_batch_whose_reading_is_cut_on_another_clock_is_refused() -> None:
+    spec = replace(instrument_spec(an_instrument()), server_offset=THREE_HOURS)
+    one = BatchRun(
+        definition=_filtered(), initial_capital=Decimal(10_000), cost_model={"type": "none"}
+    )
+
+    with pytest.raises(ValueError, match="clock"):
+        execute_batch(
+            key=(4 * HOUR, dt.timedelta(0), False),
+            runs=[one],
+            instrument=spec,
+            timeframe="H1",
+            date_from=START,
+            date_to=START + 100 * HOUR,
+            candles=dip_then_rally(),
+        )

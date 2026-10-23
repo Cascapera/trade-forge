@@ -9,27 +9,96 @@ The lifecycle is a state machine written into the `backtests` row: `queued → r
 progress channel, so a WebSocket subscriber sees the same story the database tells. A failure
 is *recorded*, not re-raised — a wrong strategy is a result to report (`GET /backtests/{id}`),
 not a job for arq to retry forever.
+
+⚠️ **Except when the database cannot be reached at all.** A run that cannot reach Postgres has
+not failed; nothing about it was measured. Before this rule, a worker that picked a job while
+Postgres was still starting raised out of `session.get`, arq — which does not retry an ordinary
+exception — dropped the job, and the row stayed `queued` for ever with nothing to say why
+(measured on 15/09, run `77842306`). Now an unreachable database hands the job back to arq with a
+growing delay, and only the last try records the run as failed. Every other database error — a
+cancelled query, a full disk, a deadlock — is a result, recorded on the first try, provided the
+database takes that write. Nothing here can record anything in a database that refuses it.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import datetime as dt
 import json
+import os
+import time
 import uuid
+from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from arq.worker import Retry, func
 from redis.asyncio import Redis
+from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
+from tradeforge_api.batching import enqueue_runs
+from tradeforge_api.candle_cache import CandleCache, CandleReader, read_window
+from tradeforge_api.candle_sync import URL_ENV as CANDLES_URL_ENV
+from tradeforge_api.candle_sync import FetchingReader
+from tradeforge_api.claim import STOPPING
+from tradeforge_api.cluster_job import process_cluster
+from tradeforge_api.collector import running as collector_running
 from tradeforge_api.config import RedisConfig, Settings
-from tradeforge_api.queue import progress_channel, redis_settings
-from tradeforge_api.runner import execute_backtest
-from tradeforge_collector import read_candles
-from tradeforge_db.models import Backtest, BacktestStatus, Instrument, Strategy
-from tradeforge_db.results import to_rows
+from tradeforge_api.grid import coordinates, label_for, read_point
+from tradeforge_api.queue import (
+    COLLECT_RANGE,
+    RUN_BACKTEST,
+    RUN_CLUSTER,
+    RUN_SWEEP_WALK_FORWARD,
+    RUN_TEMPLATE_QUEUE,
+    collect_queue_for,
+    progress_channel,
+    redis_settings,
+)
+from tradeforge_api.r_metrics import r_metrics
+from tradeforge_api.retention import recorded_for
+from tradeforge_api.reuse import copy_into, original_for, window_of
+from tradeforge_api.routers.sweeps import jobs_for
+from tradeforge_api.runner import (
+    ENGINE_VERSION,
+    BatchRun,
+    CandleWindow,
+    Measured,
+    execute_backtest,
+    execute_batch,
+    spec_document,
+    spec_for,
+)
+from tradeforge_api.sweep_walkforward_job import advance
+from tradeforge_api.template_queue_job import advance_queue
+from tradeforge_api.walkforward import Candidate, choose
+from tradeforge_api.warm_window import warmup_for
+from tradeforge_api.year_cut import Sizing, sizing_document
+from tradeforge_collector import read_candles, step
+from tradeforge_db.collections import finish_collection
+from tradeforge_db.models import (
+    Backtest,
+    BacktestMetrics,
+    BacktestStatus,
+    Collection,
+    Instrument,
+    Recorded,
+    SelectionMetric,
+    Strategy,
+    WalkForward,
+    WalkForwardFold,
+)
+from tradeforge_db.results import ladder_row, to_rows
 from tradeforge_db.session import create_db_engine, create_session_factory
+from tradeforge_engine import BacktestMetrics as EngineMetrics
+from tradeforge_engine import ClosedTrade
+from tradeforge_engine.domain import InstrumentSpec
+from tradeforge_engine.excursion import target_ladder
+from tradeforge_engine.setup_factory import ReadingKey, shared_reading
 
 
 def _now() -> dt.datetime:
@@ -42,21 +111,206 @@ async def _announce(redis: Redis, backtest_id: uuid.UUID, payload: dict[str, Any
     await redis.publish(progress_channel(backtest_id), json.dumps(payload))
 
 
-async def process_backtest(
+# SQLSTATEs that mean "the server is not there to answer": connection exceptions (class 08), and
+# the server shutting down, crashing or still starting (57P01, 57P02, 57P03). 57014, a cancelled
+# query, shares class 57 and is deliberately not here — the server answered it.
+_UNREACHABLE_STATES = frozenset({"57P01", "57P02", "57P03"})
+
+
+def database_unreachable(exc: BaseException) -> bool:
+    """Whether `exc` says the database could not be reached, as opposed to what it answered.
+
+    ⚠️ psycopg files a cancelled query, a full disk and a deadlock under `OperationalError` too.
+    Retrying those would re-run the whole backtest eight times to reach the same answer, so the
+    class alone is not the test: the SQLSTATE is. An `OperationalError` with no SQLSTATE comes
+    from the connect step — a refused connection, or a server that answered `57P03` at connect
+    time, which psycopg reports without the code (the 15/09 case) — and counts as unreachable.
+    """
+    if not isinstance(exc, DBAPIError):
+        return False
+    if exc.connection_invalidated:
+        return True
+    sqlstate: str | None = getattr(exc.orig, "sqlstate", None)
+    if sqlstate is None:
+        return isinstance(exc, OperationalError)
+    return sqlstate.startswith("08") or sqlstate in _UNREACHABLE_STATES
+
+
+def _kept_spec(backtest: Backtest, instrument: Instrument) -> InstrumentSpec:
+    """The instrument as this run first executed it, kept on the row the first time
+    (`runner.spec_for`, 25/09)."""
+    spec = spec_for(backtest, instrument)
+    if backtest.instrument_spec is None:
+        backtest.instrument_spec = spec_document(spec)
+    return spec
+
+
+def _original_of(
+    session: Session, run: Backtest, *, parquet_root: Path, read: CandleReader
+) -> tuple[Backtest, Recorded] | None:
+    """The finished run that can stand for this sweep's run (`reuse.original_for`), or `None`.
+
+    The candles are read as the run would read them (`read`, the worker's cache), so the original
+    must have seen the very bars on the disk now — a chart collected again since does not match.
+    """
+    instrument = session.get(Instrument, run.instrument_id)
+    strategy = session.get(Strategy, run.strategy_id)
+    if run.sweep_id is None or instrument is None or strategy is None:
+        return None
+    warmup = warmup_for(strategy.definition)
+    candles = read_window(
+        read,
+        parquet_root,
+        instrument.symbol,
+        run.timeframe,
+        date_from=run.date_from,
+        date_to=run.date_to,
+        warmup=warmup,
+    )
+    window = window_of(candles, run.date_from, run.date_to, warmup)
+    if window is None:
+        return None  # nothing to read: the run records that itself
+    spec = _kept_spec(run, instrument)
+    return original_for(session, run, spec_document(spec), window)
+
+
+async def _take_reused(
+    session: Session, redis: Redis, run: Backtest, *, parquet_root: Path, read: CandleReader
+) -> bool:
+    """Copy the result of the very same measurement, already made under this engine, into a
+    sweep's run — `True` if it was, and the run is done (`reuse`, 28/09).
+
+    ⚠️ **A shortcut, never a reason to fail.** Anything that goes wrong here but an unreachable
+    database is rolled back and the run simply runs: the copy is only ever a saving.
+    """
+    try:
+        found = _original_of(session, run, parquet_root=parquet_root, read=read)
+        if found is None:
+            return False
+        original, recorded = found
+        copy_into(session, original, run, recorded)
+        session.commit()
+    except DBAPIError as exc:
+        if database_unreachable(exc):
+            raise
+        session.rollback()
+        return False
+    except Exception:  # noqa: BLE001 — the run runs instead; see the docstring
+        session.rollback()
+        return False
+    await _announce(redis, run.id, {"status": "done", "progress": 1.0})
+    return True
+
+
+def _record_done(  # noqa: PLR0913 — one finished run and what it came to
+    session: Session,
+    backtest: Backtest,
+    *,
+    instrument: Instrument,
+    spec: InstrumentSpec,
+    trades: list[ClosedTrade],
+    metrics: EngineMetrics,
+    window: CandleWindow,
+    sizing: Sizing,
+) -> None:
+    """Write one finished run: what it keeps, its metrics in money and in R, what it read.
+
+    The one place a result is written — a run on its own (`process_backtest`) and each run of a
+    batch (`process_batch`) — so a batch cannot keep a run differently from how it keeps itself.
+    The caller commits.
+    """
+    # Every rung of the target ladder, scored now: a sweep's losing run keeps no trades, and
+    # without them this cannot be computed later (`backtest_metrics.targets`).
+    ladder = target_ladder(trades, spec)
+    # Decided here and stamped on the run, never re-derived later: see `Recorded`.
+    recorded = recorded_for(
+        in_sweep=backtest.sweep_id is not None,
+        timeframe=backtest.timeframe,
+        net_profit=metrics.net_profit,
+        total_trades=metrics.total_trades,
+        target_net_r=[None if rung is None else rung.net_r for rung in ladder.values()],
+        reserved_test=backtest.sweep is not None and backtest.sweep.holdout_rule is not None,
+        every_trade=backtest.sweep is not None and backtest.sweep.keep_all_trades,
+    )
+    metrics_row, trade_rows = to_rows(
+        trades=trades,
+        metrics=metrics,
+        backtest_id=backtest.id,
+        instrument_id=instrument.id,
+        recorded=recorded,
+    )
+    metrics_row.targets = ladder_row(ladder)
+    # The run's risk in R, for every run — its trades may not be kept (`r_metrics`).
+    in_r = r_metrics(trades)
+    metrics_row.net_r = in_r.net_r
+    metrics_row.max_drawdown_r = in_r.max_drawdown_r
+    metrics_row.losing_streak = in_r.losing_streak
+    metrics_row.losing_streak_r = in_r.losing_streak_r
+    metrics_row.positive_year_share = in_r.positive_year_share
+    metrics_row.yearly_r = {str(year): str(r) for year, r in sorted(in_r.yearly_r.items())}
+    metrics_row.monthly_r = {month: str(r) for month, r in sorted(in_r.monthly_r.items())}
+    metrics_row.positive_month_share = in_r.positive_month_share
+    metrics_row.r_by_years = {
+        str(entered): {str(left): str(r) for left, r in sorted(exits.items())}
+        for entered, exits in sorted(in_r.by_years.items())
+    }
+    # The trades in each of those cells (01/10): a cut's trade floor (`year_cut`).
+    metrics_row.trades_by_years = {
+        str(entered): {str(left): count for left, count in sorted(exits.items())}
+        for entered, exits in sorted(in_r.trades_by_years.items())
+    }
+    # What says whether `r_by_years` can be cut to a window of whole years (`year_cut`).
+    metrics_row.sizing_by_years = sizing_document(sizing)
+    metrics_row.sizing_refusals = sizing.refusals
+    backtest.recorded = recorded
+    session.add(metrics_row)
+    session.add_all(trade_rows)
+    # Recorded on the run, not derived later: the Parquet underneath can be re-collected
+    # or extended, and then "what this run read" stops being answerable from the dataset.
+    backtest.candles_seen = window.candles
+    backtest.first_candle = window.first
+    backtest.last_candle = window.last
+    backtest.warmup_bars = window.warmed
+    backtest.status = BacktestStatus.DONE
+    backtest.finished_at = _now()
+
+
+async def process_backtest(  # noqa: PLR0913 — keyword-only; each names one thing the run needs
     *,
     session: Session,
     redis: Redis,
     parquet_root: Path,
     backtest_id: uuid.UUID,
+    retry_unreachable: bool = True,
+    read: CandleReader = read_candles,
+    reuse: bool = True,
 ) -> None:
     """Run one backtest end to end, driving its row through the status state machine.
 
     Split from the arq entry point so it can be exercised inline in a test — pass a real
     session and Redis, and this is the whole worker without a running arq process.
+
+    `retry_unreachable=False` is for a caller that cannot retry — the walk-forward runs its folds
+    inline — and records an unreachable database as the run's failure, as before, rather than
+    leaving the run `running` with nobody coming back for it.
+
+    `read` is where the bars come from: the worker passes its `CandleCache`, so a sweep's runs
+    over one symbol read the Parquet once rather than once each (`candle_cache`).
     """
+    # ⚠️ Outside the `try`, on purpose: a database that cannot answer this is not a failed run,
+    # and the error must reach the caller — `run_backtest`, which retries or records it.
     backtest = session.get(Backtest, backtest_id)
     if backtest is None:
         return  # the row was deleted between enqueue and pickup; nothing to run
+    if backtest.status in (BacktestStatus.DONE, BacktestStatus.FAILED):
+        # A retry after a commit whose outcome was lost with the connection: the run already has
+        # its result. Running a `done` one again would write a second metrics row against the same
+        # key; restarting a `failed` one would stamp a start after its recorded finish, and the
+        # CHECK that refuses that would replace the real reason with its own. Nothing enqueues a
+        # finished run on purpose — every launch writes a new row.
+        return
+    if reuse and await _take_reused(session, redis, backtest, parquet_root=parquet_root, read=read):
+        return
 
     try:
         backtest.status = BacktestStatus.RUNNING
@@ -69,10 +323,21 @@ async def process_backtest(
         if strategy is None or instrument is None:
             raise ValueError("backtest references a missing strategy or instrument")
 
-        candles = read_candles(parquet_root, instrument.symbol, backtest.timeframe)
-        trades, metrics = execute_backtest(
+        candles = read_window(
+            read,
+            parquet_root,
+            instrument.symbol,
+            backtest.timeframe,
+            date_from=backtest.date_from,
+            date_to=backtest.date_to,
+            warmup=warmup_for(strategy.definition),
+        )
+        # A sweep's run keeps no pictures, so it does not build them either (`retention`).
+        in_sweep = backtest.sweep_id is not None
+        spec = _kept_spec(backtest, instrument)
+        trades, metrics, window, sizing = execute_backtest(
             definition=strategy.definition,
-            instrument=instrument,
+            instrument=spec,
             timeframe=backtest.timeframe,
             date_from=backtest.date_from,
             date_to=backtest.date_to,
@@ -80,30 +345,528 @@ async def process_backtest(
             cost_model=backtest.cost_model,
             slippage_ticks=Decimal(0),
             candles=candles,
+            record_snapshots=not in_sweep,
         )
 
-        metrics_row, trade_rows = to_rows(
+        _record_done(
+            session,
+            backtest,
+            instrument=instrument,
+            spec=spec,
             trades=trades,
             metrics=metrics,
-            backtest_id=backtest.id,
-            instrument_id=instrument.id,
+            window=window,
+            sizing=sizing,
         )
-        session.add(metrics_row)
-        session.add_all(trade_rows)
-        backtest.status = BacktestStatus.DONE
-        backtest.finished_at = _now()
         session.commit()
         await _announce(redis, backtest_id, {"status": "done", "progress": 1.0})
 
+    except DBAPIError as exc:
+        if retry_unreachable and database_unreachable(exc):
+            # The database, not the run: nothing was measured, so nothing is recorded. The caller
+            # hands the job back to arq.
+            raise
+        session.rollback()
+        _record_failure(session, backtest_id, exc)
+        await _announce(redis, backtest_id, {"status": "failed", "error": _reason(exc)})
     except Exception as exc:  # noqa: BLE001 — a failed run is a recorded result, not a crash
         session.rollback()
         _record_failure(session, backtest_id, exc)
         await _announce(redis, backtest_id, {"status": "failed", "error": _reason(exc)})
 
 
+async def process_batch(  # noqa: PLR0913 — keyword-only; each names one thing the batch needs
+    *,
+    session: Session,
+    redis: Redis,
+    parquet_root: Path,
+    run_ids: Sequence[uuid.UUID],
+    retry_unreachable: bool = True,
+    read: CandleReader = read_candles,
+    reuse: bool = True,
+    stopping: Callable[[], bool] = lambda: False,
+) -> None:
+    """Run a batch of runs over one market together, the market read once per bar (ADR-0029).
+
+    `stopping` says whether the worker was told to stop (`claim.STOPPING`): a batch cancelled then
+    is run again by arq, so the runs it had not written go back to the queue instead of failing.
+
+    ⚠️ **A batch refuses to guess.** Its runs are meant to share a symbol, a chart, a window, an
+    instrument and a reading of the market (`batching.batch_key`); if they do not — a hand-made
+    job, a row changed since the launch — each runs on its own through `process_backtest`,
+    which is slower and always right. Runs already finished are skipped, so a batch handed back
+    after a worker died picks up where it was.
+
+    ⚠️ **Each run's result is its own.** A run whose document will not compile, or that raised,
+    fails alone with its reason; the others are written as they finish (`_record_done`).
+    """
+    # When the job started, near enough: a cancellation at arq's ceiling is its timeout, not a stop.
+    began = time.monotonic()
+    runs = [
+        run
+        for run in (session.get(Backtest, run_id) for run_id in run_ids)
+        if run is not None and run.status not in (BacktestStatus.DONE, BacktestStatus.FAILED)
+    ]
+    # Runs whose measurement was already made are copied first, and the batch runs the rest.
+    if reuse:
+        runs = [
+            run
+            for run in runs
+            if not await _take_reused(session, redis, run, parquet_root=parquet_root, read=read)
+        ]
+    if not runs:
+        return
+    first = runs[0]
+    instrument = session.get(Instrument, first.instrument_id)
+    strategies = [session.get(Strategy, run.strategy_id) for run in runs]
+    specs = [_kept_spec(run, instrument) for run in runs] if instrument is not None else []
+    # The broker's clock the bars above are cut on is the instrument's (30/09); a batch whose runs
+    # kept different ones is refused below (`len(set(specs)) != 1`), so the first speaks for all.
+    clock = specs[0].server_offset if specs else dt.timedelta(0)
+    # The reading and the warm-up: a batch feeds its runs one stream of bars (ADR-0030).
+    keys = {
+        None
+        if strategy is None
+        or (reading := shared_reading_of(strategy.definition, first.timeframe, clock)) is None
+        else (reading, warmup_for(strategy.definition))
+        for strategy in strategies
+    }
+    one_market = (
+        instrument is not None
+        and len(keys) == 1
+        and None not in keys
+        and all(
+            (run.instrument_id, run.timeframe, run.date_from, run.date_to)
+            == (first.instrument_id, first.timeframe, first.date_from, first.date_to)
+            for run in runs
+        )
+    )
+    if not one_market or len(set(specs)) != 1:
+        session.rollback()
+        for run in runs:
+            await process_backtest(
+                session=session,
+                redis=redis,
+                parquet_root=parquet_root,
+                backtest_id=run.id,
+                retry_unreachable=retry_unreachable,
+                read=read,
+                reuse=reuse,
+            )
+        return
+    assert instrument is not None  # noqa: S101 — `one_market` says so
+    (shared,) = keys
+    assert shared is not None  # noqa: S101 — `one_market` says so
+    key = shared[0]
+
+    ids = [run.id for run in runs]
+    try:
+        started = _now()
+        for run in runs:
+            run.status = BacktestStatus.RUNNING
+            run.started_at = started
+        session.commit()
+        for run_id in ids:
+            await _announce(redis, run_id, {"status": "running", "progress": 0.0})
+
+        # One window and one warm-up for the whole batch: `one_market` and `batch_key` say so.
+        candles = read_window(
+            read,
+            parquet_root,
+            instrument.symbol,
+            first.timeframe,
+            date_from=first.date_from,
+            date_to=first.date_to,
+            warmup=warmup_for(next(one for one in strategies if one is not None).definition),
+        )
+        outcomes = execute_batch(
+            key=key,
+            runs=[
+                BatchRun(
+                    definition=strategy.definition,
+                    initial_capital=run.initial_capital,
+                    cost_model=run.cost_model,
+                )
+                for run, strategy in zip(runs, strategies, strict=True)
+                if strategy is not None
+            ],
+            instrument=specs[0],
+            timeframe=first.timeframe,
+            date_from=first.date_from,
+            date_to=first.date_to,
+            candles=candles,
+        )
+        for run, spec, outcome in zip(runs, specs, outcomes, strict=True):
+            await _write_one(
+                session,
+                redis,
+                run,
+                instrument=instrument,
+                spec=spec,
+                outcome=outcome,
+                retry_unreachable=retry_unreachable,
+            )
+    except DBAPIError as exc:
+        if retry_unreachable and database_unreachable(exc):
+            raise
+        session.rollback()
+        await _fail_open(session, redis, ids, exc)
+    except Exception as exc:  # noqa: BLE001 — a failed batch is recorded on its runs, not a crash
+        session.rollback()
+        await _fail_open(session, redis, ids, exc)
+    except BaseException as exc:
+        # ⚠️ **Cancelled by arq's timeout, or the worker told to stop** (27/09). The batch is
+        # synchronous CPU, so arq's `wait_for` only lands on the first `await` after it — in the
+        # middle of writing the runs. Left alone, the runs not yet written would stay `running`
+        # for good, with nothing to close them; the cancellation goes on up either way.
+        #
+        # Which of the two it was decides what the runs become (`_close_stopped`). A worker told
+        # to stop can still meet the timeout while it waits — a batch already stuck — and that
+        # job arq will not run again, so the clock has the last word.
+        session.rollback()
+        timed_out = time.monotonic() - began >= BATCH_TIMEOUT_SECONDS - _TIMEOUT_MARGIN_SECONDS
+        await _close_stopped(session, redis, ids, exc, told_to_stop=stopping() and not timed_out)
+        raise
+
+
+async def _write_one(  # noqa: PLR0913 — one run of a batch and what it came to
+    session: Session,
+    redis: Redis,
+    run: Backtest,
+    *,
+    instrument: Instrument,
+    spec: InstrumentSpec,
+    outcome: Measured | Exception,
+    retry_unreachable: bool,
+) -> None:
+    """Write one run of a batch: its failure, or its result — its own, whatever the others did.
+
+    ⚠️ **One run's write failing is that run's failure only**: rolled back and recorded on it, and
+    the next run is written as if nothing happened. An unreachable database is not a run's
+    failure, and goes up to be retried.
+    """
+    if isinstance(outcome, Exception):
+        _record_failure(session, run.id, outcome)
+        await _announce(redis, run.id, {"status": "failed", "error": _reason(outcome)})
+        return
+    trades, metrics, window, sizing = outcome
+    try:
+        _record_done(
+            session,
+            run,
+            instrument=instrument,
+            spec=spec,
+            trades=trades,
+            metrics=metrics,
+            window=window,
+            sizing=sizing,
+        )
+        session.commit()
+    except DBAPIError as exc:
+        if retry_unreachable and database_unreachable(exc):
+            raise
+        session.rollback()
+        _record_failure(session, run.id, exc)
+        await _announce(redis, run.id, {"status": "failed", "error": _reason(exc)})
+        return
+    except Exception as exc:  # noqa: BLE001 — this run's failure, not the batch's
+        session.rollback()
+        _record_failure(session, run.id, exc)
+        await _announce(redis, run.id, {"status": "failed", "error": _reason(exc)})
+        return
+    await _announce(redis, run.id, {"status": "done", "progress": 1.0})
+
+
+async def _close_stopped(
+    session: Session,
+    redis: Redis,
+    ids: Sequence[uuid.UUID],
+    exc: BaseException,
+    *,
+    told_to_stop: bool,
+) -> None:
+    """The runs of a batch stopped before it wrote them all: back to the queue, or failed.
+
+    ⚠️ **Which stop it was decides** (16/10, ADR-0036). After a timeout arq records the job as
+    failed and never runs it again: the runs are failed with the reason. A worker told to stop
+    that could not wait for the batch has it cancelled, and arq runs the job again ("cancelled,
+    will be run again"); failed, the runs would be skipped by that second run (`process_batch`)
+    and lost — so they go back to the queue. Both arrive as `CancelledError`; only the worker
+    knows it was told to stop.
+    """
+    if isinstance(exc, asyncio.CancelledError) and told_to_stop:
+        await _requeue_open(session, redis, ids)
+    else:
+        await _fail_open(session, redis, ids, RuntimeError(f"the batch was stopped: {exc!r}"))
+
+
+async def _requeue_open(session: Session, redis: Redis, ids: Sequence[uuid.UUID]) -> None:
+    """Put every run of the batch not yet finished back to `queued`, for the job's next run."""
+    reopened = []
+    for run_id in ids:
+        run = session.get(Backtest, run_id)
+        if run is None or run.status in (BacktestStatus.DONE, BacktestStatus.FAILED):
+            continue
+        run.status = BacktestStatus.QUEUED
+        run.started_at = None
+        reopened.append(run_id)
+    session.commit()
+    for run_id in reopened:
+        with contextlib.suppress(Exception):
+            await _announce(redis, run_id, {"status": "queued", "progress": 0.0})
+
+
+async def _fail_open(
+    session: Session, redis: Redis, ids: Sequence[uuid.UUID], exc: BaseException
+) -> None:
+    """Fail every run of the batch not yet finished, and say so to whoever is watching it."""
+    reason = _reason(exc) if isinstance(exc, Exception) else repr(exc)
+    for run_id in ids:
+        run = session.get(Backtest, run_id)
+        if run is None or run.status in (BacktestStatus.DONE, BacktestStatus.FAILED):
+            continue
+        _record_failure(
+            session, run_id, exc if isinstance(exc, Exception) else RuntimeError(reason)
+        )
+        with contextlib.suppress(Exception):
+            await _announce(redis, run_id, {"status": "failed", "error": reason})
+
+
+def shared_reading_of(
+    definition: Mapping[str, Any], timeframe: str, server_offset: dt.timedelta
+) -> ReadingKey | None:
+    """The reading of the market a stored document's setup shares (`shared_reading`), if any —
+    its bars above cut on `server_offset`, the instrument's clock (30/09)."""
+    setup = definition.get("setup")
+    if not isinstance(setup, Mapping):
+        return None
+    return shared_reading(setup, timeframe=step(timeframe), server_offset=server_offset)
+
+
+# --------------------------------------------------------------------------- #
+# Walk-forward: the one job in this system that decides something               #
+# --------------------------------------------------------------------------- #
+
+
+_METRIC_OF: dict[SelectionMetric, Callable[[BacktestMetrics], Decimal | None]] = {
+    SelectionMetric.NET_PROFIT: lambda metrics: metrics.net_profit,
+    SelectionMetric.PROFIT_FACTOR: lambda metrics: metrics.profit_factor,
+    SelectionMetric.SHARPE: lambda metrics: metrics.sharpe,
+    SelectionMetric.EXPECTANCY: lambda metrics: metrics.expectancy,
+}
+"""Which column each selection metric reads.
+
+Spelled out rather than `getattr(metrics, walk_forward.metric.value)`, even though the enum's
+values were named after the columns on purpose. The reflective version works until a column is
+renamed, and then it fails at the moment a fold picks a winner — inside a job, hours into a run
+— instead of at the line that is now wrong. Three of the four are nullable, which is the whole
+reason `choose` refuses to read a null as a zero.
+"""
+
+
+async def process_walk_forward(
+    *,
+    session: Session,
+    redis: Redis,
+    parquet_root: Path,
+    walk_forward_id: uuid.UUID,
+    read: CandleReader = read_candles,
+) -> None:
+    """Run every fold in order: train the whole grid, choose, then test the choice.
+
+    ⚠️ **The runs are executed here, inline and sequentially, rather than queued.** The
+    alternative — enqueue a fold's training runs and wait for them — deadlocks on a single
+    worker: `execute_backtest` is CPU-bound and synchronous, so this coroutine holds the only
+    slot the runs it is waiting for would need to claim. Reactive completion (whichever run
+    finishes last enqueues the test) trades that for a distributed "who was last?" question
+    with a race in it. Sequential is slower and has no failure mode: measured on this project's
+    own runs, three hundred backtests is two to four minutes.
+
+    Idempotent by construction, and it has to be: this job is enqueued under the walk-forward's
+    own id, so a retry runs it again. Runs already `done` are skipped rather than re-executed —
+    re-running one would try to write a second metrics row against the same primary key and
+    turn a completed fold into a failed one.
+    """
+    walk_forward = session.get(WalkForward, walk_forward_id)
+    if walk_forward is None:
+        return  # the row was deleted between enqueue and pickup; nothing to run
+    if walk_forward.status is BacktestStatus.DONE:
+        return  # complete; a retry has nothing to add and would restamp a finished clock
+
+    try:
+        walk_forward.status = BacktestStatus.RUNNING
+        walk_forward.started_at = _now()
+        # ⚠️ **Cleared, not left standing, and this is the whole retry path.** An attempt that
+        # ended leaves `finished_at` and `error` behind, and the row's own CHECK refuses a
+        # finish that precedes its start — so a retry that kept them would die on this very
+        # commit with a constraint violation, recorded as the experiment's failure. The message
+        # a reader would then see is about a timestamp, and it has *replaced* the reason the
+        # experiment failed in the first place.
+        walk_forward.finished_at = None
+        walk_forward.error = None
+        session.commit()
+
+        for fold in walk_forward.fold_rows:
+            await _process_fold(
+                session=session,
+                redis=redis,
+                parquet_root=parquet_root,
+                walk_forward=walk_forward,
+                fold=fold,
+                read=read,
+            )
+
+        walk_forward.status = BacktestStatus.DONE
+        walk_forward.finished_at = _now()
+        session.commit()
+
+    except Exception as exc:  # noqa: BLE001 — a failed experiment is a recorded result
+        session.rollback()
+        _record_walk_forward_failure(session, walk_forward_id, exc)
+
+
+async def _process_fold(  # noqa: PLR0913 — keyword-only; each names one thing the fold needs
+    *,
+    session: Session,
+    redis: Redis,
+    parquet_root: Path,
+    walk_forward: WalkForward,
+    fold: WalkForwardFold,
+    read: CandleReader,
+) -> None:
+    """One fold: every training run, the choice, and the single run that scores it."""
+    if fold.test_backtest_id is not None:
+        # Decided and scored by an earlier attempt. Skipped whole rather than re-derived: the
+        # training runs below would each be skipped for being `done` anyway, but the run that
+        # scores the choice is *created* here, so re-entering writes a **second** out-of-sample
+        # run for a fold that already has one. Two answers to "what did this fold make", with
+        # nothing on either row to say which one is the fold's.
+        return
+
+    training = list(
+        session.scalars(
+            select(Backtest).where(Backtest.study_id == fold.study_id).order_by(Backtest.id)
+        )
+    )
+    for run in training:
+        if run.status is BacktestStatus.DONE:
+            continue
+        await process_backtest(
+            session=session,
+            redis=redis,
+            parquet_root=parquet_root,
+            backtest_id=run.id,
+            retry_unreachable=False,
+            read=read,
+        )
+
+    ranked = _candidates(session, fold, training, walk_forward.metric)
+    winner = choose(ranked)
+    if winner is None:
+        # A terminal answer, not a gap: nothing in the grid traded this window, or nothing that
+        # traded had a defined score. Recorded by leaving the choice null and moving on — the
+        # fold reports itself as undecided, which is a finding about the method.
+        return
+
+    fold.chosen_strategy_id = ranked[winner]
+    session.commit()
+
+    test = Backtest(
+        strategy_id=fold.chosen_strategy_id,
+        instrument_id=fold.study.instrument_id,
+        timeframe=fold.study.timeframe,
+        date_from=fold.test_from,
+        date_to=fold.test_to,
+        initial_capital=fold.study.initial_capital,
+        # The same costs the training runs were charged. A test window scored under a different
+        # spread than the window that chose it would make the two sides of this comparison
+        # incomparable in the one respect the whole feature is a comparison of.
+        cost_model=dict(training[0].cost_model),
+        status=BacktestStatus.QUEUED,
+        engine_version=ENGINE_VERSION,
+    )
+    session.add(test)
+    session.commit()
+
+    await process_backtest(
+        session=session,
+        redis=redis,
+        parquet_root=parquet_root,
+        backtest_id=test.id,
+        retry_unreachable=False,
+        read=read,
+    )
+
+    # Linked after the run exists, never before: `test_backtest_id` is a foreign key, and the
+    # fold's own CHECK refuses a test run without a choice behind it.
+    fold.test_backtest_id = test.id
+    session.commit()
+
+
+def _candidates(
+    session: Session,
+    fold: WalkForwardFold,
+    training: Sequence[Backtest],
+    metric: SelectionMetric,
+) -> dict[Candidate, uuid.UUID]:
+    """Every training run of this fold as something `choose` can rank, mapped to its strategy.
+
+    A mapping rather than a list, because `choose` hands back one candidate and the caller then
+    needs the row that produced it. Keyed by the candidate itself — it is frozen, so hashable —
+    which keeps the pure ranking type free of any notion of a database id.
+
+    Coordinates come from the document each run actually executed, never from parsing the
+    strategy's name: that works until a parameter value contains a comma. They are also the
+    tie-break, and they are computed by the same `grid.coordinates` the study read sorts by, so
+    "the best point" cannot mean two different things in two endpoints.
+    """
+    grid: dict[str, list[Any]] = dict(fold.study.grid)
+    definitions = {
+        strategy.id: strategy.definition
+        for strategy in session.scalars(
+            select(Strategy).where(Strategy.id.in_({run.strategy_id for run in training}))
+        )
+    }
+
+    built: dict[Candidate, uuid.UUID] = {}
+    for run in training:
+        document = definitions.get(run.strategy_id)
+        if document is None:  # pragma: no cover — the FK is RESTRICT
+            continue
+        values = read_point(document, grid)
+        candidate = Candidate(
+            coordinates=coordinates(grid, values),
+            label=label_for(values),
+            # `None` when the run failed, has not finished, or the metric is undefined for it.
+            # All three are the same thing to a ranking — no score — and none of them is a zero.
+            score=None if run.metrics is None else _METRIC_OF[metric](run.metrics),
+            trades=0 if run.metrics is None else run.metrics.total_trades,
+        )
+        built[candidate] = run.strategy_id
+    return built
+
+
+def _record_walk_forward_failure(
+    session: Session, walk_forward_id: uuid.UUID, exc: Exception
+) -> None:
+    walk_forward = session.get(WalkForward, walk_forward_id)
+    if walk_forward is None:  # pragma: no cover — deleted mid-run
+        return
+    walk_forward.status = BacktestStatus.FAILED
+    walk_forward.error = _reason(exc)
+    if walk_forward.started_at is None:  # pragma: no cover — set before anything can throw
+        walk_forward.started_at = _now()
+    walk_forward.finished_at = _now()
+    session.commit()
+
+
 def _record_failure(session: Session, backtest_id: uuid.UUID, exc: Exception) -> None:
     backtest = session.get(Backtest, backtest_id)
     if backtest is None:
+        return
+    if backtest.status is BacktestStatus.DONE:
+        # A result already landed — a commit whose answer was lost, or an error raised after it
+        # (the progress publish). What failed afterwards is not the run, and must not erase it.
         return
     backtest.status = BacktestStatus.FAILED
     backtest.error = _reason(exc)
@@ -125,20 +888,354 @@ def _reason(exc: Exception) -> str:
 # --------------------------------------------------------------------------- #
 
 
+WAIT_POLL_SECONDS = 30
+
+BATCH_TIMEOUT_SECONDS = 2 * 60 * 60
+"""How long one batch may run before arq ends it — a ceiling for a batch stuck, not an estimate.
+
+⚠️ **Well above any batch, on purpose.** arq also keeps a job "in progress" for this long plus ten
+seconds; a batch still computing past it would be handed to a second worker and run twice. The
+batches are sized so none comes near it (`batching.batch_size`): a batch of M5 is minutes."""
+
+STOP_WAIT_SECONDS = 14 * 60
+"""How long a worker told to stop waits for the job it holds before cancelling it (16/10, ADR-0036).
+
+A batch of twenty-four M5 runs over eleven years takes a few minutes on the i9 and about three
+times that on the Xeon; fourteen minutes covers it with room. ⚠️ Docker must wait longer than this
+before it kills the container: `stop_grace_period` of the worker service in both compose files,
+which `tests/test_worker_stop_grace.py` holds above this number."""
+
+_TIMEOUT_MARGIN_SECONDS = 60
+"""How close to `BATCH_TIMEOUT_SECONDS` a cancelled batch is taken for one arq timed out.
+
+arq's clock starts a moment before `process_batch`'s; a minute of slack keeps a timeout from being
+read as a stop. A batch stopped in its last minute before the ceiling is failed — it was stuck."""
+
+OFF_GRACE = dt.timedelta(minutes=2)
+"""How long a run waits for a download before an agent that is not running gives it up.
+
+Four polls: longer than a restart of the agent, which deletes its key on the way down and writes
+it again on the way up; far shorter than `WAIT_LIMIT`, which is for an agent that runs and says
+nothing."""
+
+CLUSTER_WAIT_SECONDS = 5
+"""How long a cluster waits between looks at its members still running again."""
+"""How long a run waiting for its collection sleeps before asking again.
+
+A collection advances one calendar year at a time and a cold year takes minutes on this broker,
+so asking every second would be hundreds of questions about a row that changes five times."""
+
+WAIT_LIMIT = dt.timedelta(hours=2)
+"""How long the **collection queue** may go silent before a run waiting on it is failed.
+
+⚠️ **Measured from the queue's last delivery, not from the run's birth.** The host agent
+downloads one collection at a time (`max_jobs = 1`), and a basket may ask for twenty markets in
+one click: the last of them has not started hours in, though nothing is wrong. A clock started at
+the launch would fail those runs on a healthy system — so what is timed is silence, and every
+collection that lands anywhere resets it.
+
+⚠️ **A ceiling on the wait, not an estimate of it.** Two hours of nothing finishing anywhere is
+an agent that stopped or a terminal nobody logged in to — the failure this limit exists for,
+and the one this project has already paid for once (the run stuck `queued` on 15/09)."""
+
+MAX_TRIES = 8
+"""How many times a backtest job runs before a database that will not answer is its result.
+
+With `retry_delay`, the seven waits add up to 140 seconds — room for a database that is starting.
+That is the waiting alone: each try also spends however long its own connect takes, and no
+connect timeout is set. A database that comes back within the budget gets the run recorded,
+done or failed; one that never does leaves the row as it was, with the error in arq's result."""
+
+
+_ENDED = frozenset({BacktestStatus.DONE, BacktestStatus.FAILED})
+"""The states a collection never leaves, and so the ones a waiting run stops waiting on."""
+
+
+def retry_delay(job_try: int) -> int:
+    """Seconds to wait before try `job_try + 1`: 5, 10, 15 … — room for a database to start."""
+    return 5 * job_try
+
+
+async def _still_collecting(ctx: dict[str, Any], session: Session, run_id: uuid.UUID) -> bool:
+    """Is this run waiting for data, and has the waiting been dealt with?
+
+    True means the caller must stop: the run was either deferred (a download is still going) or
+    failed (the wait outlived `WAIT_LIMIT`). False means there is nothing left to wait for — no
+    collection was ever linked, or every one of them has ended, done **or failed**.
+
+    ⚠️ **A failed download does not fail the run — his rule of 22/09.** It used to: *"half a window
+    is not a shorter measurement, it is a different one"*. He chose the other side of that: the run
+    goes ahead with what is on disk and **says** which download failed and why. Nothing here has to
+    write that down: the link row stays and `failed` is terminal (`finish_collection` closes a row
+    once), so every reader — the run's screen, a basket's, a sweep's — derives the warning from
+    `waiting_for`. And the window the run actually covered is already reported beside the one that
+    was asked for (`coverage`), which is what keeps the shorter measurement from passing as the
+    requested one. A run left with nothing at all on disk still fails, on the data, as it should.
+
+    ⚠️ **Deferred by enqueuing a new job, never by `Retry`.** `run_backtest`'s retry budget exists
+    for a database that is not answering, and it is eight tries; a wait of two hours is two
+    hundred and forty. Spending one budget on the other would make an unreachable database look
+    like a slow download, and would run out long before the data landed.
+
+    ⚠️ **On the run's own session, inside the caller's `try`.** A database that stops answering
+    while this question is being asked is the caller's case, not a new one, and answering it here
+    would be a second error policy for the same failure.
+    """
+    run = session.get(Backtest, run_id)
+    if run is None:
+        return False
+    # The run's own relationship, so the worker and the screen read one definition of "waiting
+    # for" — including its order — rather than two queries free to drift apart.
+    waits = run.waiting_for
+    if not waits:
+        return False
+
+    # Ended is done or failed: a failed download is waited for no longer, and the run reads what is
+    # there. The siblings still downloading are waited for as before — the run takes all it can get.
+    unfinished = [one for one in waits if one.status not in _ENDED]
+    if not unfinished:
+        return False
+
+    # The queue's last sign of life, or this run's birth when nothing has ever landed.
+    # ⚠️ Ordered rather than `func.max`: arq's own `func` registers this module's jobs at
+    # the bottom of the file, and importing SQLAlchemy's `func` over it breaks the worker at
+    # import time — which is how this was found.
+    last_delivery = session.scalar(
+        select(Collection.finished_at)
+        .where(Collection.finished_at.is_not(None))
+        .order_by(Collection.finished_at.desc())
+        .limit(1)
+    )
+    silent_since = max(run.created_at, last_delivery) if last_delivery else run.created_at
+    silent = _now() - silent_since > WAIT_LIMIT
+    # ⚠️ Asked only once the run has waited `OFF_GRACE`: the agent deletes its key on a clean
+    # stop, and a restart would otherwise read as "off" to every run polling in between.
+    off = (
+        not silent
+        and _now() - run.created_at > OFF_GRACE
+        and not await collector_running(ctx["redis"])
+    )
+    if silent or off:
+        # ⚠️ **The downloads are given up, not the run** (26/09). It used to fail here, with years
+        # on disk it could have read; failed downloads are what his rule of 22/09 already answers
+        # — the run goes ahead on what is there and says which download failed and why.
+        reason = (
+            "the collector is not running" if off else f"nothing was collected for {WAIT_LIMIT}"
+        )
+        for one in unfinished:
+            finish_collection(
+                session, one.id, at=_now(), error=f"{reason}; runs went ahead on what is on disk"
+            )
+        session.commit()
+        return False
+
+    await ctx["redis"].enqueue_job(
+        RUN_BACKTEST, str(run_id), _defer_by=dt.timedelta(seconds=WAIT_POLL_SECONDS)
+    )
+    return True
+
+
+def _fail(session: Session, run: Backtest, reason: str) -> None:
+    """Record a run that ends before it ever reads a candle.
+
+    ⚠️ `started_at` is stamped too, for `_record_failure`'s reason: the database refuses a row
+    that finished without starting, and a run failed while waiting has genuinely never run.
+    """
+    run.status = BacktestStatus.FAILED
+    run.error = reason
+    if run.started_at is None:
+        run.started_at = _now()
+    run.finished_at = _now()
+    session.commit()
+
+
 async def run_backtest(ctx: dict[str, Any], backtest_id: str) -> None:
     """The registered job. arq passes the run's id as a string; everything else is read from
-    the database inside `process_backtest`."""
+    the database inside `process_backtest`.
+
+    ⚠️ **The last try is ours, not arq's.** Past `max_tries` arq refuses the job without calling
+    this function, so a retry budget spent by arq would leave the row exactly where the bug left
+    it. On the last try the unreachable database is recorded as the run's failure — if the
+    database answers that write. If it does not, that write's error goes to arq's own result (the
+    original rides along as its context), and the row stays as it was: nothing here can write to
+    a database that is not there.
+
+    A database error that is **not** unreachability — a cancelled query on the first read — is
+    recorded the same way, on the first try: it is an answer, and retrying would get it again.
+    """
+    run_id = uuid.UUID(backtest_id)
     session: Session = ctx["session_factory"]()
     settings: Settings = ctx["settings"]
     try:
+        # ⚠️ Before anything is read for the run: a run told to collect first has no candles yet,
+        # and starting it would record "no candles in this window" for data on its way.
+        if await _still_collecting(ctx, session, run_id):
+            return
         await process_backtest(
             session=session,
             redis=ctx["redis"],
             parquet_root=settings.parquet_root,
-            backtest_id=uuid.UUID(backtest_id),
+            backtest_id=run_id,
+            read=ctx["candles"].read,
+            reuse=settings.tradeforge_reuse,
+        )
+    except DBAPIError as exc:
+        job_try: int = ctx.get("job_try", 1)
+        if database_unreachable(exc) and job_try < MAX_TRIES:
+            raise Retry(defer=retry_delay(job_try)) from exc
+        # ⚠️ **The old session is let go before the new one is opened.** If its connection were
+        # still alive inside an aborted transaction, it would hold this row's lock until ROLLBACK,
+        # and the new session's UPDATE would wait on it — synchronously, stalling the worker's
+        # whole event loop. Not reproduced against a real server; the order costs nothing.
+        _discard(session)
+        last = ctx["session_factory"]()
+        try:
+            _record_failure(last, run_id, exc)
+        finally:
+            last.close()
+        await _announce(ctx["redis"], run_id, {"status": "failed", "error": _reason(exc)})
+    finally:
+        session.close()
+
+
+def _discard(session: Session) -> None:
+    """Roll back and close, tolerating a connection that is already gone."""
+    # Nothing to roll back on a dead connection; closing hands it back, and the pool discards an
+    # invalidated one rather than reusing it.
+    with contextlib.suppress(DBAPIError):
+        session.rollback()
+    session.close()
+
+
+async def run_backtest_batch(ctx: dict[str, Any], run_ids: list[str]) -> None:
+    """The batch job (`batching`, ADR-0029). An unreachable database is handed back to arq, as a
+    single run's is; on the last try it is recorded on every run still open."""
+    session: Session = ctx["session_factory"]()
+    settings: Settings = ctx["settings"]
+    ids = [uuid.UUID(one) for one in run_ids]
+    # Only `OneTripWorker` sets it; under the plain `arq` command a cancelled batch fails its runs,
+    # as it did before (16/10).
+    told_to_stop = ctx.get(STOPPING)
+    try:
+        await process_batch(
+            session=session,
+            redis=ctx["redis"],
+            parquet_root=settings.parquet_root,
+            run_ids=ids,
+            retry_unreachable=ctx.get("job_try", 1) < MAX_TRIES,
+            read=ctx["candles"].read,
+            reuse=settings.tradeforge_reuse,
+            stopping=told_to_stop.is_set if told_to_stop is not None else lambda: False,
+        )
+    except DBAPIError as exc:
+        job_try: int = ctx.get("job_try", 1)
+        if database_unreachable(exc) and job_try < MAX_TRIES:
+            raise Retry(defer=retry_delay(job_try)) from exc
+        _discard(session)
+        last = ctx["session_factory"]()
+        try:
+            await _fail_open(last, ctx["redis"], ids, exc)
+        finally:
+            _discard(last)
+    finally:
+        _discard(session)
+
+
+async def run_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> None:
+    """The registered orchestrating job — one per walk-forward, never one per run.
+
+    ⚠️ **This job occupies a worker slot for the whole experiment**, minutes rather than
+    seconds, because it executes every fold's backtests itself. That is deliberate (see
+    `process_walk_forward`), and it is why `docker compose up -d --scale worker=4` matters
+    here more than anywhere else: with one worker, a running walk-forward means ordinary
+    backtests queue behind it.
+    """
+    session: Session = ctx["session_factory"]()
+    settings: Settings = ctx["settings"]
+    try:
+        await process_walk_forward(
+            session=session,
+            redis=ctx["redis"],
+            parquet_root=settings.parquet_root,
+            walk_forward_id=uuid.UUID(walk_forward_id),
+            read=ctx["candles"].read,
         )
     finally:
         session.close()
+
+
+async def run_cluster(ctx: dict[str, Any], cluster_id: str) -> None:
+    """Replay one cluster's members on a shared account (`cluster_job`). Runs no engine.
+
+    A member run again to keep its trades may not have finished: the job then asks again a few
+    seconds later — a new job id each time, since arq will not requeue one it is still holding.
+    """
+    session: Session = ctx["session_factory"]()
+    settings: Settings = ctx["settings"]
+    try:
+        waiting = process_cluster(
+            session=session,
+            parquet_root=settings.parquet_root,
+            cluster_id=uuid.UUID(cluster_id),
+            read=ctx["candles"].read,
+        )
+    finally:
+        session.close()
+    if waiting:
+        await ctx["redis"].enqueue_job(
+            RUN_CLUSTER, cluster_id, _defer_by=dt.timedelta(seconds=CLUSTER_WAIT_SECONDS)
+        )
+
+
+async def run_sweep_walk_forward(ctx: dict[str, Any], walk_forward_id: str) -> None:
+    """One step of a sweep's walk-forward (`sweep_walkforward_job.advance`): launch the tests
+    whose training has ended, queue their runs, and look again later while any fold is open."""
+    session: Session = ctx["session_factory"]()
+    try:
+        runs, pending = advance(session, uuid.UUID(walk_forward_id))
+        # Each fold's test is its own window, and a batch shares one: cut per test sweep.
+        by_test: dict[uuid.UUID | None, list[Backtest]] = {}
+        for one in runs:
+            by_test.setdefault(one.sweep_id, []).append(one)
+        jobs = [
+            job
+            for fold_runs in by_test.values()
+            for job in jobs_for(session, fold_runs, batch=ctx["settings"].tradeforge_batch)
+        ]
+    finally:
+        session.close()
+    await enqueue_runs(ctx["redis"], jobs)
+    if pending:
+        await ctx["redis"].enqueue_job(
+            RUN_SWEEP_WALK_FORWARD, walk_forward_id, _defer_by=dt.timedelta(seconds=30)
+        )
+
+
+async def run_template_queue(ctx: dict[str, Any], template_id: str) -> None:
+    """A template's queue (`template_queue_job.advance_queue`): launch the next market when the
+    last has ended, queue its runs, and look again every minute while one is running or waiting."""
+    session: Session = ctx["session_factory"]()
+    try:
+        # Collected by itself unless the host agent is off (26/09) — then the market runs on what
+        # is on disk, as any launch does.
+        collect = await collector_running(ctx["redis"])
+        jobs, collections, pending = advance_queue(
+            session,
+            uuid.UUID(template_id),
+            collect=collect,
+            batch=ctx["settings"].tradeforge_batch,
+        )
+        # Each download on its broker's queue (ADR-0032), named while the session is open.
+        downloads = [(str(one.id), collect_queue_for(session, one.symbol)) for one in collections]
+    finally:
+        session.close()
+    for collection_id, queue_name in downloads:
+        await ctx["redis"].enqueue_job(COLLECT_RANGE, collection_id, _queue_name=queue_name)
+    await enqueue_runs(ctx["redis"], jobs)
+    if pending:
+        await ctx["redis"].enqueue_job(
+            RUN_TEMPLATE_QUEUE, template_id, _defer_by=dt.timedelta(seconds=60)
+        )
 
 
 async def startup(ctx: dict[str, Any]) -> None:
@@ -147,6 +1244,12 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["settings"] = settings
     ctx["engine"] = engine
     ctx["session_factory"] = create_session_factory(engine)
+    # One per worker process, for as long as it lives (`candle_cache`). On a machine other than
+    # the main one, a series it lacks is fetched from the main API first (`candle_sync`, 09/10).
+    url = os.environ.get(CANDLES_URL_ENV)
+    ctx["candles"] = CandleCache(
+        reader=read_candles if not url else FetchingReader(read_candles, url)
+    )
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
@@ -156,12 +1259,54 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 class WorkerSettings:
     """`arq tradeforge_api.worker.WorkerSettings` starts the worker from this."""
 
-    functions = (run_backtest,)
+    # `run_backtest` spends the last try itself, so arq must be told the same number — stated on
+    # that function alone. The walk-forward keeps arq's default: it does not raise `Retry`.
+    functions = (
+        func(run_backtest, max_tries=MAX_TRIES),
+        # ⚠️ **Its own timeout** (ADR-0029): arq's default is five minutes, and twenty-four M5 runs
+        # take about a minute and a half here — three times that on the Xeon's slower cores.
+        func(run_backtest_batch, max_tries=MAX_TRIES, timeout=BATCH_TIMEOUT_SECONDS),
+        run_walk_forward,
+        run_cluster,
+        run_sweep_walk_forward,
+        run_template_queue,
+    )
     # Built from RedisConfig, not Settings: this line runs at import, and importing the worker
     # must not require the Postgres password. The DB config is read later, in `startup`.
     redis_settings = redis_settings(RedisConfig())
+    # ⚠️ **One job at a time** (23/09). arq's default is ten, which suits I/O; a backtest is
+    # synchronous CPU that blocks the event loop, so the other nine jobs this worker took would
+    # sit claimed and idle behind it — while another worker has nothing — and run into arq's job
+    # timeout without ever starting. More speed comes from more workers (`TRADEFORGE_WORKERS`).
+    max_jobs = 1
+    # ⚠️ **A twentieth of a second, not arq's half** (24/09). The run is synchronous CPU, so it
+    # holds the event loop through the poll that falls due while it runs, and the slot it frees is
+    # only seen on the poll after that: every run paid one whole `poll_delay` before the next one
+    # started. Measured on a CHOCH sweep, 0.508 s between runs of 1.24 s — 29% of the worker idle.
+    # The cost is an idle worker asking Redis twenty times a second instead of two, which is
+    # nothing to Redis even with forty workers asking.
+    poll_delay = 0.05
+    # ⚠️ **Told to stop, a worker finishes what it holds** (16/10, ADR-0036). arq's default
+    # cancels the job at once: a batch then failed its unwritten runs, and nothing ran them again.
+    # That was rare while a worker only stopped for a rebuild; with machines that scale their
+    # workers up and down through the day it would lose runs every time. With a wait, a SIGTERM
+    # stops the claiming, lets the job finish and then exits. The signal itself is only seen once
+    # the batch's synchronous CPU hands the event loop back — the wait counts from there.
+    job_completion_wait = STOP_WAIT_SECONDS
     on_startup = startup
     on_shutdown = shutdown
 
 
-__all__ = ["WorkerSettings", "process_backtest", "run_backtest"]
+__all__ = [
+    "MAX_TRIES",
+    "STOP_WAIT_SECONDS",
+    "WorkerSettings",
+    "database_unreachable",
+    "process_backtest",
+    "process_batch",
+    "process_walk_forward",
+    "retry_delay",
+    "run_backtest",
+    "run_backtest_batch",
+    "run_walk_forward",
+]

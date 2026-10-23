@@ -1,0 +1,35 @@
+# Keep the build context small and the images clean. Anything a build does not read, or that a
+# container should never carry, is excluded here — most importantly host-built artefacts (a Linux
+# image must never inherit a Windows .venv or node_modules) and secrets.
+.git
+.gitignore
+.github
+
+# Host-built dependency trees — reinstalled inside the image for the right platform.
+**/node_modules
+**/.venv
+.venv
+
+# Python and tool caches.
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+coverage.xml
+**/coverage
+
+# Frontend build output — produced inside the web image, never copied in.
+**/dist
+
+# Runtime data lives in a mounted volume, not baked into an image.
+data
+
+# Secrets never enter an image; config is injected as environment at run time.
+.env
+.env.*
+!.env.example
+
+# Teaching material and local scratch.
+docs/aulas
+*.log

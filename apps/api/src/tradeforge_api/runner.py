@@ -16,28 +16,42 @@ via `str`, so `1.1` stays `1.1` and never inherits a float's binary dust.
 from __future__ import annotations
 
 import datetime as dt
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 
+from pydantic import ValidationError
+
+from tradeforge_api.warm_window import WarmUp, warm_start, warmup_for
+from tradeforge_api.year_cut import Sizing, sizing_of
 from tradeforge_collector import step
-from tradeforge_db.models import Instrument
+from tradeforge_db.models import Backtest, Instrument
 from tradeforge_engine import (
     BacktestBroker,
     Candle,
     ClosedTrade,
+    CombinedCostModel,
     CommissionCostModel,
     InstrumentSpec,
     NoCostModel,
     PercentRiskManager,
+    ProportionalSpreadCostModel,
     SpreadCostModel,
+    SwapRates,
     compile_strategy,
     compute_metrics,
     run,
 )
 from tradeforge_engine import BacktestMetrics as EngineMetrics
 from tradeforge_engine import __version__ as ENGINE_VERSION  # noqa: N812 — public constant
+from tradeforge_engine.batch import BatchMember, run_batch
+from tradeforge_engine.domain import AssetClass
+from tradeforge_engine.loop import RunResult
 from tradeforge_engine.protocols import CostModel
+from tradeforge_engine.setup_factory import ReadingKey, reading_for
+from tradeforge_schema import SemanticValidationError, assert_executable
+from tradeforge_schema import Strategy as StrategyDSL
 
 
 def _decimal(value: object) -> Decimal:
@@ -45,7 +59,7 @@ def _decimal(value: object) -> Decimal:
     return Decimal(str(value))
 
 
-def _instrument_spec(instrument: Instrument) -> InstrumentSpec:
+def instrument_spec(instrument: Instrument) -> InstrumentSpec:
     """The engine's value object, projected from the database row. The `asset_class` enum is
     the very same `tradeforge_engine.domain.AssetClass` the ORM column stores — no translation."""
     return InstrumentSpec(
@@ -59,24 +73,117 @@ def _instrument_spec(instrument: Instrument) -> InstrumentSpec:
         contract_size=instrument.contract_size,
         digits=instrument.digits,
         exchange=instrument.exchange,
+        server_offset=instrument.server_offset,
     )
 
 
-def _cost_model(spec: Mapping[str, Any]) -> CostModel:
-    """Build the plugged-in cost model from its stored document (ADR-07). An unknown type
-    raises rather than silently running costless — the same loud-failure doctrine as the
-    exit-reason mapper and `build_indicator`."""
+def spec_document(spec: InstrumentSpec) -> dict[str, Any]:
+    """The specification as a run keeps it (`Backtest.instrument_spec`): decimals as strings, so
+    reading it back gives the very digits that were used."""
+    return {
+        "symbol": spec.symbol,
+        "name": spec.name,
+        "asset_class": spec.asset_class.value,
+        "currency_quote": spec.currency_quote,
+        "currency_base": spec.currency_base,
+        "tick_size": str(spec.tick_size),
+        "tick_value": str(spec.tick_value),
+        "contract_size": str(spec.contract_size),
+        "digits": spec.digits,
+        "exchange": spec.exchange,
+        # Hours, as the collector's `--server-offset` states it; `timedelta` is not JSON.
+        "server_offset_hours": spec.server_offset / dt.timedelta(hours=1),
+    }
+
+
+def spec_for(run: Backtest, instrument: Instrument) -> InstrumentSpec:
+    """The instrument a run is executed with: the one it kept (25/09), or — the first time — the
+    catalogue's current row, which the caller then keeps on the run.
+
+    ⚠️ **Never the current row once the run has one.** A later collection rewrites a non-USD
+    pair's tick value with that day's exchange rate, and a run executed again would then make the
+    same trades for a different amount of money.
+    """
+    kept = run.instrument_spec
+    if kept is None:
+        return instrument_spec(instrument)
+    # ⚠️ A run kept before 30/09 kept no clock: its higher bars were cut on the strategy's
+    # `htf_offset`, which was null everywhere — UTC. Read back as the zero it ran under, never as
+    # the catalogue's clock, which would re-run it cut somewhere else.
+    hours = kept.get("server_offset_hours", 0)
+    return InstrumentSpec(
+        symbol=kept["symbol"],
+        name=kept["name"],
+        asset_class=AssetClass(kept["asset_class"]),
+        currency_quote=kept["currency_quote"],
+        currency_base=kept["currency_base"],
+        tick_size=Decimal(kept["tick_size"]),
+        tick_value=Decimal(kept["tick_value"]),
+        contract_size=Decimal(kept["contract_size"]),
+        digits=int(kept["digits"]),
+        exchange=kept["exchange"],
+        server_offset=dt.timedelta(hours=float(hours)),
+    )
+
+
+def build_cost_model(spec: Mapping[str, Any]) -> CostModel:
+    """Build the plugged-in cost model from its stored document (ADR-07).
+
+       Public because a live session assembles the same object graph: the DSL-to-engine
+       translation is the boundary, not the backtest.
+    An unknown type
+       raises rather than silently running costless — the same loud-failure doctrine as the
+       exit-reason mapper and `build_indicator`."""
     kind = spec.get("type")
     if kind == "none":
         return NoCostModel()
+    if kind in {"spread", "spread_commission"} and spec.get("spread_reference_price") is not None:
+        # The spread quoted at one price, charged in proportion to each fill's (02/10): a crypto's
+        # price moved by multiples over the years a run covers (`ProportionalSpreadCostModel`).
+        spread: CostModel = ProportionalSpreadCostModel(
+            spread_points=_decimal(spec["spread_points"]),
+            reference_price=_decimal(spec["spread_reference_price"]),
+        )
+        if kind == "spread":
+            return spread
+        return CombinedCostModel(
+            spread,
+            CommissionCostModel(commission_per_unit=_decimal(spec["commission_per_unit"])),
+        )
     if kind == "spread":
         return SpreadCostModel(spread_points=_decimal(spec["spread_points"]))
     if kind == "commission":
         return CommissionCostModel(commission_per_unit=_decimal(spec["commission_per_unit"]))
-    raise ValueError(f"unknown cost model type {kind!r}; expected 'none', 'spread' or 'commission'")
+    if kind == "spread_commission":
+        # A raw-spread account (24/09): the spread crossed on each leg and a commission per lot on
+        # each leg, both charged — the engine's two models, summed.
+        return CombinedCostModel(
+            SpreadCostModel(spread_points=_decimal(spec["spread_points"])),
+            CommissionCostModel(commission_per_unit=_decimal(spec["commission_per_unit"])),
+        )
+    raise ValueError(
+        f"unknown cost model type {kind!r}; "
+        "expected 'none', 'spread', 'commission' or 'spread_commission'"
+    )
 
 
-def _take_profit_rr(definition: Mapping[str, Any]) -> Decimal | None:
+def swap_rates(spec: Mapping[str, Any]) -> SwapRates | None:
+    """The swap a cost document charges, or None — `{"swap": {"long_per_lot": "-5",
+    "short_per_lot": "-5"}}` beside any cost model, per standard lot per night and signed as the
+    broker quotes it (24/09). Kept beside the costs rather than inside them: a cost is a magnitude
+    and a swap can be a credit (`tradeforge_engine.swap`)."""
+    swap = spec.get("swap")
+    if swap is None:
+        return None
+    if not isinstance(swap, Mapping):
+        raise ValueError(f"swap must be an object of per-lot rates, got {swap!r}")
+    return SwapRates(
+        long_per_lot=_decimal(swap.get("long_per_lot", 0)),
+        short_per_lot=_decimal(swap.get("short_per_lot", 0)),
+    )
+
+
+def take_profit_rr(definition: Mapping[str, Any]) -> Decimal | None:
     take_profit = (definition.get("exit") or {}).get("take_profit")
     if not take_profit:
         return None
@@ -84,7 +191,7 @@ def _take_profit_rr(definition: Mapping[str, Any]) -> Decimal | None:
     return _decimal(rr) if rr is not None else None
 
 
-def _risk_percent(definition: Mapping[str, Any]) -> Decimal:
+def risk_percent(definition: Mapping[str, Any]) -> Decimal:
     sizing = (definition.get("risk") or {}).get("sizing") or {}
     percent = (sizing.get("params") or {}).get("percent")
     if percent is None:
@@ -92,18 +199,153 @@ def _risk_percent(definition: Mapping[str, Any]) -> Decimal:
     return _decimal(percent)
 
 
-def _within(
-    candles: Sequence[Candle], date_from: dt.datetime, date_to: dt.datetime
+def timeframe_refusal(definition: Mapping[str, Any], timeframe: str) -> str | None:
+    """Why this document cannot run at *this* timeframe, or `None` when it can.
+
+    ⚠️ **A document carries a `timeframe` and a run carries another, and nothing compared them.**
+    They are not the same field and they reach the engine by different roads: `execute_backtest`
+    below steps the loop at the **run's**, while `compile_strategy` reads the **document's** and
+    hands it to the setup, which builds its higher-timeframe bars out of it
+    (`setup_factory._structure_kwargs`). Every other caller of that road ignores it.
+
+    **The disagreement only matters when the document carries an `htf`**, and that is measured
+    rather than assumed: the base timeframe is passed to a setup only under
+    `if kwargs.get("htf") is not None`, and `CompiledStrategy.timeframe` — the road the
+    indicator-and-condition documents take — is assigned once and read nowhere. So re-running a
+    filterless strategy on another timeframe is exactly as safe as it has always been, and this
+    function says nothing about it.
+
+    ⚠️ **Under a filter the two timeframes must be the same**, and that is stricter than the
+    first version of this function, which only substituted and asked the DSL. Measured
+    2026-09-11 against the shipped `setup_structure_choch_htf` fixture with an H4 filter:
+
+    | document | run | broker clock | what the engine does |
+    |---|---|---|---|
+    | M15 | H4 | 3h | 6 bars in, 5 "H4" out: the filter is a one-bar-lagged copy of the chart |
+    | H1 | M15 | 3h | `EngineError` naming the boundary — loud |
+    | M15 | H1 | 3h | identical H4 bars — benign *here* |
+    | H1 | H1 | **3h30** | `EngineError`: the bar straddles the 00:30 boundary — correct |
+    | M15 | H1 | **3h30** | **6 H4 bars and no complaint at all** |
+
+    The last pair is why equality, and not merely "the substituted document is legal". The gate
+    is built with the **document's** bar width and the run feeds it the **run's**; when the
+    document's is the finer of the two, `BarAggregator`'s straddle guard compares the wrong
+    width and stops firing. The honest run raises and the mismatched one does not — the guard
+    that exists to catch misalignment is silenced by the misalignment. Half-hour broker clocks
+    are not hypothetical: `InstrumentSpec.server_offset` accepts them, and the ADR says so.
+
+    **Neither rule is restated here.** The semantic one is the DSL's own — a filter has to be
+    coarser than the chart and a whole number of its bars —
+    so this substitutes the run's timeframe into the document and asks `assert_executable`, the
+    authority that answered when the strategy was saved. The equality is this function's, and it
+    is about the *wiring* rather than the grammar: no DSL rule can see two timeframes at once,
+    because a document only ever declares one.
+
+    The caller is expected to have accepted `timeframe` already (`step()` refuses a name the DSL
+    does not define). A stored document that no longer validates is reported as the different
+    fact it is, rather than dressed up as a timeframe problem.
+    """
+    try:
+        assert_executable(StrategyDSL.model_validate({**definition, "timeframe": timeframe}))
+    except ValidationError as exc:
+        fields = ", ".join(str(error["loc"][-1]) for error in exc.errors())
+        return f"the stored document no longer validates ({fields})"
+    except SemanticValidationError as exc:
+        return str(exc)
+
+    # ⚠️ **After the DSL, not instead of it.** A run at or above the filter's own timeframe is
+    # refused above with `semantic.py`'s own sentence, which is the better message for the case
+    # it covers. What is left is the pair the grammar cannot see, because a document declares
+    # one timeframe and the comparison needs two.
+    declared = definition.get("timeframe")
+    if _filters_by_a_higher_timeframe(definition) and declared != timeframe:
+        return (
+            f"setup.params.htf: this strategy's higher-timeframe filter is built from {declared} "
+            f"bars, so it has to run on {declared}; running it on {timeframe} feeds the filter a "
+            f"bar width it was not built for"
+        )
+    return None
+
+
+def _filters_by_a_higher_timeframe(definition: Mapping[str, Any]) -> bool:
+    """Does this document's setup declare an `htf`?
+
+    Read from the document rather than from the compiled strategy, because this is asked before
+    anything is compiled — and read as *declared*, so an explicit `null` is the filter switched
+    off, exactly as `setup_factory._optional_timeframe` treats it.
+
+    A document built from indicators and conditions has no setup and no filter; it is the case
+    the whole equality rule must not touch, because its timeframe reaches nothing.
+    """
+    setup = definition.get("setup")
+    if not isinstance(setup, Mapping):
+        return False
+    params = setup.get("params")
+    if not isinstance(params, Mapping):
+        return False
+    return params.get("htf") is not None
+
+
+def _candles_to_run(
+    candles: Sequence[Candle],
+    symbol: str,
+    timeframe: str,
+    date_from: dt.datetime,
+    date_to: dt.datetime,
 ) -> list[Candle]:
-    """Clip to the requested window. Reading the whole (symbol, timeframe) and filtering here is
-    fine for phase 1; partition pruning by year is a later optimisation, not a correctness need."""
-    return [candle for candle in candles if date_from <= candle.time <= date_to]
+    """Clip to the requested window — and refuse to run over nothing.
+
+    Reading the whole (symbol, timeframe) and filtering here is fine for phase 1; partition
+    pruning by year is a later optimisation, not a correctness need.
+
+    The refusal is the point. A run with no candles used to finish as `done` with every metric
+    at zero, which reads exactly like a run whose strategy found no setups. Those two need
+    opposite responses — collect the data, versus nothing to do — and a screen full of zeroes
+    cannot say which you are looking at.
+
+    Note the line is drawn at *candles*, not at trades. A window full of candles that produces
+    no trades is a real answer and still succeeds; conflating the two would turn "my filter is
+    too strict" into an error message.
+    """
+    if not candles:
+        raise LookupError(
+            f"no candles have been collected for {symbol} {timeframe}; "
+            f"run the collector backfill for it before backtesting"
+        )
+
+    windowed = [candle for candle in candles if date_from <= candle.time <= date_to]
+    if not windowed:
+        raise LookupError(
+            f"{symbol} {timeframe} covers {candles[0].time:%Y-%m-%d} to "
+            f"{candles[-1].time:%Y-%m-%d}, and the requested window "
+            f"{date_from:%Y-%m-%d} to {date_to:%Y-%m-%d} contains none of it"
+        )
+    return windowed
+
+
+class CandleWindow(NamedTuple):
+    """What a run actually read, as opposed to what it asked for.
+
+    Returned alongside the result so the run can be *recorded* honestly. A request is not
+    evidence: asking for 2024-01-01 onwards when the dataset opens in August produces a
+    perfectly ordinary-looking result covering five months, and without this nothing
+    downstream can tell that from the two years the row claims.
+    """
+
+    # Not `count`: a NamedTuple inherits `tuple.count`, and a field of that name would shadow
+    # the method — mypy rejects it outright rather than let the two quietly disagree.
+    candles: int
+    first: dt.datetime
+    last: dt.datetime
+    warmed: int = 0
+    """Bars read before the window to warm the run up (ADR-0030): traded on as shadow, never
+    booked. Fewer than asked when the history does not reach back that far."""
 
 
 def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of a backtest run
     *,
     definition: Mapping[str, Any],
-    instrument: Instrument,
+    instrument: InstrumentSpec,
     timeframe: str,
     date_from: dt.datetime,
     date_to: dt.datetime,
@@ -111,30 +353,202 @@ def execute_backtest(  # noqa: PLR0913 — keyword-only; each names one axis of 
     cost_model: Mapping[str, Any],
     slippage_ticks: Decimal,
     candles: Sequence[Candle],
-) -> tuple[list[ClosedTrade], EngineMetrics]:
-    """Run the strategy over the windowed candles and fold the result into the §5 metrics."""
-    spec = _instrument_spec(instrument)
-    broker = BacktestBroker(
-        instrument=spec,
-        initial_capital=initial_capital,
-        cost_model=_cost_model(cost_model),
-        slippage_ticks=slippage_ticks,
-        take_profit_rr=_take_profit_rr(definition),
-    )
+    record_snapshots: bool = True,
+) -> Measured:
+    """Run the strategy over the windowed candles and fold the result into the §5 metrics.
+
+    Returns the window it actually read along with the result, so the caller can record what
+    the run saw rather than what it was asked for.
+
+    `record_snapshots=False` builds no entry pictures — a sweep's run, which keeps none
+    (`retention`). The trades and metrics are the same either way (`loop.run`).
+    """
+    windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
     result = run(
-        candles=_within(candles, date_from, date_to),
+        candles=[*_warm(candles, warmup_for(definition), date_from), *windowed],
         timeframe=step(timeframe),
-        instrument=spec,
-        strategy=compile_strategy(definition),
-        broker=broker,
-        risk=PercentRiskManager(percent=_risk_percent(definition)),
+        instrument=instrument,
+        strategy=compile_strategy(definition, server_offset=instrument.server_offset),
+        broker=broker_for(
+            definition=definition,
+            instrument=instrument,
+            initial_capital=initial_capital,
+            cost_model=cost_model,
+            slippage_ticks=slippage_ticks,
+            book_from=date_from,
+        ),
+        risk=risk_for(definition),
+        record_snapshots=record_snapshots,
     )
+    return _measured(result, initial_capital, windowed)
+
+
+class BatchRun(NamedTuple):
+    """One run of a batch, as `execute_batch` needs it: its document, its capital, its costs."""
+
+    definition: Mapping[str, Any]
+    initial_capital: Decimal
+    cost_model: Mapping[str, Any]
+
+
+class Measured(NamedTuple):
+    """What `execute_backtest` returns, and what each run of `execute_batch` comes to."""
+
+    trades: list[ClosedTrade]
+    metrics: EngineMetrics
+    window: CandleWindow
+    sizing: Sizing
+    """How the run sized its trades, year by year — what says whether it can be cut (`year_cut`)."""
+
+
+def execute_batch(  # noqa: PLR0913 — keyword-only; each names one axis the batch shares
+    *,
+    key: ReadingKey,
+    runs: Sequence[BatchRun],
+    instrument: InstrumentSpec,
+    timeframe: str,
+    date_from: dt.datetime,
+    date_to: dt.datetime,
+    candles: Sequence[Candle],
+) -> list[Measured | Exception]:
+    """`execute_backtest` for many runs over one market, the market read once per bar (ADR-0029).
+
+    Every run shares the window, the instrument and the reading `key` (`shared_reading`); each
+    keeps its own document, capital and costs, built into its broker and risk exactly as
+    `execute_backtest` builds them. One outcome per run, in order: what `execute_backtest` would
+    have returned, or the error that ended that run alone — a document that does not compile, a
+    run that raised. A sweep's run keeps no pictures, so none are built (`retention`).
+    """
+    windowed = _candles_to_run(candles, instrument.symbol, timeframe, date_from, date_to)
+    # One stream of bars for every member, so one warm-up: a batch holds only runs that warm up
+    # alike (`batching.batch_key`), and one that does not is refused rather than fed another's.
+    warmups = {warmup_for(batch_run.definition) for batch_run in runs}
+    if len(warmups) != 1:
+        raise ValueError(f"a batch's runs warm up differently: {sorted(map(str, warmups))}")
+    (warmup,) = warmups
+    # The bars above are cut on the instrument's clock (30/09); a key built on another would
+    # hand every run a market cut where this instrument's is not.
+    if key[1] != instrument.server_offset:
+        raise ValueError(
+            f"a batch's reading is cut at {key[1]}, not on {instrument.symbol}'s clock "
+            f"({instrument.server_offset})"
+        )
+    reading = reading_for(key, timeframe=step(timeframe))
+    outcomes: list[Measured | Exception | None] = []
+    members: list[BatchMember] = []
+    for batch_run in runs:
+        try:
+            members.append(
+                BatchMember(
+                    strategy=compile_strategy(
+                        batch_run.definition,
+                        server_offset=instrument.server_offset,
+                        reading=reading,
+                    ),
+                    broker=broker_for(
+                        definition=batch_run.definition,
+                        instrument=instrument,
+                        initial_capital=batch_run.initial_capital,
+                        cost_model=batch_run.cost_model,
+                        slippage_ticks=Decimal(0),
+                        book_from=date_from,
+                    ),
+                    risk=risk_for(batch_run.definition),
+                )
+            )
+            outcomes.append(None)
+        except Exception as exc:  # noqa: BLE001 — this run's refusal, not the batch's
+            outcomes.append(exc)
+    ran = iter(
+        run_batch(
+            candles=[*_warm(candles, warmup, date_from), *windowed],
+            timeframe=step(timeframe),
+            instrument=instrument,
+            reading=reading,
+            members=members,
+            record_snapshots=False,
+        )
+    )
+    measured: list[Measured | Exception] = []
+    for batch_run, refused in zip(runs, outcomes, strict=True):
+        if refused is not None:
+            measured.append(refused)
+            continue
+        outcome = next(ran)
+        if outcome.error is not None:
+            measured.append(outcome.error)
+        else:
+            assert outcome.result is not None  # noqa: S101 — `BatchOutcome` holds one or the other
+            measured.append(_measured(outcome.result, batch_run.initial_capital, windowed))
+    return measured
+
+
+def broker_for(  # noqa: PLR0913 — keyword-only; each names one part of the venue
+    *,
+    definition: Mapping[str, Any],
+    instrument: InstrumentSpec,
+    initial_capital: Decimal,
+    cost_model: Mapping[str, Any],
+    slippage_ticks: Decimal,
+    book_from: dt.datetime | None = None,
+) -> BacktestBroker:
+    """The broker a run trades through — built once here for a run on its own and for a batch.
+
+    `book_from` is where its account opens (ADR-0030): what fills before it is warm-up.
+    """
+    return BacktestBroker(
+        instrument=instrument,
+        initial_capital=initial_capital,
+        cost_model=build_cost_model(cost_model),
+        swap=swap_rates(cost_model),
+        slippage_ticks=slippage_ticks,
+        take_profit_rr=take_profit_rr(definition),
+        book_from=book_from,
+    )
+
+
+def _warm(candles: Sequence[Candle], warmup: WarmUp, date_from: dt.datetime) -> Sequence[Candle]:
+    """The bars before the window a run warms up on (ADR-0030, `warm_window`)."""
+    return candles[warm_start(candles, warmup, date_from) : _opens(candles, date_from)]
+
+
+def _opens(candles: Sequence[Candle], date_from: dt.datetime) -> int:
+    return bisect_left(candles, date_from, key=lambda candle: candle.time)
+
+
+def risk_for(definition: Mapping[str, Any]) -> PercentRiskManager:
+    """The sizing a run's document asks for — the same for a run on its own and for a batch."""
+    return PercentRiskManager(percent=risk_percent(definition))
+
+
+def _measured(result: RunResult, initial_capital: Decimal, windowed: Sequence[Candle]) -> Measured:
     metrics = compute_metrics(
         trades=result.trades,
         equity_curve=result.equity_curve,
         initial_capital=initial_capital,
     )
-    return list(result.trades), metrics
+    window = CandleWindow(len(windowed), windowed[0].time, windowed[-1].time, result.warmed)
+    sizing = sizing_of(
+        trades=result.trades,
+        equity_curve=result.equity_curve,
+        refusals=result.refusals,
+        initial_capital=initial_capital,
+    )
+    return Measured(list(result.trades), metrics, window, sizing)
 
 
-__all__ = ["ENGINE_VERSION", "execute_backtest"]
+__all__ = [
+    "ENGINE_VERSION",
+    "BatchRun",
+    "CandleWindow",
+    "broker_for",
+    "build_cost_model",
+    "execute_backtest",
+    "execute_batch",
+    "instrument_spec",
+    "risk_for",
+    "risk_percent",
+    "swap_rates",
+    "take_profit_rr",
+    "timeframe_refusal",
+]

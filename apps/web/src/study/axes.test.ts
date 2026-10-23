@@ -1,0 +1,171 @@
+import { describe, expect, it } from 'vitest'
+
+import { axesFor } from './axes'
+
+describe('axesFor', () => {
+  it('tells a nullable axis how to ask for the run without the rule', () => {
+    // The value that is not on the parameter's own list and cannot be guessed from it. Without
+    // the sentence, `off` is a word only somebody who read the parser would try.
+    const [htf] = axesFor('structure_choch').filter((axis) => axis.path === 'setup.params.htf')
+    expect(htf?.hint).toMatch(/or off for none/)
+
+    const [side] = axesFor('mme9_breakout').filter((axis) => axis.path === 'setup.params.side')
+    expect(side?.hint).not.toMatch(/off/)
+  })
+
+  it("offers no axis for the broker clock, which is the instrument's", () => {
+    // Since 30/09 the higher bars are cut on the instrument's clock; a grid varying it would
+    // vary nothing the run reads.
+    for (const setup of ['structure_choch', 'structure_continuation'] as const) {
+      expect(axesFor(setup).map((axis) => axis.path)).not.toContain('setup.params.htf_offset')
+    }
+  })
+
+  it('offers the parameters the chosen setup actually has', () => {
+    // ⚠️ Asserted against the **DSL's own** parameter names, which is the point of deriving
+    // them: this list is generated from the JSON Schema, which is generated from the Pydantic
+    // models. If someone adds a parameter in Python this test starts failing here — which is
+    // the failure you want, rather than a dropdown that quietly stays a version behind.
+    const paths = axesFor('mme9_breakout').map((axis) => axis.path)
+
+    // Required first — `side` has no default, so it is the one that must be answered — and the
+    // schema's own order after that.
+    // `entry_point`, `gift_stop` and `volume_filter` joined on 2026-09-07 with the bar patterns
+    // on the average — and a study can now grid over the entry point itself.
+    // `long_average_period` joined on 2026-09-09 with his direction filter. ⚠️ A grid can vary
+    // the period but cannot ask for the filter *off*: `null` is not one of the values an axis
+    // enumerates, so "filtered against unfiltered" is still two runs. In `specs/backlog.md`.
+    expect(paths).toEqual([
+      'setup.params.side',
+      'setup.params.breakeven_at_r',
+      'setup.params.entry_point',
+      'setup.params.gift_stop',
+      'setup.params.long_average_period',
+      'setup.params.period',
+      'setup.params.stop_buffer_ticks',
+      'setup.params.volume_filter',
+      // Not a parameter of the setup: the target lives in `exit`, and since 22/09 it is an axis
+      // like any other — including its `off`, which is the run with no target at all.
+      'exit.take_profit.params.rr',
+    ])
+  })
+
+  it('says what is legal for a bounded number, in its own bounds', () => {
+    const [period] = axesFor('mme9_breakout').filter(
+      (axis) => axis.path === 'setup.params.period',
+    )
+
+    expect(period?.hint).toBe('whole numbers at least 3 and at most 1000, separated by commas')
+  })
+
+  it('lists the choices for a parameter that has them', () => {
+    const [side] = axesFor('mme9_breakout').filter((axis) => axis.path === 'setup.params.side')
+
+    expect(side?.hint).toMatch(/one or more of long, short, both/)
+    expect(side?.example).toBe('long, short, both')
+  })
+
+  it('says true and false for a flag', () => {
+    const [secondary] = axesFor('structure_choch').filter(
+      (axis) => axis.path === 'setup.params.allow_secondary',
+    )
+
+    expect(secondary?.hint).toBe('true, false — separated by commas')
+    expect(secondary?.example).toBe('true, false')
+  })
+
+  it('builds its example around the value the author chose', () => {
+    // The default is what the strategy already uses, so a first study searches *around* it
+    // rather than away from it — and the reader can see at a glance that the middle value is
+    // the one they have been running.
+    const [period] = axesFor('mme9_breakout').filter(
+      (axis) => axis.path === 'setup.params.period',
+    )
+
+    expect(period?.example).toBe('4, 9, 14')
+  })
+
+  it('never suggests a value the server would refuse', () => {
+    // ⚠️ `stop_buffer_ticks` defaults to 0 with a floor of 0, so the naive "default minus a
+    // step" is -5 — a request the DSL rejects. An example that fails is worse than no example,
+    // because the reader tries it before they trust anything else on the screen.
+    const [buffer] = axesFor('mme9_breakout').filter(
+      (axis) => axis.path === 'setup.params.stop_buffer_ticks',
+    )
+
+    expect(buffer?.example).toBe('0, 1')
+    expect(buffer?.example).not.toMatch(/-/)
+  })
+
+  it('offers nothing for a strategy built from indicators rather than a setup', () => {
+    // Those vary at `indicators.0.params.period`, a shape this list does not describe. Saying
+    // nothing leaves the typed field in place; offering the wrong paths would not.
+    expect(axesFor(null)).toEqual([])
+  })
+
+  it('offers nothing rather than throwing for a setup this build does not know', () => {
+    // The API is the authority on what setups exist. A screen that threw here would go blank
+    // over a strategy it merely could not describe — a worse outcome than one missing dropdown.
+    expect(axesFor('something_the_server_knows_about')).toEqual([])
+  })
+
+  it('steps a fractional parameter by a fraction, not by one', () => {
+    // ⚠️ The defect the probe caught before any test existed. `stop_buffer` is a *fraction of a
+    // region's width*, defaulting to 0.1 — and a step floored at 1 suggested `0.1, 1.1`, an
+    // eleven-fold jump offered as a reasonable thing to search. Flooring at 1 is right for a
+    // period and absurd for a fraction, and only one of those is obvious from the code.
+    const [buffer] = axesFor('structure_choch').filter(
+      (axis) => axis.path === 'setup.params.stop_buffer',
+    )
+
+    expect(buffer?.example).toBe('0.05, 0.1, 0.15')
+  })
+
+  it('says greater-than when the bound is exclusive, because at-least is a lie', () => {
+    // ⚠️ **This is the bug a reader actually met.** `breakeven_at_r` is `gt=0` in the DSL, and
+    // the spec used to fold that into `minimum: 0` — so the hint read "between 0 and 100", the
+    // reader typed `0, 1, 2, 3, 4` meaning "no breakeven", and the study came back 422 for
+    // doing exactly what the screen had suggested. Zero is not "off" here; null is — and since
+    // 2026-09-09 the hint says how to ask for it, which is the other half of that same bug.
+    const [breakeven] = axesFor('mme9_breakout').filter(
+      (axis) => axis.path === 'setup.params.breakeven_at_r',
+    )
+
+    expect(breakeven?.hint).toBe(
+      'numbers greater than 0 and at most 100, or off for none, separated by commas',
+    )
+    expect(breakeven?.hint).not.toMatch(/between 0/)
+  })
+
+  it('keeps the example off an exclusive bound too', () => {
+    // The hint and the example have to agree, or the button fills in the value the sentence
+    // above it just called illegal.
+    const [breakeven] = axesFor('mme9_breakout').filter(
+      (axis) => axis.path === 'setup.params.breakeven_at_r',
+    )
+
+    expect(breakeven?.example.split(', ')).not.toContain('0')
+  })
+})
+
+describe('the target as an axis', () => {
+  it('offers it under every setup, with off spelled out', () => {
+    // His ask (22/09). `off` is the whole point — the run with no target, which a setup that
+    // conducts its own stop wants to be compared against — so the hint has to name the word.
+    const [target] = axesFor('ponto_continuo').filter(
+      (axis) => axis.path === 'exit.take_profit.params.rr',
+    )
+
+    expect(target?.label).toBe('take profit (R)')
+    expect(target?.hint).toBe(
+      'numbers greater than 0 and at most 100, or off for none, separated by commas',
+    )
+    expect(target?.example).toBe('2, 3, off')
+  })
+
+  it('is not offered where the path field is, since that would replace it', () => {
+    // A strategy built from indicators has no dropdown at all: the row is a free text field, and
+    // one option would take it away. The path can still be typed, and the server knows it.
+    expect(axesFor(null)).toEqual([])
+  })
+})

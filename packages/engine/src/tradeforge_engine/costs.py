@@ -15,9 +15,11 @@ account, always ≥ 0. The `Fill` refuses a negative cost precisely so a sign bu
 at construction instead of as a strategy that mysteriously prints money.
 """
 
-from decimal import Decimal
+from collections.abc import Sequence
+from decimal import ROUND_HALF_EVEN, Decimal
 
-from tradeforge_engine.domain import ZERO, InstrumentSpec, Money, OrderRequest, Volume
+from tradeforge_engine.domain import ZERO, Candle, InstrumentSpec, Money, OrderRequest, Volume
+from tradeforge_engine.protocols import CostModel
 
 
 class SpreadCostModel:
@@ -44,11 +46,77 @@ class SpreadCostModel:
     def _half_spread(self, instrument: InstrumentSpec, volume: Volume) -> Money:
         return (self._spread_points / 2) * instrument.tick_value * volume
 
-    def entry_cost(self, order: OrderRequest, instrument: InstrumentSpec, price: Money) -> Money:  # noqa: ARG002
+    def entry_cost(  # the spread was chosen at construction; the bar is not consulted
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,
+        price: Money,  # noqa: ARG002
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
         return self._half_spread(instrument, order.volume)
 
-    def exit_cost(self, order: OrderRequest, instrument: InstrumentSpec, price: Money) -> Money:  # noqa: ARG002
+    def exit_cost(  # see entry_cost
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,
+        price: Money,  # noqa: ARG002
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
         return self._half_spread(instrument, order.volume)
+
+
+COST_QUANTUM = Decimal("1e-10")
+"""The precision a cost that does not terminate is rounded to — far below a cent, and far below the
+eight decimals a stored amount keeps, so no recorded money changes."""
+
+
+class ProportionalSpreadCostModel:
+    """A spread quoted in points at one price, charged in proportion to the price of each fill
+    (02/10) — for a market whose price moved by multiples over the years a run covers.
+
+    A spread in points is what a broker quotes today. On a currency pair it is the right figure
+    for every year: EURUSD has stayed within a factor of two. On a crypto it is not: XRP was
+    $0.20 in 2020 and $2.50 when its 100-point spread was quoted, so the same points were 5 % of
+    the price then and 0.4 % now, and a run over 2020 paid twelve times what the venue charged.
+    The venue's spread scales with the price; so does this one: `spread_points · price /
+    reference_price`, half on each leg, in ticks converted the engine's one way.
+    """
+
+    def __init__(self, *, spread_points: Decimal, reference_price: Decimal) -> None:
+        if spread_points < ZERO:
+            raise ValueError(f"spread must be a magnitude, got {spread_points}")
+        if reference_price <= ZERO:
+            raise ValueError(f"a reference price must be positive, got {reference_price}")
+        self._spread_points = spread_points
+        self._reference_price = reference_price
+
+    def _half_spread(self, instrument: InstrumentSpec, volume: Volume, price: Money) -> Money:
+        points = self._spread_points * price / self._reference_price
+        # ⚠️ Rounded to `COST_QUANTUM`: the division by the reference price is the first cost in
+        # the engine that does not terminate, and a ledger summing unterminated costs drifts from
+        # its own balance in the twentieth decimal (engine-guardian, 02/10) — `sum(net_pnl) ==
+        # final equity - initial capital` must hold exactly.
+        return ((points / 2) * instrument.tick_value * volume).quantize(
+            COST_QUANTUM, rounding=ROUND_HALF_EVEN
+        )
+
+    def entry_cost(  # the bar is not consulted: the fill's own price scales the spread
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,
+        price: Money,
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
+        return self._half_spread(instrument, order.volume, price)
+
+    def exit_cost(  # see entry_cost
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,
+        price: Money,
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
+        return self._half_spread(instrument, order.volume, price)
 
 
 class CommissionCostModel:
@@ -67,10 +135,22 @@ class CommissionCostModel:
     def _commission(self, volume: Volume) -> Money:
         return self._commission_per_unit * volume
 
-    def entry_cost(self, order: OrderRequest, instrument: InstrumentSpec, price: Money) -> Money:  # noqa: ARG002
+    def entry_cost(  # a commission is indifferent to the bar it lands on
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,  # noqa: ARG002
+        price: Money,  # noqa: ARG002
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
         return self._commission(order.volume)
 
-    def exit_cost(self, order: OrderRequest, instrument: InstrumentSpec, price: Money) -> Money:  # noqa: ARG002
+    def exit_cost(  # see entry_cost
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,  # noqa: ARG002
+        price: Money,  # noqa: ARG002
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
         return self._commission(order.volume)
 
 
@@ -78,11 +158,114 @@ class NoCostModel:
     """No costs at all. For a golden test that isolates the fill logic from the cost logic —
     and for the degenerate baseline where you want to see the strategy's gross edge."""
 
-    def entry_cost(self, order: OrderRequest, instrument: InstrumentSpec, price: Money) -> Money:  # noqa: ARG002
+    def entry_cost(  # nothing is charged, so nothing is read
+        self,
+        order: OrderRequest,  # noqa: ARG002
+        instrument: InstrumentSpec,  # noqa: ARG002
+        price: Money,  # noqa: ARG002
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
         return ZERO
 
-    def exit_cost(self, order: OrderRequest, instrument: InstrumentSpec, price: Money) -> Money:  # noqa: ARG002
+    def exit_cost(  # see entry_cost
+        self,
+        order: OrderRequest,  # noqa: ARG002
+        instrument: InstrumentSpec,  # noqa: ARG002
+        price: Money,  # noqa: ARG002
+        candle: Candle,  # noqa: ARG002
+    ) -> Money:
         return ZERO
 
 
-__all__ = ["CommissionCostModel", "NoCostModel", "SpreadCostModel"]
+class BarSpreadCostModel:
+    """Forex, paper: the spread the venue was quoting on the bar the fill landed on.
+
+    Same arithmetic as `SpreadCostModel` — half the spread on each leg, in points, converted
+    by the instrument's tick value — and a different source for the one number. `SpreadCostModel`
+    is told the spread once, at construction, because a backtest has to *choose* one: the
+    historical bar carries the spread of the moment it was collected, not of the moment it
+    traded, and a decade of bars has no honest single answer. A paper session has the honest
+    answer on every bar, because the bar arrived seconds ago from the live stream.
+
+    ⚠️ **This is the model that makes paper trading paper trading**, and it is the whole of
+    the difference. The fill logic, the ledger, the P&L arithmetic and the event loop are the
+    same objects the backtest runs (ADR-01) — what changes is one plugged-in cost, which is
+    exactly the extension point ADR-07 exists to provide (AGENTS.md §5.6).
+
+    **A bar with no spread is refused, not treated as free.** `Candle.spread` defaults to `0`,
+    and a zero is what a synthetic candle, a hand-written fixture and a stream field that went
+    missing all look like. Charging nothing for those is a paper session reporting a costless
+    edge that the same strategy will not have live — the failure this model was written to
+    prevent, arriving through the model itself. So `require_spread` is on by default: a bar
+    that cannot say what it cost stops the session instead of flattering it. Set it to `False`
+    only for an instrument whose feed genuinely quotes no spread, and know that you are then
+    asserting free execution.
+    """
+
+    def __init__(self, *, require_spread: bool = True) -> None:
+        self._require_spread = require_spread
+
+    def _half_spread(self, instrument: InstrumentSpec, volume: Volume, candle: Candle) -> Money:
+        if candle.spread <= 0:
+            if self._require_spread:
+                raise ValueError(
+                    f"the bar at {candle.time.isoformat()} carries no spread "
+                    f"({candle.spread}); a paper fill cannot be priced from it"
+                )
+            return ZERO
+        return (Decimal(candle.spread) / 2) * instrument.tick_value * volume
+
+    def entry_cost(  # the fill price is the seam's; what this model reads is the bar
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,
+        price: Money,  # noqa: ARG002
+        candle: Candle,
+    ) -> Money:
+        return self._half_spread(instrument, order.volume, candle)
+
+    def exit_cost(  # see entry_cost
+        self,
+        order: OrderRequest,
+        instrument: InstrumentSpec,
+        price: Money,  # noqa: ARG002
+        candle: Candle,
+    ) -> Money:
+        return self._half_spread(instrument, order.volume, candle)
+
+
+class CombinedCostModel:
+    """Several ways of charging at once — a raw-spread forex account pays a spread **and** a
+    commission per lot (24/09), an index future the same.
+
+    Each leg costs the sum of what every part charges for it. A new class rather than a spread
+    model that also takes a commission: the two charges are already one class each, and a fused
+    one would be a third copy of arithmetic that exists twice (ADR-07, AGENTS.md §5.6).
+    """
+
+    def __init__(self, *parts: CostModel) -> None:
+        if not parts:
+            raise ValueError("a combined cost model needs at least one part")
+        self._parts: Sequence[CostModel] = parts
+
+    def entry_cost(
+        self, order: OrderRequest, instrument: InstrumentSpec, price: Money, candle: Candle
+    ) -> Money:
+        return sum(
+            (part.entry_cost(order, instrument, price, candle) for part in self._parts), ZERO
+        )
+
+    def exit_cost(
+        self, order: OrderRequest, instrument: InstrumentSpec, price: Money, candle: Candle
+    ) -> Money:
+        return sum((part.exit_cost(order, instrument, price, candle) for part in self._parts), ZERO)
+
+
+__all__ = [
+    "BarSpreadCostModel",
+    "CombinedCostModel",
+    "CommissionCostModel",
+    "NoCostModel",
+    "ProportionalSpreadCostModel",
+    "SpreadCostModel",
+]

@@ -1,0 +1,190 @@
+"""A run's risk in R — every number worked by hand from the R column."""
+
+import datetime as dt
+from decimal import Decimal
+
+from tradeforge_api.r_metrics import r_metrics
+from tradeforge_engine.domain import ClosedTrade, Side
+
+
+def trade(when: dt.datetime, r: str | None) -> ClosedTrade:
+    net = Decimal(0) if r is None else Decimal(r) * 100
+    return ClosedTrade(
+        symbol="EURUSD",
+        side=Side.LONG,
+        volume=Decimal("0.1"),
+        entry_time=when,
+        entry_price=Decimal("1.1"),
+        exit_time=when + dt.timedelta(hours=1),
+        exit_price=Decimal("1.1"),
+        gross_pnl=net,
+        costs=Decimal(0),
+        net_pnl=net,
+        stop_loss=None if r is None else Decimal("1.09"),
+        r_multiple=None if r is None else Decimal(r),
+    )
+
+
+def day(n: int, year: int = 2020) -> dt.datetime:
+    return dt.datetime(year, 1, 1, tzinfo=dt.UTC) + dt.timedelta(days=n)
+
+
+def run(*rs: str | None) -> list[ClosedTrade]:
+    return [trade(day(n), r) for n, r in enumerate(rs)]
+
+
+def test_the_drawdown_is_the_deepest_fall_from_the_running_peak() -> None:
+    """Cumulative: 2, 3, 1, 0, 2, -1, 3. Peak 3 after trade 2, trough -1 after trade 6 → 4."""
+    found = r_metrics(run("2", "1", "-2", "-1", "2", "-3", "4"))
+
+    assert found.net_r == Decimal("3")
+    assert found.max_drawdown_r == Decimal("4")
+
+
+def test_the_peak_starts_at_zero_so_an_opening_loss_is_a_drawdown() -> None:
+    found = r_metrics(run("-1", "-1", "3"))
+
+    assert found.max_drawdown_r == Decimal("2")
+
+
+def test_the_losing_streak_is_counted_and_its_deepest_cost_summed_apart() -> None:
+    """Streaks: [-1, -1, -1] = 3 trades, -3R; then [-2.5, -1] = 2 trades, -3.5R. The longest and
+    the deepest are different streaks, and each is reported for what it is."""
+    found = r_metrics(run("-1", "-1", "-1", "2", "-2.5", "-1", "1"))
+
+    assert found.losing_streak == 3
+    assert found.losing_streak_r == Decimal("-3.5")
+
+
+def test_break_even_ends_a_streak() -> None:
+    assert r_metrics(run("-1", "0", "-1")).losing_streak == 1
+
+
+def test_each_year_is_summed_and_the_share_counts_years_with_a_trade() -> None:
+    trades = [
+        trade(day(0, 2020), "2"),
+        trade(day(5, 2020), "-1"),
+        trade(day(0, 2021), "-3"),
+        trade(day(0, 2023), "0.5"),
+    ]
+
+    found = r_metrics(trades)
+
+    # 2022 had no trade: not a year that lost, not in the share.
+    assert found.yearly_r == {2020: Decimal("1"), 2021: Decimal("-3"), 2023: Decimal("0.5")}
+    assert found.positive_year_share == Decimal(2) / Decimal(3)
+
+
+def test_one_year_has_no_share() -> None:
+    assert r_metrics(run("1", "1")).positive_year_share is None
+
+
+def test_the_trades_are_read_in_entry_order_whatever_order_they_come_in() -> None:
+    assert r_metrics(list(reversed(run("2", "-3", "1")))).max_drawdown_r == Decimal("3")
+
+
+def test_a_trade_with_no_stop_is_left_out_of_everything() -> None:
+    found = r_metrics(run("-1", None, "-1"))
+
+    assert found.losing_streak == 2
+    assert found.net_r == Decimal("-2")
+
+
+def test_no_trades_is_zero_risk_and_no_share() -> None:
+    found = r_metrics([])
+
+    assert (found.net_r, found.max_drawdown_r, found.losing_streak) == (Decimal(0), Decimal(0), 0)
+    assert found.losing_streak_r == Decimal(0)
+    assert found.yearly_r == {}
+    assert found.positive_year_share is None
+
+
+def test_r_is_kept_by_year_of_entry_then_year_of_exit() -> None:
+    """ADR-0030: a longer run answers a window of whole years with the cells entered from its
+    first year and left by its last — a trade entered on New Year's Eve and left in January is
+    not the earlier year's alone."""
+    new_years_eve = dt.datetime(2020, 12, 31, 23, tzinfo=dt.UTC)
+    trades = [
+        trade(day(10, 2020), "2"),
+        trade(new_years_eve, "-1"),  # exits 2021-01-01 00:00
+        trade(day(10, 2021), "3"),
+    ]
+
+    found = r_metrics(trades)
+
+    assert found.by_years == {
+        2020: {2020: Decimal("2"), 2021: Decimal("-1")},
+        2021: {2021: Decimal("3")},
+    }
+    # By entry the year still counts the trade it opened, as before.
+    assert found.yearly_r == {2020: Decimal("1"), 2021: Decimal("3")}
+    assert sum(r for exits in found.by_years.values() for r in exits.values()) == found.net_r
+
+
+def test_the_trades_are_counted_in_the_same_cells_as_their_r() -> None:
+    """01/10: a cut counts its trades from the cells it sums (`year_cut`). A trade with no stop is
+    in no cell of the R, and in no cell of the count either."""
+    new_years_eve = dt.datetime(2020, 12, 31, 23, tzinfo=dt.UTC)
+    trades = [
+        trade(day(10, 2020), "2"),
+        trade(day(11, 2020), None),
+        trade(new_years_eve, "-1"),
+        trade(day(10, 2021), "3"),
+        trade(day(11, 2021), "-1"),
+    ]
+
+    found = r_metrics(trades)
+
+    assert found.trades_by_years == {2020: {2020: 1, 2021: 1}, 2021: {2021: 2}}
+    assert {entered: set(exits) for entered, exits in found.trades_by_years.items()} == {
+        entered: set(exits) for entered, exits in found.by_years.items()
+    }
+
+
+def month(m: int, d: int = 1) -> dt.datetime:
+    return dt.datetime(2021, m, d, 12, tzinfo=dt.UTC)
+
+
+def test_r_is_summed_per_month_of_entry_and_the_positive_months_shared() -> None:
+    """05/10: seven months with a trade; March has two that net -0.5. Positive: Jan, Feb, May,
+    Jun, Jul — five of seven."""
+    trades = [
+        trade(month(1), "2"),
+        trade(month(2), "1"),
+        trade(month(3, 2), "1"),
+        trade(month(3, 20), "-1.5"),
+        trade(month(4), "-1"),
+        trade(month(5), "0.5"),
+        trade(month(6), "3"),
+        trade(month(7), "1"),
+        trade(month(8), None),  # no stop, no R: not a month with a trade
+    ]
+
+    found = r_metrics(trades)
+
+    assert found.monthly_r == {
+        "2021-01": Decimal(2),
+        "2021-02": Decimal(1),
+        "2021-03": Decimal("-0.5"),
+        "2021-04": Decimal(-1),
+        "2021-05": Decimal("0.5"),
+        "2021-06": Decimal(3),
+        "2021-07": Decimal(1),
+    }
+    assert found.positive_month_share == Decimal(5) / Decimal(7)
+
+
+def test_too_few_months_have_no_share_rather_than_a_hundred_percent() -> None:
+    found = r_metrics([trade(month(m), "1") for m in range(1, 6)])
+
+    assert len(found.monthly_r) == 5
+    assert found.positive_month_share is None
+
+
+def test_a_month_that_ends_at_zero_is_not_positive() -> None:
+    trades = [trade(month(m), "1") for m in range(1, 6)] + [
+        trade(month(6, 2), "1"),
+        trade(month(6, 9), "-1"),
+    ]
+
+    assert r_metrics(trades).positive_month_share == Decimal(5) / Decimal(6)

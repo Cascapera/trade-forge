@@ -84,11 +84,6 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   worker durante o `run` (CPU-bound) e as queries. Aceitável na Fase 1 (um job por vez, processo
   dedicado), mas ao escalar concorrência do worker, mover o trabalho pesado para um executor de threads
   ou usar sessão async. Anotar como dívida de escala, não de correção.
-- [origem: PR-108] **Gráfico de candles com entradas/saídas** — a tela de resultados entrega cards +
-  curva de capital + tabela de trades, mas NÃO o gráfico de candles com marcadores de entrada/saída
-  (lightweight-charts). Falta o dado: OHLCV mora em Parquet (ADR-05), não no Postgres, e não há endpoint
-  que o sirva. Fatia seguinte: `GET /instruments/{symbol}/candles?tf&from&to` na API (lê via
-  `read_candles`, pagina/decima) + a série de candlestick na UI com os trades plotados. Escopo próprio.
 - [origem: PR-108] **Builder recursivo de condições** — o form guiado do PR-108 cobre comparações e UM
   nível de all/any (o caso das estratégias-demo). A DSL suporta all/any/not aninhados em qualquer
   profundidade; um editor de árvore recursivo (visual, arrastar/soltar) é o design final da Fase 2
@@ -231,3 +226,2894 @@ Ideias e trabalho fora do escopo do PR atual. Formato: `- [origem: PR-XXX] descr
   certo é no `Candle` (validar preço positivo de uma vez, para a engine inteira), não uma guarda a
   mais no setup — por isso ficou fora do PR-208. Decidir se o modelo aceita preço negativo como
   dado válido; se aceitar, a guarda do LONG é que está errada.
+- [origem: PR-210] **`Portfolio.initial_capital` é um acessor morto** — a property existe desde o
+  PR-105 e nenhum chamador a lê (o `compute_metrics` recebe o capital inicial como argumento, não
+  do portfólio). É a única linha do módulo sem cobertura, e por isso a única que faz o `portfolio.py`
+  não fechar 100%. Não foi tocada neste PR porque é anterior a ele e um PR = um escopo: decidir se
+  apaga a property ou se o `RunResult`/métricas passam a lê-la em vez de receber o número por fora.
+- [origem: PR-213] **Nenhum setup da camada swing/SMC é lançável pela DSL** — o
+  `PontoContinuoStrategy` nasceu com o construtor já preparado para vir de JSON (o `average` é
+  validado em runtime com `.get`, não confiando só no `Literal`, exatamente porque quem vai chamar
+  é uma camada de wiring sem tipos), mas esse chamador não existe: `apps/api/.../runner.py:128` só
+  faz `compile_strategy(definition)`, que entende indicador + comparação e mais nada. Vale para o
+  `Mme9BreakoutStrategy` e para o `StructureStrategy` também — tudo que foi construído desde o
+  PR-202 é invisível para a API e para a UI. Fora do escopo aqui porque é um PR de wiring (nó de
+  schema + fábrica + tipos gerados), não de engine, e é o próximo passo combinado.
+- [origem: PR-213] **`_MIN_CORRECTION` é constante de classe, não parâmetro** — o "2 correções" do
+  Ponto Contínuo é regra do autor e deliberadamente não é um botão que uma busca de parâmetros deva
+  girar, ao contrário do `breakeven_at_r`. Fica anotado porque no dia em que virar parâmetro os
+  quatro testes de contagem (consecutividade, estritura das duas comparações, queima no
+  cancelamento) são o que impede a mudança de passar despercebida — e porque a docstring da classe
+  descreve o 2 como escolha dele, o que um leitor pode confundir com configurabilidade.
+- [origem: PR-216] **O detector de gaps não conhece horário de pregão** — ele classifica como
+  "anômalo" tudo que não é fim de semana, então uma ação americana (que negocia ~6,5 h por dia)
+  produz um gap anômalo por madrugada: 499 deles num backfill de 2 anos do AAPL. O relatório vira
+  ruído exatamente onde deveria avisar, e um gap de verdade se esconde no meio. Precisa da sessão
+  do instrumento (o MT5 a expõe em `symbol_info().session_*`). Adiado: escopo do PR-216 é o
+  relógio do servidor, não a classificação de gaps.
+- [origem: PR-217] **As constraints do `rev_0001` estão com prefixo duplicado no banco** — o
+  alembic aplica a convenção de nomes do `base.py` POR CIMA do nome passado, e o `rev_0001`
+  passa o nome já completo. Resultado medido no Postgres: `ck_backtests_ck_backtests_date_range`
+  onde o modelo espera `ck_backtests_date_range` — vale para **todas** as checks das tabelas
+  criadas lá. Consequências: um `--autogenerate` reporta diferença fantasma, e qualquer
+  `op.drop_constraint` futuro que use o nome do modelo falha. Conserto é uma migration que
+  renomeia (`ALTER TABLE ... RENAME CONSTRAINT`), mecânica mas larga. Fora do escopo do PR-217,
+  que só precisava não repetir o erro — a `rev_0002` passa o nome **nu** e sai correta.
+- [origem: PR-216] **Medir o offset com o mercado fechado** — `offset_is_plausible` recusa uma
+  medição impossível (fim de semana, madrugada), mas uma parada mais curta que a faixa de ±14 h
+  passa despercebida: rodar duas horas após o fechamento mede duas horas a mais e parece normal.
+  Separar de verdade exige uma segunda leitura segundos depois, para ver se o tick ainda avança —
+  o que compra certeza com tempo de parede e não-determinismo. Hoje a saída é `--server-offset`.
+  Reabrir se alguém agendar backfill fora do pregão sem poder declarar o offset.
+- [origem: PR-218] **Os testes de integração apagam o banco para onde apontarem** — a fixture
+  `dsn()` (`packages/db/tests/conftest.py:30`) devolve `PostgresSettings().sqlalchemy_dsn`, ou
+  seja, **o banco que as variáveis de ambiente disserem**, e a fixture `session` faz
+  `TRUNCATE trades, backtest_metrics, backtests, strategies, datasets, instruments RESTART
+  IDENTITY CASCADE` antes de cada teste. No CI isso é inofensivo (o workflow sobe um Postgres
+  descartável como service). Na máquina do dev **não é**: rodar `POSTGRES_HOST=localhost
+  POSTGRES_PORT=5433 uv run pytest -m integration` esvazia o banco de desenvolvimento, e foi
+  exatamente o que aconteceu em 04/08 — os três backtests de 03/08 e os 4 instrumentos semeados
+  se perderam (o Parquet, que é o dado caro, não foi tocado). Nada avisa: o comando é o mesmo
+  que o CI roda e a suíte passa 36/36.
+  Conserto candidato: a fixture criar/derrubar um banco próprio (`tradeforge_test`) a partir do
+  DSN recebido, em vez de usar o banco nomeado nele — assim o comando fica idêntico em CI e
+  local e a segurança não depende de quem lembrou de exportar a variável certa. Uma recusa
+  explícita ("o DSN aponta para um banco com dados; use um banco de teste") é o mínimo.
+  **Paliativo que já funciona** (verificado em 04/08, PR-219): `POSTGRES_DB` existe e é
+  respeitado, então dá para rodar em segurança criando o banco à mão primeiro —
+  `docker compose exec -T postgres psql -U tradeforge -d postgres -c "CREATE DATABASE
+  tradeforge_test OWNER tradeforge;"` e depois `POSTGRES_HOST=localhost POSTGRES_PORT=5433
+  POSTGRES_DB=tradeforge_test uv run pytest -m integration --no-cov`. Passa 36/36 e não toca
+  no banco de desenvolvimento. O item continua aberto porque isso depende de lembrar da
+  variável, que é exatamente o que falhou.
+- [origem: PR-220] **Um buraco no meio de uma série de snapshot é acidental, não estrutural** —
+  `_AverageTrail.record` pula leituras `None`, e isso só produz buraco à esquerda (aquecimento)
+  porque `SMA.value()` e `EMA.value()` nunca voltam a `None` depois de aquecer. **`VWAP.value()`
+  devolve `None` quando não houve volume** (`indicators.py`), então no dia em que um trail for
+  construído sobre VWAP uma barra sem negócio no meio da sessão produz exatamente o buraco que o
+  docstring de `SnapshotSeries` chama de "sem causa legítima" — em silêncio, e num indicador
+  intradiário isso é rotina, não exceção. Achado pelo engine-guardian na revisão do PR-220.
+  Conserto quando existir o primeiro trail não-média: ou o ponto passa a admitir valor nulo (e o
+  desenho quebra a linha ali de propósito), ou o trail recusa lacuna interna. Hoje é inalcançável
+  — o único produtor é a média — por isso fica anotado em vez de resolvido.
+- [origem: PR-223] **"Uma região é oferecida no máximo uma vez" não tem prova** — na varredura que
+  o rompimento faz, `structure.py:1186` guarda `r.index > self._index`. Trocado por `>=`, a suíte
+  inteira passa. O efeito da mutação é real: uma região nascida na *própria* barra do rompimento
+  sobrevive à limpeza e, se for do mesmo lado, pode ser oferecida de novo num rompimento posterior
+  com outro `confirmed_at` — dois `TrackedZone` para o mesmo gap, e um deles com a idade errada.
+  Fora do escopo do PR-223 porque o comportamento é **idêntico ao da base** (`g.time >
+  break_.time` também esvaziava tudo); o PR não mexeu nessa linha. Achado pelo engine-guardian.
+- [origem: PR-223] **Coletar dados pela tela, com busca de ticker no MT5** — pedido dele em
+  06/08/2026: escolher ativo e timeframe no front e o sistema coleta, mais um campo de busca que,
+  ao digitar o ticker, pergunta ao MT5 se aquele símbolo existe. Motivação real: ele troca de
+  corretora/mercado dentro do MT5, então a lista de símbolos disponíveis **muda**, e hoje a única
+  porta é a CLI do collector.
+  ⚠️ **A restrição que decide a forma:** `AGENTS.md §5.4` / ADR-02 — nada fora de `apps/collector`
+  e `apps/executor` importa a lib `MetaTrader5` — e o MT5 só roda no **host Windows**, enquanto a
+  API e o worker rodam **em container**. A API não pode falar com o MT5, nem hoje nem depois.
+  Desenho candidato, que reusa o encanamento que já existe em vez de inventar transporte:
+  1. **Um segundo worker arq, rodando no host** (fora do docker, ao lado do terminal MT5),
+     consumindo uma fila `collect` do mesmo Redis. A API só enfileira; o host coleta, escreve o
+     Parquet e cataloga. A tela acompanha por polling, exatamente como já faz com backtests.
+     O preço: ele precisa manter esse processo no ar, como já mantém o terminal aberto.
+  2. **Busca de símbolo não pode ser round-trip por tecla.** O mesmo worker publica um *snapshot*
+     do catálogo do broker (`mt5.symbols_get()` — 9550 símbolos na conta dele) para o Postgres, e
+     a API serve a busca daí: instantânea, e continua funcionando com o terminal fechado. Um botão
+     "sincronizar símbolos" cobre a troca de corretora, que é o caso que ele descreveu.
+  3. ⚠️ **Bloqueio conhecido, e ele já anunciou que vai cair nele:** `mt5_source.py` chama
+     `mt5.initialize()` **sem argumento**, então com dois terminais instalados não há como
+     escolher qual. Precisa de `--terminal-path` → `initialize(path=...)` antes de "trocar de
+     corretora" virar operação de tela.
+  4. Timeframe **não** é trabalho: a cadeia inteira já é agnóstica (a DSL é dona da lista dos 8,
+     a tela renderiza `TIMEFRAMES`, o collector mapeia por `getattr(mt5, f"TIMEFRAME_{tf}")` e a
+     constraint do banco aceita os 8). Hoje só existe H1 em disco porque só H1 foi coletado.
+- [origem: PR-223 / coleta 06/08] **As barras D1 chegam carimbadas um dia adiantado** — medido em
+  06/08/2026 no backfill de AAPL D1: **499 de 499** barras batem, candle a candle, com o pregão do
+  **dia seguinte** em UTC. A barra rotulada `2024-08-01 21:00Z` contém o pregão de 02/08.
+  Não é bug do collector: o servidor do broker é **UTC+3**, o dia dele abre à meia-noite do
+  servidor, e `--server-offset +3` converte isso corretamente para 21:00Z do dia anterior. O
+  carimbo é o instante de **abertura** da barra, que é a mesma convenção do H1 (13:00Z abre o
+  pregão das 13:30). Só que no D1 o instante de abertura cai na **data anterior** em UTC.
+  Consequências, em ordem de gravidade:
+  1. ⚠️ **Lookahead latente em multi-timeframe.** Uma barra D1 carimbada em 21:00Z do dia X resume
+     o pregão de X+1. Num backtest que misturasse D1 com H1/M15 ela seria consumida **antes** das
+     barras intradiárias que ela sumariza — lookahead puro, e do tipo que melhora o resultado em
+     silêncio. Hoje é inalcançável (um backtest roda **um** timeframe), por isso fica anotado em
+     vez de resolvido; vira bloqueante no dia em que multi-timeframe existir.
+  2. **A data reportada dos trades sai um dia errada** num backtest D1: um trade "de 01/08" na
+     tela aconteceu de fato em 02/08.
+  3. **A janela do backtest desloca.** `_candles_to_run` filtra por `date_from <= time <= date_to`,
+     então pedir `date_from=2024-08-01` inclui uma barra que é o pregão de 02/08 e exclui a de
+     01/08 (carimbada em 2024-07-31 21:00Z).
+  Conserto candidato: normalizar o carimbo do D1 (e de qualquer timeframe >= D1) para a **data da
+  sessão** que a barra representa, em vez do instante de abertura no servidor. Precisa da sessão
+  do instrumento, que é a mesma dependência do item dos gaps anômalos acima — os dois se resolvem
+  juntos. Intraday (M5/M15/H1/H4) **não** tem o problema: conferidos contra o H1, batem exatamente
+  (2948, 2970 e 996 comparações, zero divergências) e nunca cruzam a fronteira do dia.
+- [origem: coleta 06/08] **O MT5 recusa `copy_rates_range` acima de ~11 mil barras** — medido com
+  AAPL M5: 2 anos (~42 mil) e o ano de 2025 inteiro (~19 mil) devolvem `(-2, 'Terminal: Invalid
+  params')`, enquanto 3 meses (4.799), 2024 parcial (7.993) e 2026 parcial (11.161) passam. O erro
+  **não distingue** "timeframe indisponível" de "pedi demais", e a mensagem que o collector propaga
+  também não. Paliativo usado: coletar **por ano-calendário**, porque `write_candles` usa
+  `existing_data_behavior="delete_matching"` e substitui exatamente as partições de ano da rodada
+  — fatiar *dentro* de um ano apagaria o pedaço anterior. Para 2025 foi preciso buscar duas metades
+  em diretórios temporários e gravar o ano numa única chamada. Conserto candidato: o collector
+  fatiar sozinho quando o intervalo pedido exceder o limite, acumulando antes de escrever; e a
+  mensagem de erro sugerir a janela menor em vez de só repassar o código do terminal.
+- [origem: coleta 06/08] **Backfill em pedaços deixa o catálogo descrevendo só o último pedaço** —
+  `record_dataset` (`packages/db/.../instruments.py`) faz upsert com
+  `index_elements=[Dataset.instrument_id, Dataset.timeframe]`, então cada rodada **substitui** a
+  linha em vez de estender a cobertura. Como o limite de ~11 mil barras do MT5 (item acima) obriga
+  a coletar por ano, a linha final descreve apenas o último ano coletado. Medido em 06/08, disco
+  contra catálogo: EURUSD e GBPUSD H1 têm **9804** candles desde 01/01/2025 no Parquet e o catálogo
+  diz **3605** desde 01/01/2026; AAPL M5 tem **38 391** desde 01/08/2024 e o catálogo diz
+  **11 161** desde 02/01/2026. Escrever pelo `write_candles` direto (como foi preciso fazer para
+  fundir as metades de 2025) não cataloga nada.
+  Não bloqueia nada hoje: o backtest lê o Parquet do disco e **nada** na API ou na web consulta
+  `datasets` — o próprio `config.py` diz que "the `datasets` row only proves coverage, the bytes
+  live on disk". Mas é exatamente a tabela cujo propósito é provar cobertura, e ela está afirmando
+  menos do que existe. Conserto candidato: o upsert unir a faixa (`least(date_from)`,
+  `greatest(date_to)`) e recontar do Parquet em vez de confiar no que a rodada trouxe — recontar é
+  o único jeito de a linha ficar verdadeira depois de uma escrita que não passou pelo CLI.
+  ⚠️ **AAPL H1 não está no catálogo** por outro motivo, já registrado: foi coletado em 03/08 e o
+  banco foi truncado em 04/08 pelos testes de integração; os instrumentos foram resemeados, os
+  datasets não.
+- [origem: PR-226+ / 11-08-2026] **`upsert_dataset` carimba `collected_at` pelo relógio do
+  processo, não pelo do banco** — `instruments.py` monta o `set_` do `ON CONFLICT` com
+  `dt.datetime.now(tz=dt.UTC)`. Está correto no essencial (ao contrário do `updated_at` dos
+  instrumentos, que não se movia e foi corrigido em `fix/instruments-updated-at`): a coluna
+  **avança** a cada upsert. O que diverge é a fonte do tempo. `models._created_at` declara a
+  regra do projeto — *"server_default, not a Python default: the database's clock is the one
+  clock every writer shares, whatever timezone the machine that inserted thinks it is in"* — e
+  esse caminho é exatamente o que a regra descreve: quem escreve é o collector no **host
+  Windows** e a linha vive no **container**, dois relógios que não têm obrigação de concordar.
+  Consequência real, embora pequena: `datasets.collected_at` e `instruments.updated_at` passam a
+  ser medidos por relógios diferentes, então ordenar ou comparar as duas colunas entre si pode
+  inverter eventos próximos. Não bloqueia nada — nada na API nem na web lê `datasets`
+  (ver o item da cobertura acima). Conserto: trocar por `func.now()`, uma linha, junto do
+  primeiro trabalho que já for tocar `upsert_dataset` — provavelmente o item da cobertura, que
+  vai reescrever esse `set_` de qualquer forma.
+- [origem: PR-228] **Agregar candles quando uma corrida passa do teto do gráfico** — o
+  `GET /backtests/{id}/candles` recusa (422) uma corrida que leu mais de 50 000 barras, em vez de
+  reduzir. Recusar é deliberado: **decimar está errado** — um candle não é uma amostra de preço, é
+  o resumo de um intervalo, e jogar fora nove de cada dez apaga máximas e mínimas, inclusive a
+  máxima que estopou o trade. O gráfico ficaria liso, plausível e sem a barra que explica o trade
+  ao lado. A redução correta é **agregar** (primeiro open, maior high, menor low, último close),
+  que preserva os extremos — mas é uma regra com borda de verdade (o que fazer com o balde
+  incompleto no fim da janela) e merece testes próprios. Adiado por não ter caso de uso: o maior
+  dataset do projeto tem 38 986 barras (EURUSD M15) e a corrida mais longa já executada leu
+  12 883, então hoje **tudo cabe inteiro** e nada é reduzido. Fazer quando houver M1 coletado.
+- [origem: PR-228] **Endpoint genérico de candles por instrumento** — hoje as barras só são
+  servidas presas a uma corrida (`/backtests/{id}/candles`), de propósito: a janela é a
+  procedência que a corrida gravou, então o gráfico não pode ser pedido para um período que ela
+  não executou. Um `GET /instruments/{symbol}/candles?timeframe&from&to` é o superconjunto e vai
+  fazer falta na hora de **pré-visualizar o dado antes de lançar** e na tela de coleta (item do
+  PR-223). Fazer quando existir esse segundo consumidor — não antes, porque um endpoint com
+  janela livre convida a tela de resultado a montar a janela sozinha e a errá-la em silêncio.
+- [origem: PR-228] **Docstring órfã em `apps/web/src/api/hooks.ts`** — o bloco que descreve o
+  snapshot por trade ("The entry picture for one trade, fetched only once someone opens it")
+  está imediatamente acima de `useCreateBasket`, não de `useTradeSnapshot`. Documentação
+  apontando para a função errada, sem efeito em runtime. Mover junto do próximo trabalho que já
+  for tocar o arquivo.
+- [origem: PR-229] **Ancorar a curva do `/overlays` na trilha que a corrida persistiu** — hoje o
+  teste de valor do endpoint constrói a expectativa dirigindo o mesmo indicador sobre as mesmas
+  barras. Isso pega janela errada, contexto decimal errado, semente e alinhamento errados, mas
+  compartilha a implementação da EMA. A âncora **forte** já existe no banco e não precisa ser
+  inventada: uma corrida grava a média que julgou cada entrada dentro do `snapshot` daquele trade
+  (`_AverageTrail`), *durante* a corrida. Comparar o ponto servido no instante do snapshot com o
+  valor gravado ali fecha o laço contra números escritos pela corrida, não ao lado dela. Adiado
+  porque a fixture de integração não produz trade preenchido: numa série que sobe de forma
+  monotônica o MME9 rearma a cada barra e a ordem em repouso nunca é tomada — construir o cenário
+  que preenche é trabalho próprio. Fazer junto do PR que desenhar as regiões (ele vai precisar de
+  uma fixture que negocia de qualquer jeito).
+- [origem: PR-230] **A janela terminando na barra que CONFIRMA uma região** — o replay de
+  `_zones_of` já é provado alimentar o último candle da janela, mas só pelo lado da *mitigação*:
+  `test_the_last_bar_of_the_window_is_replayed_like_every_other` fecha a janela na barra cujo
+  pavio toma a secundária. O simétrico não tem cenário — uma janela que termina exatamente no
+  rompimento que **revela** regiões novas, que sob um replay curto sumiriam da resposta sem que
+  nada no payload pudesse dizer que faltou alguma. Não é bloqueante e não é regressão deste PR:
+  o laço é o mesmo para os dois eventos (não há ramo separado para "confirmar" e "mitigar"), e o
+  mutante genérico de truncamento já morre pelo teste que existe. O que falta é o cenário que
+  afirma o caso **pelo seu próprio nome** — construí-lo custa um probe novo sobre o
+  `GAPPING_IMPULSE` com a janela cortada na barra 9. Fazer junto do próximo trabalho que já for
+  tocar a marcação de regiões.
+- [origem: PR-203] **`_key` diverge em float ≥ 1e16 e a reutilização de estratégia falha em
+  silêncio** — o estudo compara documentos por `json.dumps(sort_keys=True)` para reusar a linha
+  já existente em vez de colidir no `unique(name, version)`. Medido no round-trip real por
+  `::jsonb`: `0.1`, `2.0`, `3.30`, `1e-07` e inteiros de 20 dígitos batem byte a byte, mas a
+  partir de `1e16` o Python escreve `1e+16` e o Postgres devolve `10000000000000000` — as duas
+  cadeias diferem, a reutilização não acontece, e o ponto vira **versão N+1 de uma linhagem
+  nova sem que nada dê erro**. Não é alcançável hoje: todo parâmetro numérico do DSL tem teto
+  (`le=1000`, `le=100`, `le=10_000`), e o único float sem teto é `Condition.value`
+  (`packages/schema/.../models.py:80`). Consertar comparando por JSONB do lado do banco, ou pôr
+  teto no `Condition.value`, no dia em que uma grade puder varrer esse campo.
+- [origem: PR-204] **A corrida de teste órfã, entre criá-la e ligá-la à dobra** — o resume pula a
+  dobra que já tem `test_backtest_id`, o que fecha o caso normal. Resta uma janela estreita: o
+  `_process_fold` grava a corrida out-of-sample (`session.commit()`) e só depois escreve
+  `fold.test_backtest_id = test.id` num segundo commit. Um worker morto **entre os dois** deixa
+  uma corrida real, executada e sem dono — e o retry, vendo a dobra sem link, cria uma segunda.
+  Não é regressão deste PR (a ordem é obrigatória: `test_backtest_id` é FK e o CHECK da dobra
+  recusa corrida de teste sem escolha por trás) e o sintoma é uma linha a mais no run log, não um
+  número errado no relatório. Consertar escrevendo as duas coisas na mesma transação, ou
+  adotando a corrida órfã pelo par (estratégia escolhida, janela de teste) antes de criar outra.
+- [origem: PR-204] **O portão de cobertura não enxerga o job que ele mais precisa medir** —
+  `ci.yml:53` roda `uv run pytest` sem integração e é aí que mora o `--cov-fail-under=90`; a
+  integração roda em `ci.yml:119` com `--no-cov`. Consequência estrutural: `worker.py` (30%),
+  `routers/walkforwards.py` (47%), `studies.py`, `backtests.py` e `baskets.py` contam como
+  descobertos mesmo com 103 testes de integração passando por eles, e a margem do portão vive
+  em torno de 0,2 pp — o PR-204 furou o piso pela primeira vez e o conserto foi escrever teste
+  sem banco, que é honesto mas não resolve a causa. Ver [[portao-de-cobertura-nao-ve-integracao]].
+  Opções: combinar os dois relatórios (`coverage combine` entre os jobs) e medir o total, ou
+  medir a integração com piso próprio. Não fazer dentro de um PR de produto.
+- ~~[origem: PR-201]~~ **FEITO no PR-206-A.** A linha do builder virou uma união discriminada por
+  forma (`comparison` | `between` | `trend`), o seletor de operador passou a oferecer os onze em
+  três `optgroup`, e a completude é provada **no compilador** (`MissingOp extends never`) contra os
+  tipos gerados do schema — um operador novo em Python que ninguém colocar num grupo faz o
+  `builder.ts` parar de compilar. Originalmente: **`between`, `rising` e `falling` não são construíveis pela tela** — os três nós
+  novos existem na DSL, na engine e no validador semântico, com teste de ouro cada um, mas a linha
+  de condição do builder é `esquerda | operador | direita` e eles não cabem nela: `between` tem
+  três operandos e `rising`/`falling` têm um mais um contador de barras. Reestruturar essa linha É
+  o **PR-206** (builder visual de blocos), que o próprio `specs/fase-2.md` separa. Até lá são
+  alcançáveis por JSON — o que serve para o motor e para a fixture, e não serve para ele. ⚠️ Ao
+  fazer o PR-206, lembrar que `OPS` no `strategy/builder.ts` é hoje uma lista só de operadores
+  binários: acrescentar os três ali **sem** mudar a linha produz documentos que o schema recusa.
+- [origem: PR-201] **`stop_buffer_ticks` e `stop_buffer` convivem e ninguém explicou a diferença**
+  — descoberto sondando o `setupSpec`: `mme9_breakout` e `ponto_continuo` têm `stop_buffer_ticks`
+  (inteiro, 0 a 10000, default 0) e os dois setups de estrutura têm `stop_buffer` (número, 0 a 10,
+  default 0,1, fração da largura da região). Nomes quase iguais, unidades diferentes, e a tela
+  mostra os dois com o mesmo tipo de campo. Não é bug — é dois conceitos com um nome parecido. Vale
+  renomear um dos dois ou fazer a dica dizer a unidade, no próximo PR que tocar a tela do builder.
+- ~~[origem: PR-201, achado do guardian]~~ **FEITO no PR-201-B.** `_period_builder` e `_period_source_builder` levantavam
+  `KeyError` cru** quando falta `params.period` (`indicators.py`), contra a promessa do módulo de
+  entregar "uma frase, não um traceback" — o `build_indicator` ao lado já refuta tipo desconhecido
+  e id ausente com `EngineError` legível. Não é regressão do PR-201: o `_period_source_builder`
+  sempre fez isso, e o builder novo herdou o padrão. Alcançável só por documento que não passou
+  pelo schema (a engine recebe mapping cru, por desenho). Consertar junto do próximo PR que tocar
+  o registro de indicadores — que é o PR-201-B (Bollinger e ADX).
+- [origem: PR-201, achado do guardian] **PARCIAL — `hypothesis` não cobre `ATR`/`Highest`/`Lowest`**
+  (o PR-201-B cobriu Bollinger e ADX: bandas nunca se cruzam e aquecem juntas; `+DI + -DI <= 100`,
+  que é o limite que pega denominador errado). Segue valendo para os três de PR-201-A. Originalmente: — existe
+  property de aquecimento para o RSI e nenhuma para `ATR`/`Highest`/`Lowest`. As candidatas
+  óbvias: o ATR nunca é negativo e nunca é menor que o maior `high-low` da janela dividido pelo
+  período; o `Highest` é sempre >= ao `Lowest` do mesmo período; e ambos são `None` exatamente
+  até a barra `period`. Barato, e pega a classe de erro que cenário escrito à mão não pega.
+
+- [origem: PR-201-B] **O ADX não pertence ao painel de preço** — as três linhas vivem em 0–100 e o
+  gráfico é de preço, então um `adx.adx` desenhado sai fora de escala e achata os candles.
+  ⚠️ **Não é regressão deste PR: o RSI tem o mesmo problema desde que existe** (`INDICATOR_TYPES`
+  sempre o ofereceu), e nenhuma estratégia dele desenha um até agora. O conserto é um painel
+  separado por escala no `PriceChart`, ou uma regra de "indicadores limitados não vão no painel de
+  preço". Enquanto isso, um Bollinger desenha certo porque é medido **em preço**.
+- ~~[origem: PR-201-B]~~ **FEITO no PR-206-B2.** O `IndicatorForm` deixou de ter campos escritos à
+  mão (`period`, `source`) e passou a guardar `values` por nome, dirigido pelo spec — o mesmo
+  desenho que o `SetupForm` já usava. O leitor de parâmetros saiu de dentro do `setups.ts` para um
+  `params.ts` compartilhado, então indicador e setup leem kind, limites, default e nulabilidade do
+  mesmo lugar. Efeito colateral bom: sumiu o `if (takesSource)` na dobra — a chave errada não tem
+  mais de onde vir. Originalmente: **O builder não tem controle para `deviations`** — a tela emite só
+  `{period, source}`, então uma banda montada nela é sempre de 2,0 desvios. O documento é válido
+  (o schema tem default 2.0), então não é bug: é um parâmetro inalcançável pela tela. O caminho é o
+  mesmo do PR-206 (builder visual), que já precisa de trabalho no formulário de indicador.
+- ~~[origem: PR-201-B]~~ **FEITO no PR-206-B2.** `readParams` ordena required primeiro para os
+  dois, e como `period` é o único dos três do Bollinger sem default, isso sozinho já o traz para o
+  topo. Originalmente: **`IndicatorSpec.params` vem em ordem alfabética** — é a ordem em que o JSON
+  Schema lista `properties`, então um formulário que renderiza a lista em sequência mostra
+  `deviations` **antes** de `period`. Passou desapercebido até agora porque `period` < `source` nos
+  outros sete. Vale o mesmo tratamento que o `setupSpec` já tem (required primeiro), no PR que tocar
+  o formulário de indicadores.
+- ~~[origem: PR-201-B]~~ **FEITO no PR-206-B1.** Os campos de operando viraram picker: o catálogo
+  oferece `price.*` e, por indicador declarado, `refsFor` decide a grafia — id nu para os
+  single-valued, um item por componente para os compostos, e **nunca** o `bb` sozinho. Para isso as
+  classes `Bollinger`/`ADX` passaram a publicar os componentes via `json_schema_extra`, e
+  `COMPOSITE_COMPONENTS` deixou de ser um literal para ser **derivado da união** — o número de
+  cópias em Python caiu de duas para uma, e os nomes chegam ao schema como **dado** em vez de
+  prosa. Originalmente: **Referenciar um componente exige digitar `bb.upper` à mão** — os campos de
+  operando do builder são texto livre, então funciona, mas nada oferece os três nomes nem avisa que
+  `bb` sozinho é recusado. O erro que chega é legível (a camada semântica lista os componentes), o
+  que torna isto atrito e não defeito. Some no PR-206.
+- ~~[origem: PR-301-A] **O laço não seleciona símbolos no MarketWatch**~~ — **FECHADO no PR-301-B**:
+  `LiveSource.subscribe` chama `symbol_select(symbol, True)` na subida e outra vez depois de cada
+  reconexão (Market Watch é estado do terminal, e sessão reatada é conversa nova). Um símbolo que
+  o terminal recusa agora para o watch com uma frase, em vez de virar silêncio permanente.
+- [origem: PR-301-A] **Um candle é anunciado até `--every` segundos depois de fechar** — o MT5 não
+  tem push, então o laço só percebe o fechamento no poll seguinte. Com o default de 5 s isso é 5 s
+  no pior caso. Não é defeito (é a natureza do poll), mas é latência que a sessão de paper herda, e
+  vale medir antes de alguém culpar a engine por "entrar tarde".
+- [origem: PR-301-A] **Ninguém lê os streams ainda** — `candles.{symbol}.{tf}` é escrito e nenhum
+  consumer group existe. Isso é o **PR-302** (PaperBroker). Enquanto isso os streams crescem até o
+  `maxlen` de 10 000 e param, que é o desenhado.
+- [origem: PR-301-A] **O D1 continua carimbado um dia adiantado** — a memória
+  `d1-carimbado-um-dia-adiantado` mediu 499 de 499 batendo com o pregão do dia seguinte no
+  backfill. ⚠️ **Ao vivo isto virou recusa no PR-301-B**: `tradeforge-collector live SYM D1` para
+  com a frase e o motivo, porque o consumidor do stream é uma sessão de paper que não lê log.
+  Falta o conserto de verdade — descobrir a fronteira do dia do broker e carimbar o D1 por ela,
+  no backfill **e** ao vivo, e então soltar a recusa (`cli._UNSTAMPED_TIMEFRAMES`).
+- [origem: PR-301-A] **O comando `live` é um processo de primeiro plano sem supervisão** — morre
+  com o terminal que o iniciou e não volta sozinho. O 301-B tratou a reconexão *do MT5* e o
+  buraco que um processo reiniciado deixa (ele retoma do rabo do stream), mas **reiniciar o
+  processo** continua sendo trabalho de fora: pertence ao mesmo lugar que for cuidar do executor
+  na fase 3.
+- [origem: PR-232 / medição de 19/08] **O `CostModel` é um número por run, e o spread muda uma
+  ordem de grandeza dentro de uma janela longa** — medido no EURUSD H1 deste broker: 11 pontos em
+  2010, 1 ponto de 2020 em diante. Cobrando um valor só na janela padrão (16,6 anos no H1/H4/D1),
+  o erro máximo é ~10 ticks, que contra a mediana de stop já medida (0,00116 = 116 ticks) é **~9%
+  de 1R** por round trip. Não é ruído. Conserto: custo variável no tempo — um `CostModel` que
+  aceite uma curva em vez de um escalar, ou custo lido da própria barra (`rates['spread']`, que
+  existe e hoje é ignorado no backtest). ⚠️ Não é regressão de nada: é um limite que sempre
+  existiu e que só ficou visível quando a janela passou a poder ser longa.
+- [origem: PR-232 / medição de 19/08] **O piso de 2010 é do EURUSD deste broker e precisa ser por
+  símbolo** — a fronteira "spread carimbado vs medido" foi medida num par de forex. Uma ação
+  americana, um índice ou um cripto têm cada um a sua data (e alguns nem têm histórico antes de
+  existirem). A sonda do PR-233 deve descobrir isso por símbolo em vez de assumir 2010; usar o
+  número do EURUSD para tudo seria a mesma família de erro que este PR passou a sessão inteira
+  consertando.
+- [origem: PR-232 / medição de 19/08] **24 dos 84 símbolos deste broker não são classificáveis
+  sozinhos** — `asset_class_from_path` conhece `forex/stocks/shares/indices/indexes/futures/crypto`,
+  e as raízes reais aqui são `Forex` (60, OK), **`CFDs` (14)**, **`Crypto Currency` (7)** e
+  **`Metals` (3)**. O collector **recusa em vez de chutar**, o que está certo — classe errada dá
+  aritmética de tick errada e P&L errado por um fator constante, que é o bug que parece uma ótima
+  estratégia — mas significa que o botão "coletar" do **PR-234 falha em 29% dos símbolos**.
+  Duas saídas: (a) alargar o mapa, barato e envelhece a cada corretora nova; (b) a tela
+  **perguntar** a classe quando o path não decide, reusando a recusa que já existe. (b) parece
+  melhor: transforma um erro de CLI num campo de formulário, e não finge saber o que não sabe.
+- [origem: PR-232 / coleta de 19/08] **O BTCUSD do broker fecha no fim de semana** — 216 dos 234
+  gaps do H1 são de fim de semana. Cripto negocia 24/7 no mundo real, então o que está sendo
+  testado é o **CFD do broker sobre o bitcoin**, não o bitcoin. Não é bug de nada; é uma
+  propriedade do instrumento que a tela deveria dizer antes de alguém tirar conclusão de um
+  backtest de cripto. Candidato a sair junto do PR-233, que já vai olhar a forma do histórico.
+- [origem: PR-232] **`pytest -m integration` apaga o snapshot de símbolos** — `broker_symbols`
+  entrou na lista de TRUNCATE dos dois conftest, porque um teste que sincroniza vazaria linhas
+  para o próximo. O efeito colateral é operacional: rodar a suíte de integração deixa a busca da
+  tela vazia até alguém apertar *sync from MT5*. Some quando existir banco de teste separado —
+  ver [[integracao-apaga-o-banco]], que é o mesmo problema com seis tabelas a menos.
+- [origem: PR-232] **O agente do host não tem supervisão** — mesmo problema do comando `live`
+  (origem PR-301-A): morre com o terminal que o iniciou e não volta sozinho. Agora são **dois**
+  processos que o Guilherme precisa manter no ar no Windows, o que reforça o caso de resolver
+  isso de uma vez (serviço do Windows, ou um supervisor).
+- [origem: PR-232] **Dois terminais MT5 instalados continuam sem escolha** — `mt5.initialize()`
+  é chamado sem argumento, então "trocar de corretora pela tela" ainda depende de qual terminal
+  o Windows resolve primeiro. Já estava anotado desde o PR-223; agora tem consequência visível,
+  porque o botão *sync from MT5* fotografa o catálogo de um terminal que o usuário não escolheu.
+- [origem: PR-232] **A busca é por prefixo, e `usd` não acha `EURUSD`** — decisão consciente (um
+  ticker é lembrado pela frente, e substring enterraria AAPL sob tudo que tem essas letras no
+  meio), mas é atrito real para quem procura por moeda de cotação. Conserto candidato: casar
+  prefixo **primeiro** e substring depois, na mesma resposta, com os do prefixo no topo.
+- [origem: PR-301-B] **Terminal ligado mas deslogado do broker não é detectado** — `terminal_info()`
+  devolve objeto (não `None`), então o laço não vê `ConnectionError`; o `copy_rates_from_pos`
+  responde com histórico em cache que parou de avançar, e isso é **indistinguível de mercado
+  parado**. `terminal_info().connected` diz a verdade, mas separar "parou" de "está quieto" exige
+  estado ao longo do tempo — pertence a quem supervisiona o laço, não a uma chamada dentro dele.
+- [origem: PR-301-B] **O teto do gap-fill é por barras, não por relevância** — `--max-backfill`
+  default 500. Um outage maior que isso é anunciado com o intervalo que ficou faltando e o
+  operador tem de rodar um `backfill`; nada automatiza essa costura entre o Parquet e o stream.
+- [origem: PR-301-B] **A reconexão remede o relógio do servidor** — `connect()` chama
+  `_measure_offset` quando o offset não foi declarado, e com mercado fechado isso é recusado (é
+  o desenho). Consequência operacional: **um `live` que deve sobreviver a um fim de semana
+  precisa subir com `--server-offset`**, senão o terminal pode voltar são e a reconexão continuar
+  falhando, corretamente, até a abertura.
+- [origem: PR-206-C2] **Uma ref pendurada aparece na lista mas não é editável** — o picker não tem
+  mais caixa de texto (as quatro formas da gramática viraram controles), então uma ref que deixou
+  de ser ofertável — porque o indicador foi renomeado — é acrescentada à própria lista para ficar
+  visível. Dá para trocá-la por qualquer opção válida, não dá para corrigir a digitação dela. É
+  o comportamento certo (a única correção de uma ref morta é escolher uma viva), mas se ele
+  incomodar, o caminho é renomear a ref junto com o indicador em vez de devolver a caixa.
+- [origem: PR-206-C2] **Não há como reordenar nem mover um nó entre grupos** — dá para adicionar,
+  negar e remover, e é só. Arrastar um nó para dentro de um grupo (ou para fora) é o que falta
+  para o builder ser "visual" no sentido pleno do `specs/fase-2.md`. Não bloqueia nada: a mesma
+  árvore é construível adicionando na ordem certa.
+- [origem: PR-206-C1] **A tela carrega três campos que não mostra** — `description`,
+  `max_open_positions` e `max_daily_loss_percent` agora sobrevivem ao round-trip (abrir e salvar
+  não os apaga), mas **nenhum controle os edita**. Foi escolha de escopo: sem eles no formulário o
+  round-trip perderia dado de documentos reais, e com controle para eles o PR viraria outro. Três
+  campos de texto no bloco de risco resolvem.
+- [origem: PR-206-C1] **Nada leva o usuário à rota `/strategies/:id`** — ela existe e funciona, e
+  só se chega nela digitando a URL. O `useStrategies` (lista) já existe desde o PR-104. Falta o
+  link, que é meia hora e provavelmente pertence ao PR que fizer a tela de lista de estratégias.
+- ~~[origem: PR-206-C1]~~ **FEITO no PR-206-C2.** `SideForm.rows` virou `ConditionNode[]`, com
+  `group` e `not` como nós, e o editor virou recursivo. A fixture `nested_logic` saiu da lista de
+  recusa e entrou na de round-trip byte a byte — que é o **aceite do PR-206 no spec, e o fim da
+  fase 2**.
+- [origem: PR-206-C1] **Abrir e salvar `setup_structure_continuation_defaults` escreve os
+  parâmetros que o documento omitia** — não é perda (é a mesma estratégia, soletrada), e é ponto
+  fixo a partir do segundo salvamento, o que está preso por teste. A causa é que o formulário tem
+  **um** estado vazio por campo e ele significa "não definido"; o documento distingue "ausente" de
+  "desligado" e o formulário não. Resolver de verdade exigiria um terceiro estado por campo —
+  registrar antes de alguém "consertar" isso sem saber o que está trocando.
+- [origem: PR-206-B2] **Adicionar um indicador não pré-preenche mais o `period`** — não é defeito,
+  é a consequência de a tela ler o schema: `period` não tem default no Pydantic, então a caixa
+  nasce vazia e o botão de rodar fica desabilitado até alguém escolher a janela. O `14` que
+  aparecia antes era um número escrito no TypeScript — um SMA(14) que ninguém escolheu. Se em
+  algum momento isso incomodar, a correção certa é **dar um default ao `period` no Pydantic**, não
+  reescrever o número na tela. Anotado para o caso de ele reclamar do atrito.
+- [origem: PR-206-B2] **`stop_buffer_ticks` vs `stop_buffer` continua aberto** — este PR tocou a
+  tela do builder e **não** resolveu (um PR, um escopo). Segue valendo: nomes quase iguais,
+  unidades diferentes, e a tela mostra os dois com o mesmo tipo de campo.
+- ~~[origem: PR-206-B1]~~ **FEITO no PR-206-C2.** A entrada "a closed candle" no picker abre um
+  número de barras atrás e um seletor de campo, exatamente como estava previsto — e com isso a
+  **caixa de texto livre sumiu do picker**: as quatro formas da gramática de ref são controles
+  agora. O `CANDLE_PATTERN` é montado a partir de `SOURCES`, então a lista de campos existe uma
+  vez só. Originalmente: **`candle[-N].field` só é alcançável digitando, atrás do `custom…`** — é a
+  única das quatro formas da gramática de ref que **não é enumerável**, porque N não tem teto.
+- [origem: PR-201-B, achado do guardian] **O motor não recusa um indicador declarado com `id: "price"`
+  ou `"candle"`** — o schema recusa (`RESERVED_IDS` em `semantic.py`), então é inalcançável pela API,
+  mas num mapping direto o canal nasce e fica **permanentemente inalcançável**: o
+  `compile_operand("price.close")` casa `_PRICE_REF` primeiro e o indicador declarado desaparece sem
+  uma palavra. Mesma família do `price.clsoe` que este PR fechou, e alcançabilidade idêntica (a
+  engine aceita mapping cru por desenho). O conserto é uma linha em `compile_strategy`, junto do
+  `duplicate indicator id` que já está lá. Fora de escopo aqui porque não é regressão do PR-201-B.
+- [origem: PR-201-B, achado do professor, **verificado**] **O motor não recusa um componente que não
+  existe** — `compile_strategy` aceita `{"ref": "bb.uppper"}` sobre um `bb` do tipo BOLLINGER sem
+  levantar nada, e o canal resolve para nulo em toda barra. A camada semântica pega isto para tudo
+  que entra pela API, e a trava nova do `compile_operand` só cobre as cabeças **reservadas**
+  (`price`/`candle`), não um componente errado de indicador declarado. Alcançável só por mapping cru
+  — mesma classe do item do `id: "price"` acima, e mesma família do `price.clsoe` que este PR fechou.
+  ⚠️ O conserto é barato e o material já existe: no `compile_strategy` os canais estão montados
+  **antes** de as condições serem compiladas, então dá para passar o conjunto de canais válidos ao
+  `compile_operand` e recusar um ref de indicador que não seja um deles — o que de quebra pega
+  `{"ref": "sma_lenta"}` para uma `sma_lento` declarada, que hoje também é nulo silencioso. Fora de
+  escopo aqui: não é regressão do PR-201-B, e um PR = um escopo.
+- [origem: PR-234, **medido em 20/08/2026**] **O catálogo e o disco já divergiram na máquina do
+  Guilherme**: `select count(*) from datasets` devolve **0** enquanto `data/ohlcv` tem **42 arquivos
+  Parquet** de AAPL, BTCUSD, EURUSD, GBPJPY e GBPUSD. As linhas se perderam numa rodada de
+  `pytest -m integration` (que TRUNCA `datasets`), e o efeito é que a tela de backtest não oferece
+  nada apesar de os dados estarem lá. O PR-234 impede que isso volte a acontecer *por recoleta*
+  (`storage.coverage` lê o disco), mas **não repara o que já se perdeu**. Falta um `tradeforge-db
+  reconcile` que varra `data/ohlcv` e reescreva `instruments`/`datasets` a partir dos arquivos — o
+  mesmo `coverage()` já faz metade do trabalho.
+- [origem: PR-234] **A suíte de integração continua sem banco próprio**, e agora está provado que dá
+  para ter um: `POSTGRES_DB=tradeforge_pr234 uv run pytest -m integration` roda os 158 testes
+  inteiros contra um banco descartável, sem tocar nos dados de trabalho. O conserto é fazer disso o
+  default do `conftest` (criar/derrubar o banco na fixture de sessão) em vez de depender de quem
+  roda lembrar da variável. Enquanto não for, o TRUNCATE continua sendo uma armadilha carregada.
+- [origem: PR-234] **O progresso da coleta é lido por polling e não pelo pub/sub** que o spec
+  previa. A decisão é medida: uma coleta emite no máximo um evento por ano de calendário — cinco ou
+  dez no total — e o `GET /collections/{id}` a cada 3 s cobre isso sem WebSocket novo. Publicar num
+  canal sem assinante seria código morto, que é exatamente o defeito que o PR-233 fechou. Se o
+  progresso um dia ficar mais fino que "um ano", o `ws.py` já tem o formato para copiar.
+- [origem: PR-234] **`BARS_PER_YEAR.M30` é interpolado, não medido.** Os outros sete números vieram
+  de contagem real no EURUSD 2024; o M30 foi posto entre M15 e H1 porque ninguém contou. Está
+  marcado no código. Uma medição de um minuto resolve, e enquanto não vier a janela sugerida de M30
+  é a única que não tem lastro.
+- [origem: PR-234] **Nada reconcilia `datasets` quando um arquivo Parquet é apagado à mão.** A
+  cobertura é derivada do disco *na coleta*, então apagar um ano depois deixa a linha alegando mais
+  do que existe até a próxima recoleta. O mesmo `reconcile` do primeiro item resolve os dois.
+- ~~[origem: aceite do PR-234, **medido em 20/08/2026**]~~ **FEITO no PR-235.** ⚠️ **A invariante
+  `net_profit = gross_profit + gross_loss` é verdadeira quando calculada e falsa depois de
+  gravada, e derruba o backtest.** O
+  CHECK `ck_backtest_metrics_net_profit_balances` recusou uma linha cujos três números fechavam em
+  `Decimal`: as parcelas atravessam para `NUMERIC(20,8)` **cada uma por si**, e a soma dos
+  arredondados não é o arredondado da soma. Medido no backtest do AUDCAD H1 coletado pela tela:
+
+  ```
+  em Decimal   -9944.7976321644 == 802.6520847921 + (-10747.4497169565)   ✅
+  em NUMERIC   -9944.79763216   ≠  802.65208479   + (-10747.44971696)
+                                 = -9944.79763217                          ❌  (1 na 8ª casa)
+  ```
+
+  ⚠️ **É intermitente**, que é o pior modo de falha possível: com números cujos arredondamentos
+  concordam a linha grava normal, e foi por isso que todos os backtests anteriores passaram. O
+  conserto é em `packages/db/src/tradeforge_db/results.py:176` (`_metrics_row`) e **não toca a
+  engine**: quantizar as parcelas para escala 8 e derivar `net_profit` da soma **das gravadas**, de
+  modo que as partes continuem sendo a verdade e o total siga elas. Afrouxar o CHECK para uma
+  tolerância está descartado — ele existe para pegar erro de sinal em `gross_loss`, e trocá-lo por
+  tolerância é trocar falha barulhenta por falha silenciosa. Aumentar a escala não resolve: o
+  desencontro reaparece na última casa, qualquer que seja ela. O teste precisa **reler do banco**,
+  porque `Decimal` compara numericamente e a perda de quantização só aparece no fio.
+  Mesma família, **verificada e consertada junto no PR-235**: `ck_trades_net_pnl_balances`
+  (`net_pnl = gross_pnl - costs`) tem o mesmo buraco. Não apareceu em 1.200 combinações de
+  `tick_value` × spread varridas com a engine de verdade, mas é alcançável — basta o custo cair na
+  fronteira de arredondamento. É o mesmo bug, só mais raro.
+- [origem: aceite do PR-234] **A metade "rodar um backtest nele" do aceite ficou pendente** por
+  causa do item acima, que é anterior ao PR-234 e independe dele. A metade da coleta fechou: AUDCAD
+  H1 coletado pela tela em 7 fatias (2020 → 2026), 41.216 candles, 358 gaps, uma linha em
+  `datasets` e 7 partições no disco. Refazer o backtest do AUDCAD assim que o CHECK for consertado.
+
+- [origem: PR-235] **Ninguém reconcilia `gross_profit` com a soma dos trades gravados.** Depois do
+  PR-235 cada linha fecha **consigo mesma**, mas `backtest_metrics.gross_profit` é o arredondado da
+  soma dos `net_pnl` **não arredondados**, enquanto a tabela `trades` guarda os arredondados. Somar
+  a coluna `net_pnl` dos vencedores pode dar alguns 1e-8 de diferença do total do sumário. Nenhum
+  CHECK amarra os dois, então isso só morde quem conferir uma tabela contra a outra — provavelmente
+  a tela de resultados da fase 3. Consertar exigiria escolher **qual** das duas é a verdade, e essa
+  escolha é de produto, não de encanamento: o total do sumário é o mais próximo do que a conta
+  realmente fez, e a soma dos trades é a que o usuário consegue conferir na mão.
+
+- [origem: uso real da coleta multi-ativo, **medido em 21/08/2026**] ⚠️ **O `job_timeout` do agente
+  é inerte, e o laço de eventos fica bloqueado durante a coleta inteira.** `WorkerSettings` não
+  declara `job_timeout`, então vale o default do arq 0.28 — **300 s**, com `max_tries=5` e
+  `retry_jobs=True`. Nenhum desses três números foi escolhido por alguém.
+
+  **Mas trocar o número não resolve nada**, e essa é a parte que importa: o arq aplica o limite com
+  `asyncio.wait_for`, que só cancela num ponto de `await`. `run_collection` é **síncrona**
+  (`collect.py:160`) e `collect_range` a chama direto (`agent.py:220`), então o job bloqueia o
+  event loop do começo ao fim e o timeout nunca chega a disparar.
+
+  **A prova está no próprio Redis** — os dois heartbeats lado a lado, mesma instância:
+
+  ```
+  collect:health-check     Aug-21 14:29:29  j_ongoing=1  queued=7   <- agente coletor, parado
+  arq:queue:health-check   Aug-21 17:13:44  j_ongoing=0  queued=0   <- worker da API, atual
+  ```
+
+  O agente não consegue escrever o próprio batimento enquanto trabalha. Consequências medidas:
+
+  1. **A chave `in-progress` expira com o job ainda rodando.** O arq a define como
+     `job_timeout + 10` = 310 s (observei TTL 232 e 206 contando de 310). Uma coleta mais longa que
+     isso perde o próprio cadeado.
+  2. **Com `max_jobs = 1`, um job travado congela a fila inteira** — e a tela não sabe dizer isso.
+     As linhas ficam `queued`, que é indistinguível de "o agente não está rodando". São dois
+     estados com remédios opostos: um se resolve subindo o agente, o outro esperando ou matando o
+     processo. O docstring de `Collection` diz que a linha existe justamente para separar esses
+     dois casos — o modelo previu o problema, faltou o agente publicar que está vivo.
+  3. **300 s é curto e longo ao mesmo tempo.** Para uma coleta é curto (um ano frio de M1 são
+     ~368 mil barras); para uma conexão no terminal errado é longo. São dois números diferentes
+     hoje colapsados num só que ninguém escolheu.
+
+  **Conserto, na ordem:** (a) `await asyncio.to_thread(run_collection, ...)` em `collect_range` —
+  só depois disso o timeout passa a significar alguma coisa e o heartbeat volta a bater; (b) então
+  escolher `job_timeout` de propósito, e provavelmente `max_tries` também, porque recoletar é
+  idempotente mas ressondar custa 207 s; (c) a tela ler `collect:health-check` para distinguir
+  "enfileirado atrás de outro job" de "ninguém está drenando". ⚠️ Um heartbeat velho **não**
+  distingue "morto" de "bloqueado" — mas `j_ongoing=1` ao lado diz que ele parou trabalhando, que
+  já é mais do que a tela mostra hoje.
+
+  Descoberto porque havia **dois MT5 abertos** e o agente anexou ao errado — ver o item do
+  `--terminal-path`, que agora tem uma ocorrência real a favor.
+
+- [origem: subir o agente após o upgrade de Redis 8 / Postgres 18, **medido em 24/08/2026**]
+  ⚠️ **O heartbeat do agente é reescrito uma vez por hora, então não distingue "vivo" de
+  "travado" dentro dessa hora.** Irmão do item do `job_timeout` acima, e o conserto cabe na
+  mesma passada.
+
+  `WorkerSettings` não declara `health_check_interval`, então vale o default do arq: **3600 s**.
+  Medido logo após subir o agente — a chave `collect:health-check` ficou com o mesmo carimbo em
+  três amostras a 12 s de intervalo, e o `TTL` estava em 3546 contando de 3600:
+
+  ```
+  [1] Aug-24 17:09:55 j_complete=0 j_failed=0 j_retried=0 j_ongoing=0 queued=0
+  [2] Aug-24 17:09:55 ...   (12 s depois)
+  [3] Aug-24 17:09:55 ...   (24 s depois)
+  ```
+
+  **Por que isso importa mais do que parece.** O docstring de `Collection` diz que a linha existe
+  para separar "enfileirado atrás de outro job" de "ninguém está drenando". O heartbeat é o sinal
+  que deveria responder isso, e com uma hora de granularidade ele responde tarde demais para ser
+  útil: um agente que morreu às 14h05 continua com um carimbo plausível até as 15h.
+
+  ⚠️ E ele engana ativamente. Amostrando por 24 s eu li "o horário não anda" e quase declarei
+  travamento num agente perfeitamente saudável — que é o falso positivo exato que o item do
+  `job_timeout` pede para a tela evitar. Um sinal de vida que só é verdadeiro na escala de horas
+  é pior do que nenhum, porque parece um sinal de vida.
+
+  **Conserto:** declarar `health_check_interval` de propósito no `WorkerSettings` — algo na
+  ordem de 15-30 s, que é barato (uma escrita de chave) e torna o carimbo legível como
+  liveness. Fazer junto de (a) `await asyncio.to_thread(run_collection, ...)` e (b) a escolha
+  deliberada do `job_timeout`: os três são a mesma pergunta — *como alguém sabe que o agente
+  está vivo e trabalhando?* — e consertar um sem os outros deixa a resposta pela metade.
+
+  Não é regressão do upgrade: o default sempre foi 3600. Só ninguém tinha olhado.
+
+  **Atualização 26/09 (PR #329):** o "está vivo?" foi resolvido **fora** do arq — uma chave própria
+  (`collector:alive`, TTL 90 s) renovada por uma thread, que bate mesmo com o laço bloqueado; a API
+  e o worker a leem para não pedir coleta a um agente desligado. **Continua aberto:** (a) o
+  `to_thread` em `collect_range`, (b) o `job_timeout` escolhido, e distinguir "vivo mas travado"
+  (a thread bate mesmo com a coleta presa).
+
+- [origem: PR #329, 26/09/2026] A fila do modelo ainda **recusa** um ativo que nunca foi
+  catalogado (`POST /sweep-templates/{id}/queue` → 422 "never collected", sem linha em
+  `instruments`). A coleta automática não alcança esse caso: sem instrumento não há classe de
+  ativo nem custo medido para preencher. Conserto provável: sincronizar/catalogar o símbolo no
+  enfileiramento, com o agente vivo.
+
+---
+
+## `ix_live_sessions_heartbeat_at` não é usado por consulta nenhuma
+
+Achado ao consertar o buraco de teste do `reconcile_stale` (fix do PR-302-C-B). O comentário da
+migration que cria o índice diz que a reconciliação lê essa coluna. Ela não lê — não em SQL.
+
+`running_sessions` emite exatamente:
+
+```sql
+SELECT ... FROM live_sessions WHERE status = 'running' ORDER BY started_at
+```
+
+e o predicado de silêncio (`is_stale`) roda **em Python**, sobre as linhas já trazidas. Nenhum
+plano de consulta no repo toca `heartbeat_at` num `WHERE` ou num `ORDER BY`. O índice é peso morto:
+custa uma escrita a cada batida — que é o caminho mais quente do módulo, uma vez a cada
+`BEAT_EVERY` por sessão viva — e não acelera leitura nenhuma.
+
+**Duas saídas, e elas discordam de verdade:**
+
+1. **Apagar o índice** e corrigir o comentário da migration. A reconciliação continua em Python,
+   onde a decisão é testável sem banco (foi exatamente esse o argumento do `is_stale`).
+2. **Descer o filtro para o SQL**: `running_sessions` passa a receber o corte e emite
+   `AND COALESCE(heartbeat_at, started_at) < :cutoff`. O índice passa a ser usado e o banco
+   devolve só as linhas mortas.
+
+⚠️ O (2) tem um custo que não é óbvio: move a fronteira do off-by-one para dentro de uma string
+SQL, onde o teste de milissegundos não alcança — e o portão de cobertura deselecciona integração.
+Foi essa exata configuração que deixou o mutante `<` → `<=` vivo. O (2) só vale se a tabela crescer
+a ponto de trazer todas as `running` para o Python ficar caro, e hoje ela tem unidades de linhas.
+
+**Inclinação: (1).** Mas é decisão dele, não minha.
+
+---
+
+## A suíte de integração não precisa apagar o banco de trabalho
+
+`packages/db/tests/conftest.py` faz `TRUNCATE ... RESTART IDENTITY CASCADE` em **11 tabelas** do
+banco que o `PostgresSettings` apontar, e o default é `tradeforge` — o de trabalho. Isso já apagou
+os backtests dele uma vez (04/08).
+
+Não precisa ser assim. O `postgres_db` é override por ambiente, então:
+
+```bash
+POSTGRES_DB=tradeforge_test uv run pytest -m integration --no-cov
+```
+
+roda a suíte inteira contra um banco descartável. O fixture `migrated_engine` já chama
+`upgrade("head")`, então o schema se cria sozinho; só o `CREATE DATABASE` precisa existir. Provado
+em 25/08: 206 de integração verdes contra `tradeforge_test`, com os 24.001 trades do `tradeforge`
+conferidos intactos antes e depois.
+
+**Conserto:** fazer disso o caminho padrão em vez de uma coisa que se lembra na hora. Opções — um
+default de `tradeforge_test` no fixture `dsn` (com o `TRUNCATE` recusando-se a rodar contra um
+banco cujo nome não termine em `_test`), ou um serviço postgres separado no compose. A guarda
+importa mais que o default: um default é uma sugestão, e o modo de falha aqui é perda de dados
+silenciosa.
+
+---
+
+## Uma ordem limite que preenche depois não tem quem avise a sessão
+
+Descoberto medindo o terminal em 26/08 (`fix/pr-304-placed-is-not-filled`). O executor trata **uma
+entrada da fila = uma decisão**: recebe a ordem, manda, grava, publica o fill se houve, dá o ack.
+Isso fecha certo para ordem a mercado, onde o negócio acontece dentro da chamada.
+
+Para uma **limite**, não fecha. A colocação volta `retcode=10009` com `deal=0` — aceita e parada no
+book — e agora o executor corretamente **não publica fill nenhum**. Só que o preenchimento de
+verdade acontece minutos ou horas depois, e nesse momento **não há ninguém naquele laço olhando**:
+a entrada já foi acked e o executor já esqueceu a ordem.
+
+Ou seja: hoje uma sessão que arma limite (que é o que a estratégia SMC faz — ADR-0015) abre
+posição no venue e **nunca fica sabendo**. O ledger do broker e a conta divergem em silêncio, que é
+o pior modo de falha possível para dinheiro real.
+
+**Conserto (candidato a PR-304-A3):** um laço próprio no executor que varre
+`history_deals_get(magic=770302)` desde o último deal visto e publica em `venue.outcomes` o que
+apareceu, correlacionando pelo `client_id` no comment da ordem. É um segundo produtor da mesma
+stream, com a mesma regra de "publica só o que tem `deal`".
+
+✅ **FECHADO no PR-304-B-D-2d.** `DealWatch` varre `history_deals_get` numa thread própria a cada
+10 s, recupera a cotação do tick mais próximo (janela declarada) e publica em `venue.outcomes`.
+De-duplicação pelo `order_audit` (`ledger.deal_was_reported`), não por marca d'água — o laço de
+ordens não sabe o *instante* do deal, então não tem como avançar uma marca honestamente.
+
+⚠️ **Descoberto ao construir:** os timestamps do MT5 vêm no relógio do **servidor** (medido:
+UTC+3), inclusive nos argumentos do `history_deals_get`. Sem corrigir, todo deal fica 3 h no
+futuro, a busca de cotação não acha nada e o log diz "mercado fino". Agora há
+`ExecutorSettings.server_offset`, declarado e não medido — ⚠️ **e o mesmo fato vive no
+`--server-offset` do coletor**; os dois descrevem um terminal só e deviam ter uma casa só.
+
+---
+
+## `Broker.cancel` e `Broker.modify_stop` não têm fio
+
+`orders.outbound` carrega `OrderRequest`, e o `__post_init__` recusa `CANCEL` e `MODIFY_STOP` — de
+propósito, e certo: um cancelamento não é uma ordem. A consequência é que metade do protocolo
+`Broker` não tem como chegar ao executor, e as duas metades que faltam são justamente as que a
+estratégia SMC usa (desarmar a limite quando a região morre, apertar o stop na condução — ADR-0018).
+
+**Conserto (candidato a PR-304-A3):** mensagem própria no fio, com `kind` explícito, não um
+`OrderRequest` alargado. Alargar a gramática abre o buraco do outro lado.
+
+---
+
+## O executor não confere `terminal_info().trade_allowed` na subida
+
+Medido em 26/08: com o botão AutoTrading do terminal desligado, **toda** ordem volta
+`accepted=False`, `retcode=10027`, e nada chega ao mercado. Falha fechada — mas em silêncio: a
+sessão roda o dia inteiro recusando ordens com uma mensagem plausível, e nenhum teste ponta a ponta
+contra o venue prova coisa nenhuma. `account_info().trade_allowed` continua `True` e engana.
+
+**Conserto:** o executor confere na subida e recusa subir armado com o botão desligado.
+
+---
+
+## O `MT5Broker` existe e ainda não está ligado em lugar nenhum
+
+Deliberado, e a razão é o item de cima. `session.py` continua construindo dois `BacktestBroker`
+(aquecimento e sessão), que é o modo paper. Ligar o `MT5Broker` numa sessão de verdade hoje seria
+irresponsável enquanto:
+
+1. **`cancel` e `modify_stop` não têm fio** — o broker levanta `EngineError` nos dois em vez de
+   devolver `False`, então uma estratégia que arma limite ou conduz stop **para a sessão** em vez
+   de mentir. Isso é o comportamento certo, e também significa que só uma estratégia puramente a
+   mercado roda ponta a ponta.
+2. **Uma limite que preenche depois não tem produtor** (item acima).
+3. **Não existe reconciliação** entre o ledger do broker e a conta no venue.
+
+Ligar é trabalho do **PR-304-B** (a trava de promoção paper→real), que é onde a decisão "esta
+sessão pode usar o venue" ganha dono.
+
+---
+
+## ~~Uma sessão nova não sabe da posição que a anterior deixou aberta~~ — FECHADO (PR-304-A4)
+
+Fechado. O executor publica um retrato do que segura (por magic) na chave Redis `venue.positions`,
+numa **thread própria** a cada 15 s, e o `MT5Broker.start()` recusa começar se o retrato mostrar
+posição — ou se estiver **ausente, velho ou ilegível**.
+
+⚠️ A entrada anterior descrevia o sintoma errado (dizia que o `_request_for` levantaria). Não
+levanta: cada processo cria uma `LiveSession` nova, e o broker descarta em silêncio os fills que
+não são da sua sessão. O problema real era a posição órfã viva no venue com o ledger novo zerado.
+
+Duas regras que saíram disso e valem além deste PR:
+
+* **"Não sei" não é "não tem nada".** Ausente e velho recusam igual a posição encontrada.
+* **Uma leitura que falhou não publica retrato vazio.** O executor deixa a chave velha envelhecer
+  em vez de escrever `positions: []`, senão "não consegui perguntar" viraria "a conta está limpa"
+  exatamente no instante em que a resposta decide se uma sessão pode operar.
+
+**Ainda em aberto (PR-304-A5):** *adotar* a posição órfã em vez de só recusar. Precisa recuperar do
+`order_audit` o custo de entrada, o `decided_at` e o `initial_stop_loss` — que é o denominador de
+todo R e não está no que o venue reporta.
+
+### Como a posição órfã diz de quem ela é (levantado pelo Guilherme, 27/08)
+
+> *"quando temos uma operação que ficou aberta e o sistema reinicia, que a gente saiba qual é a
+> estratégia usada para dar continuidade. Temos duas opções: a operação sempre tem um id único que
+> a corretora entrega, e no MT5 podemos adicionar comentário na ordem."*
+
+Está certo, e **metade já está construída** — o que vale registrar é qual das duas âncoras carrega
+o quê, porque a diferença decide o desenho do A5.
+
+* **O comentário já identifica a sessão.** O gateway escreve o `client_id` no comentário da ordem
+  (`gateway._comment`), e o `client_id` que o `MT5Broker` cunha é `s{session_id[:8]}-{n}`. A
+  sessão está em `live_sessions`, que tem `strategy_id`. Então o caminho comentário → sessão →
+  estratégia **existe hoje**, e não custa campo nenhum.
+* **O ticket é a identidade da instrução, não do dono.** Medido em 26/08: o `TRADE_ACTION_SLTP`
+  volta com `magic=0` e `symbol=''`, então o ticket é a única coisa que sobra para endereçar uma
+  posição. Mas ele nasce no venue e não sabe nada de estratégia — ele é a chave, não o registro.
+
+⚠️ **A escolha real não é "ticket ou comentário", é "carregar o dado ou carregar o endereço do
+dado".** O comentário tem **31 caracteres** (medido, PR #157) e truncar não encurta um nome:
+**funde** nomes. Um código de estratégia embutido ali gasta o pouco espaço que existe para dizer
+algo que o `order_audit` já diz inteiro — com o `decided_at`, o custo de entrada e o
+`initial_stop_loss` junto, que é exatamente o que a adoção precisa e que nunca caberia num
+comentário. O `client_id` é curto porque é um **ponteiro**.
+
+**O que falta de verdade para o A5**, então, não é identidade:
+
+1. `HeldPosition` (`executor/wire.py`) publica `ticket`, `symbol`, `side`, `volume`, `price_open`
+   e `stop_loss` — e **não publica o comentário**. Sem ele o retrato do venue diz "tem posição"
+   sem dizer de quem. Esse é o campo a acrescentar, e é barato.
+2. Do comentário sai o `client_id`; do `order_audit` sai a linha inteira daquela ordem. Aí o
+   `MT5Broker.start()` pode *adotar* em vez de recusar: reconstrói o `OrderRequest`, injeta a
+   posição no `Portfolio` e continua a conduzir o stop.
+3. ⚠️ **Uma posição cujo comentário não casa com nada no `order_audit` continua sendo recusa.**
+   Pode ser um trade manual seu ou de outro EA, e adotar às cegas põe risco que ninguém autorizou
+   dentro do denominador de todo R. "Não sei de quem é" não é "é minha".
+
+---
+
+## ~~O executor precisa conferir sozinho que um stop está apertando~~ — FECHADO (PR-304-A3-B)
+
+Fechado, e a medição mudou a natureza do item. Ele estava escrito como "segunda linha de defesa";
+não é.
+
+⚠️ **Medido em 26/08 numa posição real na demo: o MT5 aceita afrouxar o stop.** Movido de 1.16214
+para 1.15714 — mais longe do preço, mais risco — o terminal respondeu `retcode=10009` e fez. O
+venue **não tem opinião sobre a direção**.
+
+Então `Router._verified` não é uma verificação redundante: é **a única guarda** entre um erro de
+sinal na estratégia e uma conta carregando risco que ninguém autorizou. Ela lê a posição pelo
+magic, compara os níveis por lado, e recusa antes de qualquer envio.
+
+⚠️ E a identidade também ficou sendo dela: o `TRADE_ACTION_SLTP` sai com `magic=0` e `symbol=''` —
+medido — então **o ticket é a identidade inteira** da instrução. Um ticket que não veio do filtro
+por magic poderia ser de um trade manual seu ou de outro EA.
+
+---
+
+## ~~O aquecimento faz a sessão nascer parecendo morta~~ — FECHADO (PR-304-B-C)
+
+**Medido contra a conta demo em 28/08/2026, na primeira sessão `live` que este projeto rodou.**
+A sessão subiu certa, aqueceu sobre 39.204 barras, abriu a linha, e o `hand_over` colocou sua
+ordem no fio. O executor a **recusou**:
+
+```
+order_audit: demand-20260730T1500-360  ·  refused
+             "the core is not answering; no new orders while it is silent"
+```
+
+### A causa, com os números
+
+```
+started_at        00:03:33   ← `opened_at = now()` no TOPO do `run_session`
+ordem submetida   00:15:13   ← depois do aquecimento
+silêncio               700s   contra STALE_AFTER = 60s
+```
+
+O executor pergunta `ledger.session_is_alive`, que cai em
+`is_stale(heartbeat_at=None, started_at=…, now=…)`. E `heartbeat_at` **é NULL nesse instante**,
+por três decisões que estão individualmente certas e se somam errado:
+
+1. `open_session` deixa `heartbeat_at` NULL **de propósito** — é assim que se distingue "o
+   processo morreu entre abrir a linha e a primeira barra".
+2. `session.py` abre o `session_heartbeat` **depois** do `hand_over`. Era correto quando o
+   hand-over era local; desde o PR-304-B-B ele **envia ao venue**.
+3. `silence()` cai em `started_at` quando não há beat — e `started_at` é o instante **anterior ao
+   aquecimento**.
+
+⚠️ **É sistemático e piora com o que deveria melhorar a sessão:** quanto mais história ela aquece,
+mais morta ela parece no exato instante em que coloca sua primeira ordem. Com 39 mil barras são
+700 s de "silêncio" para um limite de 60.
+
+### E tem uma segunda cara, pior
+
+`MT5Broker.submit` respondeu `accepted` — e está **certo**, porque aceito é um fato local e o
+protocolo diz isso desde a fase 1. Mas o executor recusou depois. Então a estratégia atravessou
+para a sessão **acreditando que armou uma limite que o venue nunca viu**: o fantasma do ADR-0023,
+chegando pelo lado que ninguém tinha olhado — não pelo veto do risco, mas pela salvaguarda do
+executor, três processos adiante e assíncrona.
+
+### O conserto, e o que ele precisou além do óbvio
+
+Abrir o `session_heartbeat` **antes** do `hand_over`. Mas isso sozinho não bastou, e a medição é
+o motivo: `Heartbeat.start()` só *disparava a thread*, e o primeiro beat acontecia nela. Sondado
+sobre 200 partidas, com um beat custando 1 ms — o piso de um round-trip ao Postgres:
+
+```
+beat custa   0.0 ms -> o chamador seguiu ANTES do 1o beat em  48/200
+beat custa   1.0 ms -> o chamador seguiu ANTES do 1o beat em 200/200
+```
+
+Ou seja: subir o `with` sozinho trocaria uma falha sistemática de 700 s por uma corrida perdida
+**sempre**, e do mesmo jeito silencioso. Então `start()` passou a bater de forma **síncrona, na
+thread do chamador**, antes de criar a thread da cadência — que é o que o docstring do módulo já
+prometia (*"it happens at `start()`"*) sem entregar.
+
+E como `start()` engole o que o beat levanta (de propósito: falha transitória não pode parar um
+heartbeat), "o heartbeat está aberto" não é "a linha diz que está viva". O `session.py` confere
+`beating.beats` e **recusa o hand-over** se o primeiro beat não pegou.
+
+⚠️ Não confundir com "aumentar `STALE_AFTER`". Verificado como mutante: subir o limite mata o
+teste pela guarda de vacuidade (`WARM_UP_COSTS > STALE_AFTER`), como tem que ser.
+
+⚠️ **E o conserto tentador de uma linha também foi verificado**: `open_session` gravar
+`heartbeat_at = at`. Com o código pré-PR mais essa linha, o golden **continua vermelho** — porque
+`at` é o instante anterior ao aquecimento, então a sessão segue silenciosa por 700 s. O teste
+separa o conserto certo do vizinho.
+
+---
+
+## ~~A recusa do executor não volta para a estratégia (o transporte)~~ — FECHADO (PR-304-B-D-2a, ADR-0024)
+
+> **O PR-304-B-D-1 abriu o canal na engine** (`Context.refusals`). O que falta é o transporte:
+> a recusa que acontece **três processos adiante** ainda não tem como chegar nele.
+
+### O que sobrou depois do D-1
+
+
+**Separado do PR-304-B-C de propósito** (decisão de 28/08): é mudança de contrato entre três
+processos, e um PR = um escopo.
+
+`MT5Broker.submit` responde `accepted` — e está **certo**, porque aceito é um fato local e o
+protocolo diz isso desde a fase 1. Mas o executor pode recusar depois, assíncrono e três
+processos adiante. Quando isso acontece, a estratégia atravessa **acreditando que armou uma
+limite que o venue nunca viu**: o fantasma do ADR-0023, chegando pelo lado que ninguém tinha
+olhado — não pelo veto do risco, mas pela salvaguarda do executor.
+
+Hoje isso só aparece no `order_audit`, que ninguém está lendo em tempo real.
+
+⚠️ O PR-304-B-C fechou a causa que produziu a recusa medida na demo, **não o caminho de volta**.
+Qualquer outra recusa do executor (magic desconhecida, stop afrouxando, AutoTrading desligado)
+produz o mesmo fantasma.
+
+### Como foi resolvido — ADR-0024
+
+`fills.inbound` **virou `venue.outcomes`**, carregando `Outcome = WireFill | WireRefusal`
+discriminadas por `kind` lido estritamente, espelhando o que a ida já fazia com três formas.
+
+⚠️ O nome antigo mentia depois da mudança (recusa não é fill), e o rename só foi barato por um
+fato medido: **zero entradas reais** nos 184 registros do stream antigo — todos de teste.
+
+**Três estados, não dois:** enviada e preencheu → `WireFill`; enviada e **em repouso** → nada;
+não enviada → `WireRefusal`. A ordem em repouso não é nem um nem outro.
+
+`RefusedBy` ganhou `EXECUTOR` e `VENUE` — separados porque **se comportam ao contrário**, e é
+essa distinção que o D-2c vai usar para o teto.
+
+### O argumento original (mantido, porque continua valendo)
+
+O docstring do `_publish_fill` decide isso antes de o problema aparecer:
+
+> *"`fills.inbound` says what happened at the venue, and a refusal never reached one; a 'fill'
+> of zero would be a session waiting for a position it will never get told about."*
+
+Está certo. Então o D-2 precisa de **decisão de transporte própria — provavelmente ADR**: stream
+novo, ou generalizar o `fills.inbound` para um stream de desfechos. E é irmã de um item que já
+está neste backlog: *"uma ordem limite que preenche depois não tem quem avise a sessão"*. **Mesmo
+canal, mesma decisão** — decidir os dois juntos, mesmo que construídos separado.
+
+### ⚠️ O teto de tentativas volta à mesa aqui, e agora com número
+
+O D-1 deixou a região **reoferível** depois de uma recusa (decisão do Guilherme, consistente com
+o ADR-0015: só o fill gasta uma região). Medido em `arms_a_resting_limit` com recusa
+**permanente**: a zona é re-armada **em toda barra enquanto estiver de pé** — 48 seguidas
+(barras 61→108), 50 no total das 175.
+
+Hoje isso não é alcançável: as recusas permanentes do `MT5Broker` são a ordem de breakout
+(nenhum setup emite `stop_price` — medido na demo) e o `client_id` longo demais (determinístico).
+Um teto agora seria guarda sem produtor.
+
+⚠️ **O D-2 torna alcançável.** `AutoTrading` desligado recusa **tudo** (retcode 10027) — recusa
+permanente de verdade. Aí são 48 ordens no fio e 48 linhas de `order_audit` por zona. Decidir o
+teto (ou distinguir recusa transitória de permanente pelo `RefusedBy`) faz parte do D-2.
+
+⚠️ **E há um perigo pior que o barulho:** se uma recusa se **perder** no transporte, a sessão
+re-arma sob nome novo enquanto a ordem antiga está de fato resting — **duas limites na mesma
+zona**, que é exatamente o que o docstring do `hand_over` avisa que um venue sem deduplicação
+por nome permite.
+
+✅ **FECHADO no PR-304-B-D-2c**, com **teto por contagem** (`MAX_ARMING_ATTEMPTS = 3`, no
+`_may_arm`) e **não** pela distinção `EXECUTOR`/`VENUE` — essa premissa caiu: medido ao vivo em
+31/08, o teto de volume do executor chega como `EXECUTOR`, documentado como *"condições que mudam
+sozinhas"*, e é permanente. A outra candidata (comparar o `detail` repetido) construiria política
+sobre texto livre, que a `Refusal` reserva para humanos.
+
+Medido: 48 re-armagens na demand viram 3; a supply fica em 2, intocada. ⚠️ Custo declarado: uma
+parada de infra maior que ~45 min em M15 **queima a zona**. Decisão do Guilherme em 31/08.
+
+---
+
+## ~~O `hand_over` recusa em silêncio — o quinto ponto do ADR-0023~~ — FECHADO no PR-304-B-D-2b
+
+`HandOver.refused` virou `tuple[Refusal, ...]` (os três portões carimbam quem recusou), o
+`iter_run` ganhou `refusals=` para a semente do que foi recusado **antes da primeira barra**, e o
+`session.py` passa uma coisa na outra. Medido sobre `arms_a_resting_limit` cortado na barra 70,
+com o venue recusando só a ordem do hand-over:
+
+| | zona reoferecida | trades fechados |
+|---|---|---|
+| recusas não repassadas | nunca | **0** |
+| repassadas | 1ª barra viva, como `-2` | **1** |
+
+⚠️ Não era relatório: era **um trade**. A região que o aquecimento armou nunca mais era negociada
+— a frase do ADR-0023, chegando pelo último ponto que ainda estava mudo.
+
+---
+
+## A ordem das recusas do hand-over não é observável
+
+Encontrado pelo `engine-guardian` fechando o PR-304-B-D-2b. `pending = tuple(reversed(refusals))`
+em `loop.py` **sobrevive**: toda fixture tem exatamente uma recusa no hand-over, então nenhum
+teste separa uma ordem da outra.
+
+Não é bug hoje — nada depende da ordem, e `_observe_refusal` casa por nome, não por posição. Mas
+as duas irmãs prometem ordem no docstring (`HandOver.carried` diz "in the order they were
+submitted", `RunResult.refusals` diz "in the order it asked for them") e `HandOver.refused` não
+promete nada. **Fica dívida consciente**: no dia em que a ordem passar a importar, o teste que a
+prenderia precisa de um aquecimento que deixe duas ordens em repouso e as veja recusadas.
+
+⚠️ A `StructurePhase` tem um único slot `_armed`, então duas recusas simultâneas do hand-over só
+são alcançáveis por um double — que é como `test_every_resting_order_crosses_not_just_the_first`
+já testa o laço.
+
+---
+
+## A ordem re-armada depois de uma recusa perde os `levels` do snapshot
+
+**Medido** pelo `engine-guardian` na revisão do PR-304-B-D-1, sobre `arms_a_resting_limit`:
+
+```
+demand-...-1  levels [('choch', 1.03750)]     ← armada na barra do break
+demand-...-2  levels []                        ← re-armada uma barra depois
+```
+
+Preço, stop e zona são **idênticos**. O que some é o desenho da estrutura: o `_may_arm`
+recarimba `confirmed_by` com o `break_` da barra do re-arm, que é `None` porque não houve break
+naquela barra.
+
+⚠️ **O mecanismo é pré-existente** — é o mesmo caminho do re-arm depois de um `_withdraw` — mas o
+PR-304-B-D-1 o torna **o caminho normal de toda recusa**, então deixa de ser raro.
+
+Consequência: o `EntrySnapshot` da ordem que efetivamente entrou não desenha a estrutura que
+justificou a entrada. Quem abrir o gráfico daquele trade vê a zona e não vê o CHoCH.
+
+---
+
+## Uma `OrderRequest` de saída não carrega `client_id`
+
+Encontrado pelo `engine-guardian` no PR-304-B-D-1. Um EXIT **nomeado** recusado no portão
+`NO_POSITION` volta com nome (a `Refusal` lê `signal.client_id`); o mesmo EXIT recusado pelo
+`risk.allow` ou pelo broker volta com `client_id=None`, porque aí a `Refusal` lê
+`order.client_id` e o `_to_order` nunca põe um na ordem de saída.
+
+⚠️ **Sem produtor hoje:** a DSL (`strategy.py:255`) emite EXIT sem nome e a `StructureStrategy`
+não emite EXIT nenhum.
+
+⚠️ **NÃO faça o conserto ingênuo.** Dar à saída o `client_id` do sinal colide com o nome da
+entrada, que o `BacktestBroker` recusa como duplicata — trocaria "recusa anônima" por "recusa que
+**impede fechar a posição**", que é estritamente pior. A saída precisa de um nome **derivado e
+distinto** (`f"{client_id}.exit"`), o que é decisão de design e não patch. Vem junto com o
+primeiro produtor de saídas nomeadas.
+
+---
+
+## `modify_stop` recusado também não volta para a estratégia
+
+Encontrado ao construir o PR-304-B-D-1, fora do escopo dele. `loop.py` faz `logger.debug` quando
+`broker.modify_stop` devolve `False` e segue.
+
+Não produz o fantasma do `placed` — esse é sobre entradas — mas é a mesma classe: a estratégia
+pediu para apertar um stop, não apertou, e ela não fica sabendo. O `StructuralTrail` acredita que
+o stop se moveu.
+
+⚠️ O docstring do loop já registra que as duas causas (ordem ainda não preenchida vs. broker sem
+nível protetivo) são indistinguíveis dali. Um canal de volta teria que carregar qual foi.
+
+---
+
+## ~~O aceite do PR-304 promete "kill switch encerra tudo"~~ — DECIDIDO 01/09, opção 1
+
+Encontrado ao construir o PR-304-C1, lendo `safety.admits` antes de escrever a rota. O
+`specs/fase-3.md` diz: *"kill switch encerra tudo"*. O que o switch faz é outra coisa:
+
+```python
+if reduces_risk(intent):   # EXIT, CANCEL, MODIFY_STOP
+    return ALLOWED         # ← ANTES dos switches, deliberadamente
+for switch in switches: ...
+```
+
+Ele **barra risco novo e libera a saída**. Posição aberta continua aberta com o stop que já está
+no venue; a sessão continua de pé e leva recusa a cada entrada. O docstring do `admits` argumenta
+o porquê e está certo: *"a kill switch that refuses an exit is an operator pulling the handle and
+staying in the trade"*.
+
+⚠️ **Isso é um problema de rótulo, não de mecanismo — e por isso é perigoso.** Um botão escrito
+"encerrar tudo" que deixa posição aberta ensina o operador a acreditar numa coisa que não
+acontece, exatamente no momento em que ele não vai conferir. O `KillSwitchOut` já carrega o
+`layer` para a tela poder ser específica, mas o texto do C4 precisa de decisão explícita.
+
+✅ **Decidido em 01/09 e feito no PR-304-C4: opção 1, rotular honesto.** O `specs/fase-3.md` foi
+corrigido na fonte, e a tela diz ao lado de cada botão o que ele **não** faz — com teste prendendo
+as duas frases, porque um rótulo é a única coisa nesta tela que nenhum outro teste protege.
+
+**A opção 2 continua não existindo, e fica aqui caso um dia seja preciso:** construir o *flatten*
+— um caminho que fecha posição a mercado e cancela as pendentes. Passaria pelo switch engajado
+(é `reduces_risk`), mas quem o dispara, com que idempotência, e o que acontece se o venue recusar
+metade é projeto inteiro.
+
+---
+
+## Uma sessão viva com o kill switch engajado queima as zonas
+
+Encontrado ao construir o PR-304-C1, percorrendo o caminho. Com o switch engajado, cada tentativa
+de armar vira recusa, e `setups.MAX_ARMING_ATTEMPTS` aposenta a zona depois de **3 recusas
+seguidas**. Soltar o switch não devolve a zona.
+
+Não é bug: é o mesmo custo declarado no #181 para parada de infra maior que ~3 barras. Está aqui
+porque o **caminho é novo** — antes só se chegava nele por acidente (Redis fora, executor morto), e
+agora existe um botão que leva a ele de propósito, apertado por alguém que não fez essa conta.
+
+⚠️ Consequência prática para o C2/C4: depois de um kill, a sessão precisa ser **reiniciada**, não
+apenas des-killada. A tela tem que dizer isso.
+
+---
+
+## `venue.outcomes` nunca é podado, e uma sessão nova perde uma barra por 500 entradas
+
+Encontrado ao rodar o portão do PR-304-C1 (01/09). Um teste **de outra área** falhou, e a causa
+não era o PR: é estado real deixado pela demo ao vivo de 31/08.
+
+```
+XLEN venue.outcomes          503
+broker._BATCH                500     ← lê 500 por barra
+```
+
+`ensure_group` cria o grupo em `id="0"` — de propósito, para que um fill chegado durante o
+aquecimento não se perca. Consequência não intencionada: uma sessão que nasce hoje recebe as
+**500 entradas mais velhas** na 1ª barra, dá `xack` em todas, e só vê o que é dela na 2ª.
+
+⚠️ **Não é artefato de teste, é produção.** Em M15 isso são **15 minutos** até a sessão ficar
+sabendo de um fill — e a notícia do fill é exatamente o que o PR-304-B-D-2d existe para entregar.
+Cada 500 entradas acumuladas custam mais uma barra. O stream nunca é podado, então isso só piora.
+
+⚠️ **E o número é exatamente 503 contra 500**, o que quer dizer que a coisa passou de despercebida
+a quebrada com três entradas. Antes disso todo teste era verde por sorte.
+
+Conserto provável: `XADD ... MAXLEN ~ N` no lado do executor (ele é dono do stream), ou um
+`xautoclaim`/salto de marca d'água no lado da sessão. **Decisão de design**, porque o `id="0"`
+protege um caso real (fill durante o aquecimento) e um `$` ingênuo o perderia.
+
+⚠️ CI não vê: cada job sobe um Redis vazio. Só aparece numa máquina que já operou.
+
+---
+
+## A ajuda do `--spread-points` promete o spread da barra e entrega custo zero
+
+Encontrado na passada B da demo (02/09/2026), ao investigar por que toda barra publicada chegava
+com `spread = 0`.
+
+```
+apps/api/.../live/process.py:88   help="charge this fixed spread; omitted means the bar's own spread"
+apps/api/.../live/process.py:155  else {"type": "none"}          ->  build_cost_model  ->  NoCostModel()
+```
+
+Omitir a flag **não** cobra o spread da barra: cobra **nada**. As duas sessões de 31/08 e a de
+02/09 estão gravadas no banco com `cost_model = {"type": "none"}`.
+
+⚠️ **Em `live` isso é inofensivo e é por isso que passou despercebido**: o `MT5Broker` precifica o
+fill com o `wire.spread` medido no venue (`crossed = wire.spread if arrived.buys else ZERO`), não
+com o `cost_model` da sessão. Em **paper** não há venue, então uma sessão paper roda de graça
+enquanto a ajuda afirma que cobra — e paper é justamente o que o portão de promoção usa como
+evidência para liberar live.
+
+Conserto: ou implementar o que a ajuda promete, ou mudar a ajuda para dizer `none`. **A segunda
+não é só texto** — ver a seção seguinte, que mostra que a primeira não funcionaria nesta fonte.
+
+## Esta corretora publica `spread = 0` em toda barra
+
+Medido em 02/09/2026, Tradeview-Demo, com mercado aberto (tick de 5 s atrás, spread vivo de 8
+pontos): `copy_rates_from_pos` devolve `spread=0` em **todas** as barras M1 e M15. O coletor
+repassa fielmente; o zero é da fonte, não nosso.
+
+⚠️ Consequência para o item acima: implementar *"o spread da barra"* nesta fonte cobraria **zero
+parecendo que mediu** — o modo de falha que [[nulo-e-zero-sao-afirmacoes-diferentes]] descreve, só
+que vindo de fora. Se o custo do live tem de sair de um número medido, ele tem de sair do **tick**
+(`symbol_info().spread`, com mercado aberto) ou do `wire.spread` do deal, nunca do campo da barra.
+
+Decidir junto: o `Candle.spread` deveria ser `None` quando a fonte não mede, em vez de `0`?
+
+## `fills.inbound` ficou órfã no Redis desde a #166
+
+A chave existe, ninguém escreve, ninguém lê — o stream foi renomeado para `venue.outcomes` sem
+dual-read (decisão consciente na época). É lixo, não bug: custa memória desprezível e confunde
+quem for depurar por `KEYS *`, que é exatamente o que se faz quando algo está errado.
+
+Limpar junto da poda do `venue.outcomes` (seção acima), que mexe no mesmo lugar.
+
+## A volta do `DealWatch` não se prova esperando o mercado
+
+A passada B (02/09) colocou a limite no venue com ticket real — e ela nasceu **77,6 pips abaixo do
+preço** (1,15072 contra 1,15848). Não preenche no dia, e pode não preencher nunca: a estrutura
+pode invalidar a zona antes.
+
+⚠️ Então o **maior buraco que sobra na pilha live** — fill -> `WireFill` -> a sessão fica sabendo —
+não é uma questão de deixar rodando mais tempo. Precisa de um cenário onde a limite nasça perto do
+preço. Opções, nenhuma escolhida:
+
+* uma estratégia de demonstração cuja zona seja recente (a atual arma zona de 30/07);
+* um símbolo mais volátil, onde 77 pips seja uma tarde;
+* um caminho de teste que injete um deal no `history_deals_get` — mas aí não é o venue de verdade,
+  e [[fake-que-diverge-do-real]] já custou 22 mutantes cegos uma vez.
+
+⚠️ E `RefusedBy.VENUE` continua igualmente sem prova, por ironia: `--capital 800` conserta o teto
+de volume do executor e **por isso mesmo** tira de cena a única recusa que a gente conseguia
+produzir de propósito.
+
+## O docstring do `_conduct` descreve algo falso para o `RETURN_PASS`
+
+Achado pelo `engine-guardian` na #190 (03/09/2026), como observação não-bloqueante.
+
+`packages/engine/src/tradeforge_engine/setups.py:757` justifica a supressão do breakeven na barra
+do fill assim: *"a **limit** entry fills in the middle of a bar the trade did not live through...
+The swing family does not need this guard, because a **stop** entry fills going through its level
+in the direction of travel"*.
+
+O `RETURN_PASS` **é** entrada por stop e mesmo assim herda a supressão. O efeito é conservador — o
+backtest piora, não melhora — então não é bug. Mas é documentação errada num caminho de
+corretude, e [[docstring-e-afirmacao-testavel]] diz o que isso faz: quem lê para de procurar.
+
+Decidir junto: a supressão deveria seguir a **forma da ordem** (limite sim, stop não) em vez da
+família do setup? Se sim, é mudança de comportamento e precisa de golden próprio.
+
+## A UI ganhou `"return_pass"` no tipo e ninguém olhou a tela
+
+A #190 ampliou o enum no `models.py`, e `strategy.schema.json` e `strategy.ts` foram regerados —
+então o tipo TS conhece a opção. **Ninguém verificou se a tela oferece as três**, nem se ela
+oferece só `edge` e `midpoint` com o terceiro valor chegando apenas por JSON cru.
+
+⚠️ O portão do PR não pega isso: `tsc --noEmit` passa com uma lista de opções incompleta, porque
+uma lista menor que o union continua sendo atribuível. [[completude-provada-no-compilador]] tem a
+forma que provaria (`Exclude<...> extends never`), e ela não está aplicada aqui.
+
+## ~~Nenhuma medição agregada dos pontos de entrada~~ — MEDIDO em 06/09/2026
+
+Aberto na #189 quando eram dois pontos de entrada, piorado pela #190 e depois pelas #191–#193, que
+construíram mais três. **Corrida solta, nada commitado além desta nota**: os cinco `entry_point`
+sobre barras reais de M15, ano-calendário de 2025, dois ativos.
+
+Como a corrida foi montada — importa para ler os números: `structure_choch` e
+`structure_continuation` com `allow_secondary: true`, `percent_risk` 1%, capital 100 000, **custo
+zero e slippage zero**, sem `take_profit`. Custo zero porque a pergunta é *censo de população*
+("este ponto de entrada tem o que fazer no mundo real?"), não P&L; ver
+[[degradacao-cresce-com-a-busca]] para o que o spread faria com o segundo. AAPL: 6 470 barras
+(02/01 → 31/12). EURUSD: 24 674 barras (01/01 → 31/12). Duas corridas idênticas conferidas —
+determinismo verificado, não assumido.
+
+**A resposta principal: nenhum dos cinco produz zero.** Todos armam, todos preenchem e todos
+fecham trade nos dois ativos. 725 trades no total.
+
+| ativo | setup | entry | zonas | ordens | cancel | fills | trades | equity final |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| AAPL | choch | `edge` | 51 | 51 | 18 | 33 | 33 | 102 691 |
+| AAPL | choch | `midpoint` | 56 | 56 | 37 | 19 | 19 | 84 283 |
+| AAPL | choch | `return_pass` | 4 | 4 | 3 | 1 | 1 | 100 000 |
+| AAPL | choch | `botinha` | 6 | 17 | 11 | 6 | 6 | 94 435 |
+| AAPL | choch | `fffd` | 7 | 7 | 5 | 2 | 2 | 98 010 |
+| AAPL | contin. | `edge` | 47 | 47 | 18 | 29 | 29 | 98 156 |
+| AAPL | contin. | `midpoint` | 53 | 53 | 37 | 16 | 16 | 90 438 |
+| AAPL | contin. | `return_pass` | 4 | 4 | 0 | 4 | 4 | 109 103 |
+| AAPL | contin. | `botinha` | 12 | 48 | 42 | 6 | 6 | 105 011 |
+| AAPL | contin. | `fffd` | 5 | 5 | 4 | 1 | 1 | 99 000 |
+| EURUSD | choch | `edge` | 201 | 201 | 67 | 134 | 134 | 89 540 |
+| EURUSD | choch | `midpoint` | 213 | 213 | 138 | 75 | 75 | 101 420 |
+| EURUSD | choch | `return_pass` | 30 | 30 | 15 | 15 | 15 | 128 692 |
+| EURUSD | choch | `botinha` | 48 | 167 | 129 | 38 | 38 | 87 224 |
+| EURUSD | choch | `fffd` | 38 | 39 | 29 | 10 | 10 | 104 700 |
+| EURUSD | contin. | `edge` | 202 | 202 | 64 | 138 | 137 | 115 671 |
+| EURUSD | contin. | `midpoint` | 253 | 253 | 161 | 92 | 91 | 74 026 |
+| EURUSD | contin. | `return_pass` | 46 | 46 | 13 | 33 | 32 | 112 467 |
+| EURUSD | contin. | `botinha` | 76 | 246 | 185 | 61 | 61 | 96 719 |
+| EURUSD | contin. | `fffd` | 55 | 56 | 41 | 15 | 15 | 89 431 |
+
+"Zonas" é `client_id` distinto com o sufixo `-rN` removido — isto é, a zona, não a recolocação.
+
+**O achado com mais força estatística é a taxa de conversão zona → fill**, porque ela se repete
+em dois mercados que não têm nada em comum:
+
+| entry | AAPL choch | AAPL contin. | EURUSD choch | EURUSD contin. |
+|---|---:|---:|---:|---:|
+| `edge` | 65% | 62% | 67% | 68% |
+| `midpoint` | 34% | 30% | 35% | 36% |
+| `fffd` | 29% | 20% | 26% | 27% |
+| `botinha` | 100% | 50% | 79% | 80% |
+| `return_pass` | 25% | 100% | 50% | 72% |
+
+As três primeiras linhas são faixas apertadas num ativo de bolsa e num par de forex — é
+geometria, não regime de mercado: a ordem na borda enche em dois de cada três toques, a do meio
+em um de cada três, porque o meio exige penetrar metade da região. `botinha` e `return_pass` têm
+n pequeno demais no AAPL (6 e 4 zonas) para a linha significar coisa alguma.
+
+⚠️ **As populações não são comparáveis entre colunas de uma mesma linha da tabela grande.** Uma
+zona queima no FILL ([[smc-uma-entrada-por-regiao]]), então um `entry_point` que enche mais muda
+quais zonas existem depois. `edge` marca 51 e `midpoint` 56 sobre a **mesma** série pelo mesmo
+motivo. Comparar "quantos trades cada um dá" é legítimo; comparar "qual acha mais setup" não é.
+
+**A perseguição do botinha, medida:** 7 nomes por zona no máximo — exatamente o número que a lição
+da #192 previu, agora confirmado em dois ativos. Mediana de 2 a 3. O `fffd` chega a 2 nomes (a
+releitura sem matar a região, da #193); os outros três ficam em 1 sempre.
+
+⚠️⚠️ **A equity desta tabela não é critério de nada, e a decisão é dele (06/09/2026):** *"o
+resultado ainda não importa pois vamos ligar os pontos ainda, a estratégia global ainda não está
+pronta, estamos adicionando os blocos para fazer a parede final."* O que esta corrida valida é a
+**configuração no código** — os cinco pontos de entrada existem, são alcançáveis por dado real e
+produzem ordem. Nenhum deles foi projetado para operar sozinho, e comparar o P&L de tijolos
+soltos é comparar coisa que não vai existir na forma medida. Não usar estes números para escolher,
+podar ou ajustar entry point.
+
+**Sobre a equity da tabela: leia com cuidado.** Todas as 725 saídas são `sl`, porque não há
+`take_profit` e a condução da MME9 aperta o stop ([[swing-conducao-mme9]]) — "saiu no stop" inclui
+os ganhos. A distribuição é de seguidor de tendência: no primeiro trimestre do AAPL/`edge` foram 9
+perdas de 1R, 2 no zero e **um** ganho de +14,6R, e é esse trade sozinho que faz o ano. Com 1 a 15
+vencedores por célula, nenhuma dessas equities separa um ponto de entrada de outro; elas estão
+aqui como ordem de grandeza e como prova de que a corrida chega ao fim, não como resultado.
+
+### ⚠️ A afirmação sobre o `RETURN_PASS` que estava aqui era falsa
+
+A versão anterior desta seção dizia: *"a passagem na volta segura o nome da zona sem nada no book
+por quantas barras o preço levar para voltar — é o entry point que vive mais tempo dos três"*.
+Medindo a vida da zona em barras, da origem da região (que está gravada no próprio `client_id`)
+até o fill ou o cancelamento:
+
+| ativo/setup | `edge` med/máx | `midpoint` med/máx | `return_pass` med/máx |
+|---|---:|---:|---:|
+| AAPL choch | 67 / **2 017** | 63 / 2 017 | 42 / 166 |
+| AAPL contin. | 40 / 1 305 | 39 / 1 305 | 23 / 96 |
+| EURUSD choch | 56 / 1 217 | 56 / 1 217 | 37 / 258 |
+| EURUSD contin. | 26 / 565 | 27 / 565 | 25 / 121 |
+
+`edge` e `midpoint` vivem mais em toda célula, e por uma ordem de grandeza no extremo: uma zona do
+AAPL segurou o nome por **2 017 barras**, quase um terço do ano de pregão.
+
+⚠️ **E o mais importante: a afirmação original não é falsificável por esta medição, e isso é o
+achado.** O `return_pass` só chega ao book quando o preço volta e passa; a zona que espera para
+sempre **nunca submete ordem nenhuma** e portanto é invisível para qualquer sonda do lado do
+broker — que é exatamente a população sobre a qual a frase falava. As 4 zonas do AAPL e 30 do
+EURUSD são os *sobreviventes*. Medir a frase de verdade exige uma costura do lado da estratégia
+(quando a zona é armada), que hoje não existe. Ver [[cenario-que-nao-separa]]: o número que eu
+tinha medido primeiro era o tempo **no book**, não o tempo segurando o nome, e as duas coisas só
+coincidem para `edge` e `midpoint`.
+
+O termo `not self._tracked(...)` e o `_MAX_ZONES = 200` continuam sem teste que os prenda. O maior
+número de zonas numa corrida foi **253** (EURUSD, continuação, `midpoint`) — acima do teto, mas ao
+longo de um ano, não simultâneas. Prendê-lo honestamente continua exigindo um `_MAX_ZONES`
+injetável, não um cenário de 200 zonas.
+
+## ~~A barra de força que fecha abaixo do preço de entrada~~ — RESPONDIDO em 07/09/2026: **cancela**
+
+Aberto no PR-195 (06/09/2026), achado pelo `engine-guardian` como **bloqueante**. Posto a ele com
+as três alternativas — cancelar, virar stop no rompimento da máxima da força, ou entrar a mercado
+no fechamento dela — e a resposta foi ***"cancela"***: o comportamento que já estava no código
+deixa de ser default conservador nosso e passa a ser regra dele. `HammerForceTrigger.levels_for`
+credita a resposta. O texto abaixo fica como registro do que estava em dúvida.
+
+O `martelo_forca` entra a 30% do caminho entre a máxima do martelo e a da barra de força. Nada na
+regra dele exige que esse nível fique **abaixo do fechamento** da barra de força — e uma barra de
+força deve só **70%** de si ao corpo, então os outros 30% podem ser pavio. Quando a barra fura a
+máxima do martelo e volta a fechar por baixo do nível dos 30%, a conta produz uma **compra limite
+acima do mercado**: `Signal` recusa como erro de sinal e **nada no loop captura `ValueError`**, ou
+seja a sessão inteira morre. Medido: martelo H 102, barra de força 99,20/102,10/99,00/102,00 (90%
+de corpo), limite 102,03 contra fechamento 102,00.
+
+**O que foi feito, e é conservador de propósito:** `HammerForceTrigger.levels_for` devolve `None`
+— mesmo desfecho de "a barra de força não superou o martelo", região aposentada, com razão logada.
+A regra dele descreve uma entrada *entre dois extremos aos quais o preço volta*, e um nível que o
+mercado já fechou abaixo não é esse trade.
+
+⚠️ **A recusa é mais larga do que só o caso patológico**, e isso é o que precisa da decisão dele.
+A condição é `fechamento < 30% do que a barra superou`. Com martelo em 100 e barra de força
+topando em 101:
+
+| fechamento da barra de força | limite bruto | hoje |
+|---|---|---|
+| 100,50 (metade do que superou) | 100,30 | **arma** em 100,30 |
+| 100,20 (rente à máxima do martelo) | 100,30 | **recusa** |
+
+Os dois são barras de força válidas pelo critério de 70%. A segunda é uma barra forte que superou
+o martelo por um ponto e fechou vinte centavos acima dele.
+
+**Decidir com ele:** cancela mesmo (é o que está), ou nesse caso a entrada vira **stop** no
+rompimento da máxima da barra de força, ou entra **a mercado** no fechamento dela? Ver
+[[martelo-gatilho-de-barra]] e [[decidir-vs-traduzir-com-numero-contaminado]] — o número está
+contaminado para um `if`, e por isso ele falha fechado até ele responder.
+
+## Recolher a ordem antes do fechamento e repor na abertura seguinte
+
+Ideia dele, 06/09/2026, olhando os três descartes por gap do AAPL — todos gap de abertura de ação
+(última barra 19:45, gap às 13:30; o pior em 03/04/2025: limite 218,19, stop 216,70, abertura
+205,53). A regra: **a ordem pendurada não atravessa a noite.** Cancela
+antes do fechamento da sessão e recoloca na abertura, se a região ainda estiver de pé.
+
+**Por que vale a pena, e não é só evitar o gap:** ela move a decisão para a camada certa. Hoje
+quem salva a situação é o *broker* — `_survives_the_gap` recusando um fill que abriria já estopado.
+Com a regra, quem decide é a *estratégia*, na abertura, olhando a estrutura. No caso de 03/04/2025
+ela simplesmente não recolocaria, porque o gap de 6% rompeu a estrutura: vira um não-trade por
+decisão em vez de um resgate do encanamento.
+
+⚠️ **1. Precisa de calendário de sessão, e NÃO pode ser deduzido da série.** A heurística óbvia —
+*"se a próxima barra está a mais de 15 minutos, a sessão fechou"* — funciona no backtest e **é
+lookahead**: às 19:45 a engine só sabe que aquela foi a última barra do dia quando a próxima
+chega, e o live não tem essa informação. Deduzir da série quebra a invariante 1 (anti-lookahead) e
+a 3 (estratégia única) do `AGENTS.md` de uma vez só. Tem que ser fato conhecido de antemão, no
+`InstrumentSpec`, idêntico nos dois modos. É esse o custo real da ideia, e ele é maior do que
+parece: feriado, meio-pregão, DST, e a diferença entre a sessão da bolsa e o horário em que a
+corretora cota.
+
+⚠️ **2. Colide com uma guarda que já existe.** A 1ª recusa do `_may_arm` foi escrita exatamente
+contra *"retirar e repor idêntica uma barra depois"*. O ciclo noturno é literalmente isso, uma vez
+por dia. Quem implementar tem que ensinar a guarda a separar "retirei porque mudei de ideia" de
+"retirei porque a bolsa fechou" — senão a zona é aposentada pela própria regra que devia
+protegê-la. Ver [[duas-guardas-se-confundem]].
+
+**3. Não substitui `_survives_the_gap`.** O fim de semana do forex (2 descartes medidos no EURUSD)
+e a primeira barra depois de qualquer halt continuam existindo. As duas são complementares.
+
+**4. Efeito colateral bom:** a ordem reposta na abertura carrega `decided_at` da barra de abertura,
+não o da noite anterior. Melhora a postura anti-lookahead em vez de piorar.
+
+## ~~Uma ordem em repouso descartada por gap sai do book sem virar `Refusal`~~ — FECHADO (PR-194, ADR-0025)
+
+Medido em 06/09/2026 na corrida acima, e foi ela que tornou o buraco visível: `zonas` menos
+`fills` menos `cancelamentos que acertaram` não fechava em três casos.
+
+`backtest_broker._fill_resting` tem dois caminhos que **removem** uma ordem em repouso sem fill e
+sem cancelamento — `_survives_the_gap` (o preço abriu através do nível *e* do stop medido a partir
+dele) e `_survives_the_slip` (ADR-0016, o stop dispararia longe demais do gatilho). A remoção é
+correta e está justificada no docstring. O que não existe é o **registro**: o único vestígio é um
+`logger.debug`, e `RunResult.refusals` devolve `0`.
+
+No ano de 2025, nos 20 cenários: **18 descartes por gap e 1 por slip**, e `refusals: 0` em todos
+os 20. Exemplo, AAPL/choch/`edge`:
+
+```
+resting order supply-20250116T1645-3  dropped: 232.10 gapped past its stop 231.28
+resting order demand-20250310T1900-19 dropped: 223.75 gapped past its stop 224.22
+resting order demand-20250331T1345-22 dropped: 205.53 gapped past its stop 216.70
+```
+
+⚠️ **É a promessa do próprio docstring de `RunResult.refusals`** — *"o registro de toda ordem que
+foi pretendida e não aconteceu"*, e *"a pergunta que ele responde é a que um backtest não podia:
+por que isto não tomou trade nenhum?"*. Uma ordem descartada por gap é precisamente isso e não
+está lá. Do lado da estratégia é o fantasma do ADR-0023 por uma porta nova: ela segue acreditando
+que a ordem descansa, até a própria expiração soltar a zona — e é isso que produz os
+`cancel` que erram (18 pedidos, 15 acertos no cenário acima, os 3 que faltam são estes).
+
+**Resolvido no PR-194 com a opção (B) do ADR-0025**: membro novo `RefusedBy.MARKET`, que não
+conta contra o `MAX_ARMING_ATTEMPTS`. O ADR guarda por que (A) — reusar `BROKER` — teria
+aposentado zonas por causa de um gap, e por que (C) — tipo de desfecho novo — custava um contrato
+atravessando o fio inteiro do ADR-0024 para uma diferença que nenhum consumidor lê.
+
+⚠️ **E o conserto revelou um segundo buraco, maior**, também fechado ali: `iter_run` drenava
+`broker.refusals()` **depois do `yield`**, direto para o `Context` seguinte, sem nunca tocar num
+`BarOutcome` — e `run()` é um acumulador de `BarOutcome`. O que o broker reportava chegava à
+estratégia e nunca ao registro da corrida. Em live isso valia igual para `EXECUTOR` e `VENUE`.
+
+## A retirada pelo mercado podia ser entregue na própria barra, e não é
+
+Aberto no PR-194, e é o trade-off nº 2 do ADR-0025 assumido conscientemente.
+
+A retirada nasce no passo 1 de `_step` — `broker.on_bar()` — que é **antes** de o passo 2 montar
+o `Context`. Diferente de toda recusa de portão, ela poderia ser mostrada à estratégia na mesma
+barra. Não é: `Context.refusals` significa "a da barra anterior" para os outros seis membros, e
+uma regra de entrega que a estratégia consegue enunciar valeu mais do que uma barra de frescor.
+
+O custo está medido: dos 19 descartes de 2025, o conserto eliminou **4** cancelamentos fantasma.
+Os outros aconteciam dentro dessa uma barra de atraso — a fase decidia soltar a zona antes de
+saber que a ordem já não existia. Entregar na própria barra fecharia esses.
+
+⚠️ **O que ela custa, e o que ela compra — corrigido depois da conferência da lição.** A
+primeira versão da #194 drenou a caixa de correio no topo de `_step` e o guardian mediu que todo
+veredito assíncrono passou a chegar uma barra depois (barra 3 → barra 4). Eu escrevi aqui que
+era a *posição* da drenagem; era o **roteamento**: o que se drena no topo ia para o `BarOutcome`
+daquela barra e só daí para `pending`. Uma drenagem no topo **roteada para o `Context` da mesma
+barra** entrega igual ao `develop` para o que chega durante o `submit` — e entrega **uma barra
+antes** para o que chega na espera pela vela seguinte, porque o `for` de `iter_run` bloqueia
+depois da drenagem atual. Uma leitura só, janela maior, e a retirada pelo mercado na própria
+barra. O preço é o contrato: `Context.refusals` deixa de ser "a da barra anterior", o que reprende
+`carrying == [1]` em `test_loop` e o "não pode chegar antes" do docstring de `_observe_refusal`.
+
+⚠️ É uma decisão sobre `Context` **mais** uma sobre o custo da leitura, e mexe no live junto: o
+`hand_over` do aquecimento e o fio do ADR-0024 leem a mesma regra. Ver
+[[protocolo-decidido-antes-do-problema]] e [[duas-guardas-se-confundem]].
+
+⚠️ **`_survives_the_slip` disparou 1 vez em 725 trades e 20 corridas de ano inteiro.** A guarda do
+ADR-0016 é quase inexercitada por dado real — o que não a torna removível ([[guarda-inalcancavel-como-falha]]
+diz que o critério é o modo de falha, não a alcançabilidade), mas diz que ela vive de teste
+sintético e vai continuar assim.
+
+## A VWAP se cala em silêncio quando o volume pedido não existe na série
+
+Medido em 03/09/2026 sobre os 144 Parquets de `data/ohlcv`, ao levantar o terreno do capítulo 11.2.
+
+| | `tick_volume == 0` | `real_volume == 0` |
+|---|---|---|
+| AAPL (D1, H1, H4, M15, M5) | 0 de 56.249 | 0 de 56.249 |
+| todo o resto (AUDCAD, BTCUSD, EURGBP, EURUSD, GBPJPY, GBPUSD, USDJPY, XAUUSD) | 0 | **100% das barras** |
+
+Ou seja: **`tick_volume` existe em toda barra da base**, e `real_volume` só existe no AAPL — que é
+exatamente o que o docstring do `vwap.py` prevê ("present on B3, zero on decentralised forex").
+
+⚠️ **A consequência é um modo de falha silencioso.** `AnchoredVWAP.update()` faz
+`if volume <= 0: return`, então uma série sem o volume pedido não produz erro: ela produz
+`value() is None` **para sempre**. Com `volume="auto"` (o default) nada quebra, porque ele cai para
+ticks. Mas com **`volume="real"` em qualquer símbolo que não seja o AAPL**, 100% das barras são
+puladas, o indicador nunca existe, nenhuma ordem é colocada — e o relatório do backtest diz
+**zero trades**, que se lê como "a estratégia não operou" em vez de "o indicador nunca existiu".
+
+Decisão do Guilherme (03/09): sem volume não há VWAP, e sem VWAP **não se coloca a ordem nem se
+executa o trade** — falha em silêncio, para o lado seguro. Fica então pendente **tornar o silêncio
+localizável**: uma linha de log quando o setup se cala por falta de indicador, para separar "não
+achou setup" de "não tinha volume". Ver [[nulo-e-zero-sao-afirmacoes-diferentes]] e
+[[nao-sei-nao-e-nao-tem-nada]].
+
+⚠️ E o mesmo buraco existe nos **testes**: o helper `bar()` de `tradeforge_engine.testing` não
+preenche volume e `Candle` tem `tick_volume: int = 0`, então **nenhum cenário de `test_setups.py`
+consegue produzir uma VWAP**. Um teste que afirme silêncio ali passa vacuosamente. O par
+obrigatório é: mesmas barras **com** volume produzem a ordem, mesmas barras **sem** volume ficam
+mudas.
+
+
+## ~~Três leituras minhas no gift e na barra ignorada que ele ainda não confirmou~~ — RESPONDIDO em 07/09/2026
+
+Aberto e fechado no mesmo dia do PR-196. As quatro respostas dele, na ordem: *"1 - pode /
+2 - se o preço perder a mínima da barra de força anula / 3 - a entrada / 4 sem cor"*. Três
+confirmaram o que já estava escrito; a **segunda mudou código**: `ForceFollowLevels` ganhou
+`annul_price` (a mínima da barra de força, nas duas variações, independente de onde o stop é
+medido) e `ForceFollowActivation._age_the_order` lê o toque nela antes do relógio, igual ao
+martelo. Coberto por quatro testes novos e cinco mutantes mortos. O texto abaixo fica como registro
+do que estava em dúvida.
+
+**1. A barra da fuga pode ser a própria barra de força.** A pergunta foi "sendo N a primeira barra
+com mínima acima da região, a força pode ser N, N+1 ou N+2?" e a resposta foi *"n+1"*. Li como
+"até N+1": a barra que sai inteira da região **pode** ser a força (ele disse antes *"a barra de
+força pode ocorrer na fuga ou saída da região"*), e a seguinte também; a segunda depois da saída
+não. Está em `DEFAULT_BARS_OFF_REGION = 1` e no teste
+`test_the_bar_that_leaves_the_region_may_itself_be_the_force_bar`. Se ele quis dizer **só** N+1,
+é uma linha: a barra que sai não pode ser a força.
+
+**2. Nada nas barras anula a ordem pendurada; só a mínima da região.** Perguntei o que anula a
+ordem depois de armada e ele respondeu com a validade (*"válida por duas barras"*), não com um
+nível. O martelo perde a própria mínima e cancela; aqui não há regra equivalente, então uma barra
+que rompe a mínima do gift (ou da força) e depois rompe a máxima preenche a ordem normalmente. A
+mínima da **região** continua matando tudo, a qualquer momento, mesmo por pavio — isso ele disse
+com todas as letras. Se ele quiser que perder a mínima da força (ou do gift) cancele, é um
+`annul_price` em `ForceFollowLevels`, igual ao do `HammerBreakLevels`.
+
+**3. O teto de 2× mede a entrada, não a barra.** *"Teto de entrada é 120"* — medi a ordem
+(`levels.stop_price <= top + 2 × altura`), ao contrário do martelo, cujo teto mede o martelo e
+não a ordem (e ele disse isso em palavras naquele dia). Diferença de um tick, mas são duas regras
+vizinhas no mesmo arquivo com respostas opostas.
+
+**E uma quarta, menor: a cor da barra ignorada.** A regra dada é "corpo maior que 1/3 da força e
+não rompe a mínima da força". O nome — *ignorada*, o mercado ignora o vendedor — sugere uma barra
+de baixa, mas a regra como ditada admite uma barra de alta com corpo grande, e o código segue a
+regra, não o nome (`is_ignored_bar` não olha a cor; teste
+`test_an_ignored_bar_may_close_either_way`). Se ele quiser a cor, é uma comparação a mais.
+
+## `volume_filter: false` agora aparece em todo documento de estrutura salvo pelo web
+
+Achado no PR-196 pelo teste `writes what the document left to the engine, and nothing else`, que
+existe exatamente para isto: *"if this list ever grows, a save has started adding something new
+to the author's document and somebody has to decide whether it should"*.
+
+O builder do web grava **todo** parâmetro booleano no documento, no valor que estiver, inclusive
+o default — é a regra que `allow_secondary` segue desde o #69 (`foldParams`:
+`folded[param.name] = raw === true`). `volume_filter` é o segundo booleano do setup de estrutura,
+então um documento `entry_point: "edge"` re-salvo pelo web ganha `volume_filter: false`, chave
+que o engine ignora nesse entry point. `gift_stop` não sofre disso: é enum, e o builder omite enum
+vazio.
+
+Decidi seguir a regra existente (fixture `setup_structure_choch.json` e lista pinada do teste
+atualizadas) em vez de mudar o builder dentro de um PR de engine. O conserto de verdade é **o
+builder mostrar e gravar `gift_stop` e `volume_filter` só quando `entry_point` for `gift` ou
+`barra_ignorada`** — parâmetros condicionais a outro parâmetro, coisa que o `SchemaParam` de hoje
+não expressa. Enquanto isso, os dois aparecem no formulário de todo setup de estrutura, e o
+usuário pode ligar um filtro que não faz nada.
+
+## ~~Leituras minhas nos padrões de barra sobre a MME9 (PR-202)~~ — TODAS CONFIRMADAS em 07/09/2026
+
+Aberto em 07/09/2026, no PR que leva martelo, martelo+força, gift e barra ignorada para o 9.1. As
+sete respostas dele fecharam o relógio (substitui a entrada; janela = a barra que encosta ou a
+seguinte; qualquer encostada vale; sem teto, só fechar abaixo desarma; duas barras; virada nova;
+condução do setup). Três lugares ficaram com mais de uma leitura e eu escolhi uma:
+
+**1. ~~A barra da virada não é uma encostada.~~ CONFIRMADO por ele em 07/09/2026: *"pode, a barra da
+virada não conta"*.** A barra que cruza a média de baixo para cima sempre
+"encosta" nela — o range dela atravessa a linha por construção. Lida como toque, ela abriria a
+janela em toda virada, e a sonda mostrou o efeito: a barra da virada com 88% de corpo virou "barra
+de força" e a barra grande seguinte virou "barra ignorada", com stop seis pontos abaixo. Li o
+*"inclusive a primeira depois de um cruzamento"* como a encostada que vem **depois** da barra do
+cruzamento: o preço já do lado do setup voltando à linha. Está em `Mme9BreakoutStrategy._arm_pattern`
+(`crossing`) e no teste `test_a_close_back_across_the_average_withdraws_the_pattern_order`. Se ele
+quiser que a própria barra do cruzamento conte, é apagar duas linhas.
+
+**2. ~~Um padrão que falha não gasta nada.~~ CONFIRMADO (*"correto"*).** Na região, a barra seguinte que não é gift/ignorada, ou a
+força que não supera o martelo, gasta a região. Na média não existe região para gastar, e a resposta
+4 diz *"só desarma se fechar abaixo"*. Então o relógio limpa o padrão e lê a mesma barra como
+possível primeira barra de um padrão novo; a próxima encostada recomeça. `PatternWatch` documenta.
+
+**3. ~~Depois do fill, a virada fica gasta até a próxima virada~~ CONFIRMADO (*"correto"*)** — a regra do 9.1 de hoje ("one trade
+per turn"), herdada pelo padrão sem pergunta. Um trade que sai no alvo com o preço ainda acima da
+média não rearma até uma barra fechar abaixo e outra fechar acima. Teste
+`test_a_filled_pattern_spends_the_turn_like_the_classic_does`.
+
+**4. ~~A barra que anula ou expira a ordem não é relida como primeira barra~~ CONFIRMADO
+(*"n+2 arma"*)** — achado do guardian, não bloqueante, agora documentado em `PatternWatch.observe`. `PatternWatch.observe` devolve cedo na barra em que a ordem morre; já a segunda
+barra que falha **é** relida como possível primeira barra. Consequência: martelo arma em N; N+1 toca
+a mínima do martelo (anula) e é ela própria um martelo encostado — não arma; um martelo em N+2 arma
+(janela da encostada de N+1). "A próxima encostada recomeça" admite as duas leituras. Se ele quiser
+que a barra da anulação já conte, é tirar um `return`.
+
+E o efeito colateral já conhecido: `volume_filter: false` passa a aparecer em todo documento de
+`mme9_breakout` re-salvo pelo web (regra do booleano), e o eixo de estudo do 9.1 agora oferece
+`entry_point`, `gift_stop` e `volume_filter` — o teste `axes.test.ts` existe para acusar isso e
+acusou.
+
+## Três leituras minhas no ponto contínuo hospedando os padrões (PR-203) — ✅ CONFIRMADAS
+
+Aberto em 07/09/2026. Ele autorizou seguir sem responder as três perguntas (*"pode fazer"*), então
+escolhi a leitura que segue do que ele já decidiu para o 9.1 e registro aqui.
+
+**Fechado em 08/09/2026: *"1 - sim / 2 - sim / 3 - sim"*.** Nada mudou no comportamento; os
+docstrings de `PontoContinuoStrategy` e `_arm_pattern` passaram a creditar a resposta dele. As três
+abaixo ficam como registro do que foi perguntado.
+
+**1. As duas correções continuam exigidas antes de o padrão poder armar.** O `entry_point`
+substitui a regra 3 (a barra que toca e fecha acima) e deixa as regras 1, 2, 4 e 5 de pé. Sem as
+correções o setup entraria em qualquer encostada com martelo, que é a regra do 9.1 e não a deste —
+as duas correções são o que faz dele o ponto contínuo. Teste
+`test_the_two_corrections_are_still_required_before_a_pattern_may_arm`.
+
+**2. O relógio recebe toda barra que não fechou abaixo da média.** O gatilho clássico exige fechar
+**acima**; o padrão não, porque a barra que importa nele é a que **encosta**. Uma barra que fecha
+exatamente **em cima** da média não é evento nenhum pela regra 4 dele, então também é alimentada.
+
+**3. Posição aberta fecha o portão e reseta o relógio.** A regra 5 (um trade por vez) já valia para
+a entrada clássica; estendi ao padrão, e o reset evita que uma barra de força de antes do trade
+receba um gift de depois dele.
+
+E um mutante **declarado equivalente**: apagar o `self._watch.reset()` do ramo `closed_short_of`
+não muda nada observável, porque aquele ramo também zera `_qualified` e a barra seguinte encontra o
+portão do item 3, que reseta. Fica no código com o comentário, pelo mesmo motivo do `crossing` do
+PR-202: as duas linhas respondem perguntas diferentes.
+
+## Filtro de time frame superior (PR-205) — ✅ leituras CONFIRMADAS, pendências abertas
+
+Aberto em 08/09/2026. A definição dele está fechada (sete respostas, todas creditadas em
+`higher_timeframe.py`). O que segue eram **leituras minhas** em bordas que ele não ditou, e
+pendências técnicas da forma como o H4 é montado (ADR-0026).
+
+**Fechado em 09/09/2026: *"1 - correto / 2 - correto / 3 - correto / 4 - sim"*.** Nada mudou de
+comportamento; os docstrings passaram a creditar a resposta dele. As quatro ficam como registro do
+que foi perguntado. **As pendências técnicas continuam abertas.**
+
+1. ✅ **A referência é a região mais funda que a barra alcançou.** Uma barra que cai através da
+   secundária [110, 117] até a primária [80, 100] gasta as duas e mede o 2x e o rompimento pela
+   primária. Medido, não raciocinado: com a mais nova como referência, o primeiro cenário sondado
+   liberava e encerrava na mesma barra (fechou abaixo de 110 no caminho até 92).
+2. ✅ **Região alcançada e rompida na mesma barra gasta-se e não libera nada.**
+3. ✅ **Rompimento é fechamento, não pavio** — lido do exemplo dele (*"fecha em 85"*), não perguntado.
+   Fechar exatamente na borda de baixo não rompe (mesma leitura da regra 4 das médias).
+4. ✅ **O CHoCH confirmado na própria barra do toque conta** (*"a partir dessa barra"*); um confirmado
+   na barra anterior não.
+5. ~~A liberação é gasta ao ARMAR a zona~~ — **confirmado por ele em 08/09** (*"como está tá
+   bom"*), junto com a devolução da liberação quando o venue recusa no portão (*"1 ok"*).
+
+**Pendências técnicas:**
+
+- ~~O relógio do H4 é UTC e tem que ser o do servidor MT5~~ — **FEITO na PR-208.** O
+  `BarAggregator` recebe `offset` (horas à frente do UTC, meias horas incluídas), o documento
+  carrega `htf_offset`, e a semântica **exige** os dois juntos: `htf` sem relógio é recusado, e
+  relógio sem `htf` também. Barra que atravessa fronteira levanta `EngineError` em vez de ser
+  dobrada no balde errado. ⚠️ **O que fica:** o offset é **um número fixo** para a corrida
+  inteira, e broker que muda com horário de verão desloca metade de um backtest de dois anos. O
+  coletor tem a mesma limitação (`infer_server_offset` mede uma vez), então é uma pendência do
+  pipeline, não deste filtro — e a barra que atravessa a fronteira **não** denuncia esse caso,
+  porque um offset de uma hora continua alinhado à grade.
+- **As regiões de H4 não são desenhadas no gráfico.** `Zoned.zones()` devolve só as da base; o
+  portão expõe `HigherTimeframeGate.zones`, mas nada as lê. A entrada carrega a região que a
+  liberou (`htf_top`/`htf_bottom` no `context`, retângulo `htf` no snapshot), então o retrato de
+  cada trade a mostra — o que falta é o desenho na série inteira.
+- **A grade de estudo não sabe variar `htf` incluindo "off".** `axes.ts` oferece as opções do
+  enum; `null` não é uma delas. Comparar "com filtro × sem filtro" numa grade exige duas corridas.
+- **A cláusula "múltiplo inteiro" de `semantic._higher_timeframe_error` é inalcançável hoje**:
+  com a tabela atual (M1…W1), todo par mais grosso é múltiplo. Fica porque o modo de falha sem
+  ela é um `ValueError` do `BarAggregator` em tempo de construção (500) em vez de um 422 na
+  validação, no dia em que entrar H2/H6/H8. Só a metade da ordem tem teste.
+
+## Filtro de média longa no 9.1 e no ponto contínuo (PR-207) — leituras e pendências
+
+Aberto em 09/09/2026. A definição dele está fechada (cinco respostas, creditadas em
+`LongAverageFilter`): só compra acima / vende abaixo, o que conta é o **preço de entrada** e não o
+fechamento, a ordem pendurada **fica**, trade aberto conduz independente, média exponencial, vale
+para os dois setups, e o filtro é opcional.
+
+**Leituras minhas (uma linha cada):**
+
+1. **"Acima" é estritamente acima.** Uma entrada exatamente **em cima** da média longa é recusada,
+   nos dois lados. É a convenção que o resto do módulo já usa (`close > average`), e o custo é um
+   trade que ninguém notaria.
+2. **Enquanto a média longa está aquecendo, nada arma.** Sem valor não dá para afirmar que a
+   entrada está acima dela. A alternativa — deixar passar — faria um filtro de 200 períodos operar
+   as primeiras 199 barras sem filtro nenhum, em silêncio. Do jeito que está, o custo aparece: a
+   corrida arma menos no começo.
+3. **A média do filtro é sempre exponencial, mesmo no ponto contínuo com `average: "SMA"`.** O
+   `average` é a média contra a qual as *correções* são contadas; o filtro é uma segunda pergunta,
+   sobre direção, e a resposta dele nomeou uma exponencial. Os dois não compartilham botão.
+
+**Pendências técnicas:**
+
+- **A grade de estudo varia o período do filtro, mas não sabe pedir "desligado"** — `null` não é
+  um dos valores que um eixo enumera, então comparar "com filtro × sem filtro" continua sendo duas
+  corridas. É a mesma pendência que o `htf` já tinha (PR-205), agora com dois parâmetros.
+- ~~O filtro de média longa não é desenhado no front~~ — **a curva já era desenhada**: `overlays()`
+  devolve `long EMA N`, o endpoint entrega e o `PriceChart` dá cor e legenda próprias. O que
+  faltava eram as **regiões do H4**, feito na PR-210. Fica só o retrato da entrada
+  (`TradeSnapshot`), onde todas as curvas saem na mesma cor e todos os retângulos no mesmo azul —
+  com o filtro ligado são duas linhas douradas indistinguíveis e dois retângulos iguais.
+  ⚠️ Esta linha já foi escrita errada **duas vezes**, cada vez mais forte que o código, e as duas
+  correções vieram de revisão: primeiro dizia que o filtro "não aparece no gráfico da corrida
+  inteira" (o guardian pegou: a curva já era desenhada), depois ficou um segundo marcador
+  contradizendo o primeiro (a lição pegou). O estado real é o do parágrafo acima.
+
+## O relógio do broker (PR-208) — o que fica
+
+- **Um número fixo para a corrida inteira.** `htf_offset` não muda no meio de um backtest, então
+  uma corretora que segue horário de verão desloca metade de uma corrida de dois anos. O coletor
+  tem exatamente a mesma limitação (`infer_server_offset` mede uma vez), então é pendência do
+  pipeline e não deste filtro. ⚠️ A guarda da barra que atravessa a fronteira **não** denuncia
+  esse caso: uma hora de erro continua alinhada à grade de M15.
+- **`_optional_hours` e `_decimal` explodem com `Decimal("abc")` em vez de frase.** Os dois em
+  `setup_factory.py` aceitam `str` no `isinstance` e caem em `decimal.InvalidOperation` com
+  traceback nu, contra a promessa do `compile_strategy` de sempre falhar com uma sentença. Dívida
+  **pré-existente e idêntica** nos dois (o `_decimal` é de muito antes); a camada Pydantic bloqueia
+  o caso real, porque o campo é `number | null`. Achado pelo guardian na PR-208.
+- **A fábrica levanta `EngineError` para valor de vocabulário errado e deixa a classe levantar
+  `ValueError` para valor fora de faixa** (`htf` mais fino que o `timeframe`, `htf_offset` além de
+  ±14h). É deliberado — a classe é quem conhece a regra —, mas a assimetria com `_choice` merece
+  ficar escrita antes que alguém a "conserte".
+
+## Achados da lição da PR-208 (conserto na PR-209)
+
+Consertados: o ADR-0026 afirmava o contrário do código depois da PR-208 (ganhou seção de revisão);
+o docstring de `_optional_hours` afirmava uma proteção inexistente (`float(Decimal(str(x)))` é
+`float(x)`, medido — a viagem pelo `Decimal` só protege quando o retorno **é** `Decimal`, como no
+`_decimal`); um teste chamado `..._on_the_utc_clock` que a PR-208 tinha deixado dizendo o oposto do
+que faz; e a atribuição errada de qual comando do coletor exige `--server-offset` (é o `catalogue`;
+o `backfill` mede).
+
+**Fica aberto:**
+
+- ⚠️ **Documento que a API aceita e que morre na primeira barra.** `timeframe: H1` + `htf: H4` +
+  `htf_offset: -5.5` passa por `validate_semantics` e levanta `EngineError ... spans the boundary`
+  na corrida. A regra estática ingênua (`offset % timeframe == 0`) **não** serve, e isso foi
+  medido: as velas D1 reais em `data/ohlcv` estão carimbadas às **21:00 UTC** (servidor +3), então
+  D1 → W1 roda com `offset: 3` e levanta com `offset: 0` — a regra ingênua recusaria justamente o
+  caso que funciona. O que falta é a semântica saber onde as velas **daquele instrumento** caem, e
+  ela não tem acesso a candle nenhum. Provavelmente vira uma checagem na API, ao montar a corrida,
+  e não no schema.
+- `packages/schema/src/tradeforge_schema/semantic.py:293` é uma guarda de narrowing não exercida —
+  gêmea da linha 324, que é anterior e igual. Só o `mypy` a exige.
+
+## O que a UI ainda não faz (levantado em 09/09/2026, antes da PR-210)
+
+Solicitar backtests com os gatilhos e filtros novos **já funciona**: o construtor e os eixos do
+estudo são derivados do JSON Schema, sem lista escrita à mão, então todo parâmetro novo aparece
+sozinho. O que falta é retorno visual e expressividade da grade, em ordem de valor:
+
+1. ~~As regiões do H4 não aparecem no gráfico~~ — **feito na PR-210**.
+2. **No retrato da entrada, a região do H4 é indistinguível da zona base** (`TradeSnapshot.tsx`
+   pinta todo retângulo do mesmo azul tracejado e nunca lê `region.label`), e **todas as curvas
+   saem na mesma cor**, sem legenda — com o filtro de média longa são duas linhas iguais.
+3. ~~A grade não sabe pedir "desligado"~~ — **feito na PR-213.** O token é a palavra `off`, lida e
+   escrita num lugar só (`settings.ts`); enum anulável ganha a caixa, número anulável ganha o
+   botão, e a dica do eixo passa a dizer que a palavra existe. ⚠️ Junto foi preciso **relaxar uma
+   regra semântica que eu mesmo tinha criado na PR-208**: "relógio sem `htf`" era recusado, e uma
+   grade é produto cartesiano — o relógio tem que ficar parado enquanto o filtro varia, então o
+   ponto sem filtro necessariamente carrega um relógio que não configura nada. A recusa na direção
+   perigosa (`htf` sem relógio) continua.
+4. ~~**A regra cruzada `htf` ⇒ `htf_offset` não existe no navegador**~~ — **resolvido na
+   PR-215**, junto com toda a família. ⚠️ **Correção de um fato errado que eu mesmo escrevi
+   aqui:** o exemplo `off, H4, H1` num documento M15 é **legal** — `H1` é mais grosso que M15 e
+   múltiplo inteiro dele. Sondado: num documento M15 a semântica aceita `M30, H1, H4, D1, W1` e
+   recusa `M1, M5, M15`. O eixo que derrubava o estudo é `off, M5, H4`, com um timeframe **mais
+   fino ou igual**, não mais grosso. O defeito era real e o exemplo não era.
+   O conserto foi `POST /studies/preview`: o navegador manda estratégia + grade, o servidor
+   expande, valida cada ponto e devolve **todas** as recusas com o rótulo do ponto. Zero cópia da
+   semântica no TypeScript. ⚠️ Ele **não** reusa o `points_for` (decide, falha fechado no
+   primeiro) — compartilha só o `_prepared`, que é expandir e **nomear**, e essa parte tem que ser
+   idêntica ou o ensaio mente. É um aviso antecipado, **nunca** o portão: o portão continua sendo
+   o `POST /studies`, que revalida tudo e não escreve nada se um ponto falhar.
+   ⚠️ **O que ficou descoberto (achado na conferência da lição da PR-215), para um item futuro:**
+   nada liga a string `'/studies/preview'` do `client.ts` ao decorator do router. Trocar uma das
+   duas deixa os testes verdes e a tela fica muda em produção, indistinguível de "a API caiu". É
+   uma classe **pré-existente** — vale para todos os endpoints —, e o schemathesis não fecha
+   porque sorteia UUID aleatório, bate no 404 e nunca chega no `preview_of`. Menor, junto: o
+   `QueryClient` de produção não desliga `retry`, então um ensaio fora do ar vira 3 tentativas por
+   grade.
+   ⚠️ **Duas entradas novas, achadas na conferência da lição da PR-213:**
+   (a) ~~o botão `off` é oferecido também em **`htf_offset`**~~ — **resolvido na PR-214.** O
+   modelo publica `json_schema_extra={"requiredWith": "htf"}`, o `SchemaParam` carrega a chave e
+   `offIsASetting` responde a pergunta uma vez só para os **quatro** controles (dica do eixo,
+   botão do eixo, legenda do construtor e a opção `off` do `select` anulável — a legenda dizia
+   "empty = off" desde a #208, mesmo furo). ⚠️ O quarto, o `select`, é **inobservável hoje**:
+   `htf` é o único enum anulável e nada é exigido junto com ele, então `offIsASetting` e
+   `nullable` concordam. Fica pelo modo de falha — no dia em que um enum ganhar a chave, o mesmo
+   `label` mostraria "empty only if X is" e a opção `off` quatro linhas abaixo.
+   Um teste parametrizado em `test_semantic.py` amarra a chave à regra: para todo campo com
+   `requiredWith: X`, documento com X nomeado e o campo nulo **tem** que ser recusado, e com X
+   ausente **tem** que passar. ⚠️ O `requiredWith` **não** resolve o resto deste item: ele é um
+   fato por parâmetro e a exigência de `htf` mais grosso que o `timeframe` do documento é uma
+   relação entre dois campos, que nenhum fato estático expressa. Candidato para isso: um endpoint
+   de ensaio (`POST /studies/preview`) que expande e valida cada ponto e devolve **todas** as
+   recusas, em vez de o navegador imitar a semântica. ⚠️ Ele **não** pode reusar o `points_for`:
+   aquele decide e falha fechado no primeiro ponto ruim, este relata e precisa continuar — as
+   duas políticas de falha não se fatoram numa função só.
+   (b) um eixo sobre `htf_offset` num documento com `htf: null` passa em `expand` +
+   `assert_executable` e produz N backtests **idênticos** (portão `None` em todos), ou seja um
+   mapa de calor chapado — o modo de falha que `grid.py` classifica como o único totalmente
+   silencioso. A guarda retirada na PR-213 barrava isso de lambuja; é a outra metade do preço.
+5. ~~**Oito métricas calculadas e nunca exibidas**~~ — **resolvido na PR-216.** Nove, na verdade,
+   com o `sortino`, que só aparecia na lista de corridas. Segundo grupo no `MetricCards`, atrás de
+   um título, porque dezessete lajotas numa grade só é uma parede.
+   ⚠️ **Achado ao sondar antes de codar:** o `avg_trade_duration` vem como duração ISO 8601 e o
+   **Pydantic emite ANOS** — 400 dias viram `P1Y35DT2H`. Um parser que lesse só o `D` mostraria
+   `35d 2h`, errado por um fator de onze, sem nada parecer estranho na tela. Medido contra o
+   serializador: um ano ali vale exatamente 365 dias (`P2Y270D` = 1000 dias). Varrido o resto do
+   formato: semanas e meses o Pydantic **nunca** emite (`P14D`, `P30D`, `P31D`), fração só em
+   segundos, e o sinal negativo existe (`-PT1H`) mas é inalcançável numa saída menos uma entrada.
+   ⚠️ O regex **não** trata mês nem semana — `duration('P1M')` devolve travessão. Está certo
+   (falha fechada no que o produtor não emite), e a frase anterior aqui dizia o contrário.
+   ⚠️ **Fica em aberto:** `max_dd_duration_days` vem de `metrics.max_drawdown_duration.days`
+   (`packages/db`, `results.py`), que **trunca** — todo backtest intraday chega como `0`. A tela
+   agora escreve "< 1 d" quando o valor é zero **e** houve drawdown, o que é honesto, mas a
+   perda de resolução é do backend e continua lá.
+6. Menores: a seta do `htf_offset` começa em **-14** (o `startingPoint` cai no `param.min` quando o
+   default é nulo) e o exemplo de eixo sugere `0.5, 1, 1.5`, que não são offsets plausíveis.
+
+⚠️ **O endpoint `/overlays` não tem teste de integração para o campo `zones`** — os que existem
+asseguram só `series`. Pré-existente; a PR-210 fixou o contrato do `ZoneOut` em teste unitário e a
+publicação em teste de engine, mas o caminho HTTP inteiro segue sem cobertura.
+
+## ⚠️ A suíte e2e está morta e ninguém percebeu (achado em 09/09/2026)
+
+`apps/web/e2e/` tem dois specs — `happy-path.spec.ts` e `screenshot.spec.ts` — e **nenhum
+workflow do CI roda playwright**. O resultado previsível: eles drifaram da tela.
+
+Medido ao subir `@playwright/test` para 1.63.0 e rodar contra o stack do Docker: o
+`happy-path` falha na primeira asserção, esperando um heading `Build a strategy` que **não existe
+em nenhum lugar de `apps/web/src`** — a tela do construtor diz `Run a backtest`. Ele também
+procura um botão `save & configure`. Não conferi o resto nem o `screenshot.spec.ts`.
+
+⚠️ **A distinção que importa:** o playwright em si funciona — subiu o Chromium, carregou o app e
+executou asserções. O que está podre é o conteúdo dos specs, não a ferramenta. Por isso o bump
+foi mergeado com o e2e vermelho, e isso está dito na PR.
+
+✅ **RESOLVIDO na PR-224**, decisão dele: consertar **e** colocar no CI. As duas juntas, porque
+consertar sem rodar só recomeça o relógio.
+
+O que o conserto encontrou, além do heading:
+* o fluxo virou **uma** tela (`Run a backtest`), o botão salva e roda junto;
+* o seletor de mercado é combobox sobre `/api/symbols/search`, não select sobre `/instruments`;
+* a tela de resultado busca também `candles` e `overlays`, que nenhum spec mockava;
+* ⚠️ **a fixture do run omitia `candles_seen`/`first_candle`/`last_candle`.** O `coverageNotice`
+  guarda com `=== null`, então campo **ausente** passa pela guarda e estoura no formatador de
+  data — tela branca. Fake que discorda do real ([[fake-que-diverge-do-real]]).
+
+As fixtures viraram um módulo compartilhado (`e2e/fixtures.ts`): eram duas cópias de noventa
+linhas, que é o mecanismo pelo qual os dois apodreceram em separado.
+
+⚠️ **`screenshot.spec.ts` NÃO roda no CI**, de propósito: ele escreve em `docs/assets/`, então
+comitaria uma imagem que ninguém pediu ou falharia com a árvore suja. É ferramenta, rodada à mão.
+
+## O rótulo da média no retrato não é o do gráfico (achado na PR-211)
+
+`swing.py` nomeia a média do próprio setup de **`average`** no `series` da entrada
+(`_AverageTrail()` sem rótulo) e de **`EMA 9`** no `overlays()` do gráfico da corrida. A curva do
+filtro é `long EMA N` nos dois. Consequência agora que o retrato tem legenda: ela escreve
+**"average"** na tela, que é a palavra da engine para "a média que define este setup" e não uma
+boa palavra para mostrar a quem lê.
+
+⚠️ E a cor coincidir entre as duas telas é **coincidência estrutural, não garantia**: `curveStyles`
+atribui matiz por **posição da família**, e as duas listas declaram a média do setup primeiro. No
+dia em que uma delas mudar de ordem, a mesma curva troca de cor entre o gráfico e o retrato sem
+nada falhar.
+
+Conserto é na engine (`_AverageTrail(label=...)` no `swing.py`, para os dois hospedeiros), então
+sai num PR que passa pelo guardian. A fixtura de `TradeSnapshot.test.tsx` usa os rótulos de
+produção de propósito, para que a tela do teste seja a tela de verdade.
+
+## As telas de LEITURA ainda mostram "API error NNN" (achado na PR-230)
+
+A PR-230 consertou os dois pontos de **escrita** do construtor (salvar a estratégia, enfileirar o
+backtest) e pôs a desembalagem em `apps/web/src/api/failure.ts`. Restam três lugares que mostram
+`error.message` cru de uma **consulta**, onde o texto é o status e nada mais:
+
+* `TradesTable.tsx` — "Could not load this entry: ...";
+* `Results.tsx` — o erro do gráfico de candles;
+* `CollectSymbol.tsx:398` — o helper local da tela de coleta.
+
+Não entrou na PR-230 por escopo: são falhas de carregamento em outras telas, e o `detail` de uma
+recusa de leitura tem forma própria (404 com sentença, quase nunca `{message, errors}`). Basta
+trocar por `apiFailure(error, "<a frase da tela>")` — e conferir, tela por tela, se a frase de
+reserva ainda faz sentido.
+
+⚠️ E o `launchFailure` do **basket** (`basket/settings.ts`) continua sendo uma quarta cópia, que
+só lê `detail` quando é string. Isso cobre **todas** as recusas escritas do `POST /baskets` — ele
+não chama `validate_document`, então nunca manda `{message, errors}`. O que escapa é o 422 do
+próprio FastAPI sobre a forma do corpo (`detail` é **lista**) e um 5xx sem corpo nenhum: nos dois
+o leitor recebe a frase da casa e nada do que o servidor disse.
+
+## A API responde 422 com a mesma chave `errors` em dois tipos (achado na PR-230)
+
+`validate_document` (`routers/strategies.py`) manda `errors` como **lista** de falhas do Pydantic
+quando a recusa é de forma, e como **string** quando é de significado (`str(SemanticValidationError)`,
+que é um `"; ".join`). Uma chave, dois tipos, e nada no contrato avisa — foi assim que o navegador
+descartou a razão em silêncio até a PR-230.
+
+O `apiFailure` agora lê as duas, mas o conserto de raiz é no servidor: ou chaves distintas, ou
+normalizar o semântico em `{loc, msg}` — informação que o `SemanticError` **tem** e que o
+`str(exc)` joga fora. A segunda opção também daria à tela o campo pra destacar, que hoje só existe
+no meio da frase.
+
+## ✅ RESOLVIDO — o `mme9_breakout` com `period: 1` não armava nunca (achado no PR-231)
+
+`EMA` usa `alpha = 2 / (period + 1)`, então em `period = 1` o alpha é **1** e a média **é** o
+fechamento. O setup dele arma com `close > ema`, que ali nunca é verdade: o documento é válido, o
+backtest roda, e o resultado é zero trade sem uma linha de aviso. O `ponto_continuo` tem a mesma
+forma de problema pelo lado do toque.
+
+O `mme9_turn` (o 9.1 publicado) **não** sofre disso, porque lê a inclinação — está pinado em
+`test_the_two_readings_come_apart_at_a_period_of_one`, que é onde a equivalência entre as duas
+leituras deixa de valer.
+
+**Fechado no PR-234:** ele decidiu piso **3** (não 2) no `period` de todo setup de média, no
+schema. Nenhum documento salvo foi invalidado — conferido nas 267 estratégias do banco. Ver a
+entrada "o piso do período das médias é 3", abaixo.
+
+## ✅ RESPONDIDO — a barra neutra do 9.2/9.3 não estende a mínima da correção
+
+Pergunta feita em 10/09/2026: *"mínima do movimento de correção" são as barras que **contam** como
+correção, ou o pullback inteiro no gráfico?*
+
+**Resposta dele: não pertence.** As barras que contam como correção **são** a correção. Uma barra
+que fecha exatamente no fechamento da âncora não corrige, não avança a perna e **não alarga o
+stop** — mesmo que imprima a mínima mais funda do pullback. O stop pode, portanto, ficar acima de
+um preço que o movimento já visitou, e isso é o método, não uma aproximação dele.
+
+Está pinado em `test_a_close_exactly_on_the_anchor_neither_corrects_nor_advances`, com uma barra
+neutra de propósito mais funda que a correção.
+
+## ✅ RESPONDIDO — o piso do período das médias é 3
+
+Pergunta feita em 10/09/2026, saída do canto de `period = 1` do PR-231.
+
+**Resposta dele: mínimo 3.** Aplicado no schema como `AVERAGE_FLOOR`, nos sete lugares onde um
+setup nomeia uma média: o `period` dos quatro `mme9_*` e do `ponto_continuo`, e o
+`long_average_period` dos dois que têm filtro de direção.
+
+É um **estreitamento** de gramática, e por isso foi conferido antes: das **267** estratégias
+salvas, nenhuma usa período abaixo de 3 (só 9, 20 e 200). Nenhum documento existente foi
+invalidado.
+
+⚠️ **As classes da engine continuam aceitando a partir de 1**, de propósito: lá o mecanismo é são,
+e quem publica gramática é o schema. `test_the_two_readings_come_apart_at_a_period_of_one` continua
+existindo por isso — ele prende o comportamento do mecanismo no extremo degenerado.
+
+## O piso de 3 não alcança os indicadores — vale estender? (aberto, do PR-234)
+
+O `AVERAGE_FLOOR` ficou só nos setups. Os nós de indicador (`PeriodSource`, `PeriodParams`: SMA,
+EMA, RSI, ATR, Bollinger) seguem aceitando `period >= 1`, e ali um EMA de 1 é uma série de preços,
+não um setup quebrado — uma condição `close > EMA(1)` é sempre falsa, mas é uma pergunta que o
+usuário pode estar fazendo de propósito.
+
+A assimetria é o tipo de coisa que um leitor futuro lê como bug, então está escrita no docstring do
+`AVERAGE_FLOOR`. Estender ou não é decisão dele; é outra superfície (estratégias de condição, não
+de setup).
+
+## ⚠️ O portão de drift do schema se autocura (achado na conferência do PR-234)
+
+`packages/schema/tests/test_semantic.py` chama `generate.main()`, que **escreve**
+`strategy.schema.json` em disco. Então rodar a suíte do schema **reescreve o artefato como efeito
+colateral**, e o `test_schema_drift` passa a medir um arquivo que a própria suíte acabou de
+consertar.
+
+Consequência medida no PR-234: o artefato ficou na árvore **sem o `ponto_continuo` inteiro** (103
+linhas: os `$defs`, a entrada do `discriminator.mapping` e o `$ref` do `oneOf`), sobra de uma
+regeneração feita durante uma rodada de mutação do guardian — e a suíte do schema passou verde
+`91/91` na minha rodada, porque o `test_semantic` regenerou o arquivo no meio. Quem pegou foi a
+conferência da lição, rodando o drift **isolado**.
+
+Pior: com a ordem aleatória do pytest, a mesma suíte falha numa rodada e passa na seguinte. Ou seja,
+**repetir não confirma nada sobre o artefato** — ver [[repeticao-nao-separa-queda-de-permanencia]].
+
+Conserto possível: `test_semantic` não deveria escrever no arquivo versionado — ou gera num tmp, ou
+compara `render_schema()` em memória. O drift precisa medir o arquivo **como ele está no commit**,
+e hoje ele mede o arquivo como a suíte o deixou.
+
+- [origem: PR-235] **Buraco de fim de mês no M15 do GBPUSD** — medido em 11/09/2026 ao comparar o
+  H4 montado com o H4 do venue. Dias de virada de mês trazem **13** barras de M15 onde um dia
+  útil normal traz **96** (2025-04-30, 2025-12-31, 2026-04-30; controle em 2025-04-16 e
+  2026-04-15 traz 96). Efeito: 16 barras de H4 do venue sem contrapartida montada e 6 com OHLC
+  diferente — **todas** em fronteira de mês. EURUSD e XAUUSD, coletados de forma contígua, batem
+  100%. Não é bug de agregação: é coleta. Adiado porque o conserto é re-coletar as janelas de
+  borda, e nenhum backtest atual usa GBPUSD. ⚠️ Enquanto não for feito, todo resultado de GBPUSD
+  com filtro de time frame superior tem 0,2% das barras de H4 erradas e 0,7% ausentes.
+
+- [origem: PR-236] **O documento de um ponto de estudo grava um time frame que ele não rodou** —
+  `points_for` valida cada ponto com o time frame do estudo substituído, mas **não** escreve a
+  substituição: o documento persistido continua dizendo o que a estratégia base dizia. Isso é
+  proposital hoje, porque `strategies_for` deduplica por documento e um time frame dentro dele
+  faria a mesma grade em dois time frames colidir em `(name, version)` — o mesmo mecanismo que
+  faz seis folds de walk-forward escreverem cinquenta estratégias em vez de trezentas. O efeito é
+  de procedência, não de execução: o run carrega o time frame certo e é ele que a engine usa.
+  Consertar junto com a varredura de vários time frames, que vai precisar de um ponto por time
+  frame de qualquer jeito — provavelmente pondo o time frame no **nome** do ponto.
+
+- [origem: PR-240] **Todo fake de fila do repo engole `**options`, e `_job_id` é a idempotência
+  inteira.** O `Protocol` `JobQueue` documenta `**options` com um ⚠️ dizendo que `_job_id` "é o que
+  importa aqui", porque um id derivado da linha torna o enfileiramento **idempotente** — um request
+  que morre no meio de N jobs se recupera reenviando. Mas os nove fakes `_CapturingQueue` /
+  `_FakeQueue` dos testes guardam só `(function, args)`. Medido: apagar `_job_id=` do router de
+  `/sweeps` deixava a suíte inteira verde. Consertado **só no `/sweeps`** (o fake guarda as opções
+  e o teste compara os ids com os run ids); `/studies`, `/baskets`, `/walkforwards`,
+  `/collections`, `/candles`, `/symbols` e `/flow` continuam com a afirmação inobservável. O
+  conserto é um fake compartilhado em `conftest.py` — nove cópias é o que produziu nove buracos
+  iguais. Ver [[fake-que-diverge-do-real]].
+
+- [origem: PR-240] **`date_to precedes date_from` está escrito quatro vezes.** `backtests.py:235`,
+  `baskets.py:101`, `studies.py:284` e agora `sweeps.py` (duas vezes, preview e launch, mas essas
+  duas já saem da mesma função). ⚠️ **E as cópias já divergem**: as três primeiras usam `<`, que
+  aceita janela de duração zero; a do sweep usa `<=`, porque o CHECK `date_to > date_from` de
+  `rev_0018` recusa a igualdade e um `<` ali viraria 500 em vez de 422. Ou seja, não é cópia
+  literal — é uma regra que muda com a tabela, e é por isso que ninguém fundiu ainda. Antes de
+  fatorar, decidir se as outras três tabelas também recusam janela de duração zero; se sim, o
+  helper é um só, se não, são dois e o comentário tem que dizer qual é qual. Ver
+  [[nivel-escrito-tres-vezes]].
+
+- [origem: PR-240] ~~**`sweep_size` é código morto em produção.**~~ ✅ **RESOLVIDO no próprio PR:
+  apagada**, com o teste do teto reancorado nas constantes e perguntando ao `size_refusal` (a função
+  que os dois endpoints chamam). Mantido aqui só pelo raciocínio, que vale para a próxima vez.
+  Era função pura em
+  `apps/api/src/tradeforge_api/sweep.py`, com quatro testes — inclusive o que pegou o teto errado
+  de 2 000 recusando a forma exata para a qual a feature existe (3 entradas x 50 pontos x 3 time
+  frames x 5 mercados = 2 250). Nenhum caminho do router a chama: o router tem o número **exato**
+  na mão (`len(documents) * len(symbols)`), e um previsor é sempre pior que a verdade. O risco não
+  é a função errar, é o `TestTheSize` parecer que guarda o teto enquanto o caminho guardado é
+  outro — e a soma-vs-produto que ela ensinava já estava provada num lugar melhor, no teste de
+  integração com fixture assimétrica (3 e 1 pontos), onde multiplicar as entradas daria 18 em vez
+  de 24. Ver [[teste-que-parece-cobrir-e-nao-separa]].
+
+- [origem: PR-247] **React 18 → 19, a fazer como UM PR deliberado.** O Dependabot propôs em
+  14/09/2026 e as duas PRs foram fechadas: `#241` (react-dom + @types/react-dom) e `#242` (react +
+  @types/react), ambas para `^19.3.0`. ⚠️ **Nenhuma das duas era mergeável sozinha**: o `react-dom`
+  faz peer **exato** no `react`, então a `#241` sozinha instala react-dom@19 contra react@18 e a
+  `#242` faz o inverso — e as duas reescrevem as mesmas entradas do lock, então a segunda
+  conflitaria com a primeira.
+
+  O repo já encontrou este upgrade uma vez: o comentário no topo do `.github/dependabot.yml`
+  registra que a `#33` chegou como *"bump the js-prod group with 3 updates"* carregando React
+  18 → 19 e reprovou os 25 testes web num element-symbol mismatch. A correção de então — major sai
+  do grupo e vem como PR individual — **funcionou**. O que ela não previu é que `react` e
+  `react-dom` são um **par**: separá-los troca "um major escondido num grupo" por "um major
+  partido em dois pedaços, cada um quebrado sozinho". Se valer a pena ensinar isso ao dependabot,
+  o mecanismo é um grupo só para esse par, com `update-types: [major]` — ao contrário dos grupos
+  de cima, aqui agrupar é o que **revela** o major em vez de escondê-lo.
+
+  Quando for feito: é migração, não bump. A prova são os 825 testes web **e** os e2e, que desde a
+  `#229` rodam no CI — e ver [[e2e-local-passa-contra-outro-app]] antes de confiar num verde local.
+
+- [origem: PR-248] **O ensaio do estudo tem os dois furos que a #248 fechou no da varredura.**
+  (1) `useStudyRehearsal`/`useStudyPreview` não olham `isError`: um `POST /studies/preview` que
+  falha cai na resposta vazia, que é a cara de "tudo certo" — sem aviso, sem "Checking…", botão
+  vivo. (2) `useStudyPreview` carrega só a `grid` na resposta, mas a chave também tem `strategyId`
+  e `timeframe`; hoje não fura porque não há `placeholderData`, e com ele ligado trocar o time
+  frame passaria na comparação. A varredura carrega o request inteiro e mostra a falha à parte,
+  sem bloquear — o formato a copiar está em `apps/web/src/sweep/preview.ts`.
+
+- [origem: PR-249] **Basket e Study ainda perguntam o time frame de uma estratégia salva, com default
+  H1.** A #249 tirou esse campo do `/launch`, que agora lê o `timeframe` do documento: um H4 rodado
+  em H1 é aceito pelo servidor sem filtro HTF e deixa de ser a estratégia montada. `LaunchBasket.tsx`
+  e `study/settings.ts` continuam com o seletor. Decidir com o Guilherme se lá ele também vira
+  leitura do documento — o Sweep só varia gráfico de entradas da **prateleira**, então Basket/Study
+  são hoje o único caminho de mudar o gráfico de uma estratégia salva fora dela.
+
+- [origem: PR-251] **A docstring de `aggregate_points` (ex-`_aggregate`, `routers/studies.py`) afirma
+  uma corrida que o worker não tem.** Diz que "um run é marcado `done` um instante antes de a linha
+  de métricas ser escrita", e usa isso para justificar contar só runs **com** métricas. Medido no
+  `worker.py`: `session.add(metrics_row)` e `backtest.status = DONE` vão no **mesmo** `commit`. A
+  guarda `metrics is not None` continua certa (um `done` sem métricas seria linha feita à mão ou
+  migração), mas o motivo escrito é falso, e quem lê para de procurar. Corrigir a frase; a tela da
+  varredura e a do estudo decidem o fim do polling pelo **status** e dependem desse commit único.
+  Ver [[docstring-e-afirmacao-testavel]].
+- [origem: varredura real de 15/09] **A mediana por entrada mistura gráficos e mercados.** Medido na
+  varredura `eef98f56`: 480 runs de uma entrada, espalhados por EURUSD/AUDUSD **e** H4/M15, caem numa
+  única mediana (−1,0%). Separar entradas foi o acerto da #251, mas dentro de uma entrada a mediana
+  soma duas perguntas diferentes: "o método funciona neste gráfico?" e "funciona neste mercado?".
+  Um H4 lucrativo e um M15 destrutivo se cancelam e o resultado lido é "quase zero". Candidato:
+  agregado por (entrada × time frame) e por (entrada × ativo), ou um seletor na tela. Confirmar com
+  ele o que ele quer comparar antes de escolher a forma.
+- ⭐ [origem: PR-251, **PRIORIDADE pedida por ele em 15/09**] **Uma varredura só é alcançável na hora
+  em que é lançada — precisamos consultar o histórico.** Palavras dele: *"precisamos poder consultar
+  o histórico do sweep, isso é importante"*. Não existe `GET /sweeps` (lista), e o run log não
+  carrega `sweep_id` — fechou a aba, o endereço `/sweeps/{id}` só volta pelo histórico do navegador.
+  Já há varreduras de 11/09, 15/09 e 16/09 inalcançáveis pela interface. O estudo e a cesta têm o
+  mesmo buraco? Conferir antes de decidir se é uma aba própria (`/sweeps`) ou uma coluna/filtro no
+  run log — e perguntar a ele o que cada linha precisa mostrar para ele reconhecer a varredura.
+- [origem: PR-252] **O dataset é de UMA varredura; o ML vai querer várias.** `GET /sweeps/{id}/dataset.csv`
+  e o dicionário são por varredura, porque as colunas `param:` são as da varredura. Juntar varreduras
+  exige decidir a união das colunas e, principalmente, **separar janelas**: é juntando varreduras de
+  períodos diferentes que aparece dado fora da amostra. Fazer depois que houver duas varreduras reais.
+- [origem: PR-252] **Parâmetro não varrido sai vazio no dataset, e o valor real existe.** Uma entrada que
+  não varre `setup.params.period` rodou com o `period` do próprio documento; o CSV deixa a célula
+  vazia (honesto: ninguém escolheu), mas o ML perde um valor conhecido. Opção: coluna preenchida a
+  partir do documento, marcada como "fixo, não varrido". Decidir com o Guilherme.
+- [origem: PR-253, MEDIDO em 15/09] **Um run pode ficar `queued` para sempre, sem erro, se o worker
+  o pegar antes de o Postgres aceitar conexão.** Caso real: o backtest
+  `77842306-1810-47fc-b0af-c1174a2513bf` (varredura `29e00cfa`, 15/09 01:27) está `queued` até hoje,
+  com `started_at`, `finished_at` e `error` NULOS e sem métricas. O resultado guardado no Redis
+  (`arq:result:<id>`) é um `sqlalchemy.exc.OperationalError`: *"connection to server at 172.21.0.6,
+  port 5432 failed: FATAL: the database system is starting up"*. O `arq:job:<id>` não existe mais e
+  `arq:queue` está vazia — ninguém vai reprocessá-lo.
+  **Mecanismo:** `process_backtest` só consegue gravar `FAILED` através de `_record_failure(session,
+  ...)`, que precisa de uma sessão; se a falha é *na própria conexão*, não há como registrar nada, e
+  a linha fica no status inicial. O `depends_on: postgres healthy` do compose ordena a **primeira**
+  subida, não os reinícios (`restart: unless-stopped`), então basta o Postgres reiniciar junto com a
+  máquina para a corrida acontecer.
+  **Efeito:** a tela e o contador dizem "na fila" para um run que nunca vai rodar — status que mente,
+  do tipo que [[sinal-de-vida-na-escala-errada]] descreve. Isso também é o que o contador X/Y pedido
+  por ele em 15/09 tornaria visível.
+  **Candidatos de conserto (decidir):** (a) no worker, tratar falha de conexão como retentativa do
+  arq (`Retry`) em vez de consumir o job; (b) um reconciliador que marca `queued` órfão como
+  `failed` dizendo o motivo; (c) healthcheck/espera do worker antes de consumir a fila. Enquanto não
+  houver conserto, o sintoma é reconhecível: `queued` antigo com `arq:result` presente e `arq:job`
+  ausente.
+- [origem: PR-253] **A tela da varredura mostra a frase crua do Pydantic quando um ponto é
+  recusado.** O `refusal_of` devolve `campo: mensagem` (`name: String should have at most 120
+  characters`), e a tela imprime isso ao lado do rótulo do ponto. Para quem está montando uma
+  estratégia, a frase fala de um campo que ele não escreveu. Depois da #253 essa recusa específica
+  não acontece mais, mas as outras continuam chegando assim — por exemplo `htf must be coarser
+  than the chart`, que é boa, ao lado de mensagens de tipo que não são. Decidir se a API traduz ou
+  se a tela agrupa por campo. Ver [[uma-chave-dois-tipos]].
+- [origem: PR-252] **Características de mercado da janela** (volatilidade, tendência, spread médio)
+  ficaram fora do dataset. São o que permitiria ao ML dizer "este setup funciona em mercado assim";
+  hoje a linha só diz em qual ativo e período. É um cálculo novo sobre as velas, não um export.
+- [origem: PR-256] **O painel das varreduras lê tudo, sem teto.** Sem datas, `GET /sweeps/dashboard`
+  carrega todo run de toda varredura como objeto ORM. Medido em 16/09: 794 runs em 0,12 s. Mas
+  ⚠️ **Piorou na PR-273:** não há mais teto por varredura (era `MAX_SWEEP_RUNS` = 3000), então uma
+  varredura sozinha já pode ter dezenas de milhares de runs — 60 mil objetos seriam uns 9 s por
+  extrapolação. Candidatos: agregar em SQL (`percentile_cont`), ou recusar
+  acima de N runs pedindo um período. Cuidado: agregar em SQL cria uma segunda definição de mediana
+  e de vencedor, além da do estudo.
+- [origem: PR-256] **O painel mistura retornos de janelas de tamanhos diferentes na mesma mediana.**
+  Uma entrada varrida em 2024 (1 ano) e em 2020–2026 (6 anos) põe as duas medidas no mesmo ranking.
+  A tela avisa. Conserto possível: anualizar, ou agrupar também por janela.
+- [origem: PR-258] **O walk-forward ainda não sobrevive ao banco fora do ar.** A PR-258 devolve à fila
+  (`Retry` do arq) só os backtests. Os runs que o walk-forward executa inline continuam como antes:
+  banco inalcançável vira falha **do run** (`retry_unreachable=False`), e o experimento segue com um
+  buraco no ranking. Aqui não há espera: se o banco também recusar essa gravação, o run fica
+  `running` (o commit que o marcou já entrou) e ninguém volta para ele.
+  Repetir não resolve sozinho: `_process_fold` só grava `test_backtest_id` **depois** de rodar o
+  run de teste, então uma repetição no meio cria um **segundo** run fora da amostra para o mesmo
+  fold. Conserto: vincular o run de teste logo depois de criá-lo (a FK e o CHECK já permitem, porque
+  `chosen_strategy_id` está gravado) e, na repetição, rodar o vinculado se ele não estiver `done`.
+- [origem: PR-258] **Os runs que já estão presos continuam presos.** O conserto evita casos novos.
+  O `77842306` (15/09) segue `queued`, e o contador X/Y mostra isso (decisão dele: sem reconciliador).
+
+## ⚠️ Coletar parte de um ano apaga o resto daquele ano (achado na PR-261)
+
+`write_candles` particiona por ano e grava com `existing_data_behavior="delete_matching"`.
+Medido em 17/09/2026: um ano com 12 barras, depois uma gravação de uma barra de 2024-12-20, e
+sobrou **uma** barra. A tela de coleta (`POST /collections`) aceita qualquer janela, então pedir
+"2026-06 a 2026-09" sobre um par que já tem 2020-2026 apaga janeiro a maio de 2026. O pior é que
+o índice (`datasets`) continua dizendo 2020-2026, porque ele só guarda o primeiro e o último
+candle, e o buraco fica invisível para o plano de coleta e para a checagem da varredura.
+O plano da PR-261 já contorna isso: pede sempre anos inteiros. A tela de coleta ainda não.
+Conserto provável: a coleta arredonda a janela para anos inteiros (ou o coletor mescla com o que
+está na partição antes de gravar). Adiado: fora do escopo da PR-261, e decidir qual das duas
+opções usar muda o contrato do coletor.
+
+## A lacuna inferior regrava o primeiro ano que já está no disco (risco não medido, PR-261)
+
+O plano de coleta sempre inclui o primeiro ano do disco na janela inferior, porque ele não sabe
+se aquela partição está completa. Se a corretora hoje entrega **menos** daquele ano do que
+entregou antes (M1 com teto de `maxbars`, por exemplo), o `delete_matching` troca a partição por
+uma versão menor. O corte pela sondagem (`symbol_history.oldest`) evita isso quando o par foi
+sondado. Sem sondagem, o risco existe. A próxima peça (enfileirar a partir do plano) deve sondar
+antes, ou recusar reescrever uma partição com menos barras do que ela tinha.
+
+## O que a fatia "roda com o que tem" (PR-262) deixou de fora
+
+* **A cesta não guarda quem foi pulado.** O `skipped` só vem na resposta do `POST /baskets`.
+  Aberta depois, a tela da cesta mostra os runs que existem e não sabe dizer quais mercados
+  ficaram de fora. Guardar exige uma coluna nova (migration).
+* **O estudo (`POST /studies`) ainda enfileira sem perguntar ao índice.** A regra dele (17/09)
+  vale para o estudo também; ficou para uma fatia própria.
+* **As telas ainda não avisam nem perguntam.** O servidor já pula e recusa. O aviso "faltam X,
+  coletar?" com os dois botões é a fatia seguinte.
+* **A CLI `backfill` cataloga a extensão do download, não a do disco** (`backfill.py:_catalogue`).
+  Coletar 2015 depois de 2020 por ela faz o índice dizer "só 2015". Desde a PR-262 isso é
+  alcançável: o backtest e a cesta recusam ou pulam barras que existem, e a frase "on disk"
+  mostra números errados. O coletor da tela (`collect.py`) já cataloga a partir do disco
+  (`storage.coverage`). Conserto: o `backfill` usar o mesmo `coverage`.
+
+## O que a tela "avisa o que falta" (PR-263) deixou de fora
+
+* ✅ **RESOLVIDO na PR-264** — "Run with what there is" aparecia mesmo sem nada para rodar. Ele
+  apareceu para o Guilherme em 17/09 (estratégia H1 sobre um par coletado só em M15/H4) e o
+  clique trouxe "no candles in this window for EURUSD H1 (never collected)". O plano passou a
+  responder `in_window`, e a tela esconde o botão quando nenhum mercado do lançamento leria
+  candle.
+* **Ativo fora de `instruments`** (fatia 265): o plano o trata como "nunca coletado", mas o
+  lançamento recusa com "unknown symbol(s)", e na cesta isso derruba o pedido inteiro. Hoje é
+  inalcançável, porque os seletores só oferecem ativos do catálogo.
+* **"Já enfileirado" vive enquanto a tela está aberta.** Recarregada a página, um segundo
+  "Collect" manda de novo uma janela que ainda está na fila. Resolver de verdade é o servidor
+  recusar uma coleta idêntica à que está `queued`/`running`.
+
+## O que a fatia "o run espera a coleta" (PR-265) deixou de fora
+
+* **Dois runs pedindo a mesma janela geram duas coletas idênticas.** `create_collection` sempre
+  insere linha nova, e o agente executa uma de cada vez (`max_jobs = 1`), então os mesmos anos
+  são baixados duas vezes e o segundo run espera o dobro. Conserto: reaproveitar uma coleta
+  `queued`/`running` com o mesmo (símbolo, time frame, janela).
+* ✅ **RESOLVIDO na PR-266** — o run carrega `waiting_for` (as coletas com o progresso delas) e a
+  tela de resultado diz o que está sendo baixado. ⚠️ Segue valendo que **nada é publicado no canal
+  de progresso**: quem descobre é o poll de 1 s da tela.
+* **O run log não mostra que um run está esperando** (`BacktestListItem` não carrega
+  `waiting_for`): lá ele aparece como `queued` igual a qualquer outro. O lançamento navega para a
+  tela do run, então hoje isso só morde quem chega pelo log.
+* **`collections` não tem o CHECK `failed_needs_error`** que `backtests` tem, então uma coleta
+  pode ficar `failed` sem razão registrada. O worker já trata (`no reason recorded`), mas a
+  assimetria é acidental.
+* ✅ **RESOLVIDO na PR-283** — **Uma coleta que falha derruba o run.** Decidido pelo Guilherme
+  (22/09): o run roda com o que tem no disco e **avisa** qual coleta falhou e por quê — na tela do
+  run, e uma vez só no topo da cesta e da varredura (`failed_collections`). O aviso é derivado do
+  `waiting_for`, sem coluna nova: `failed` é terminal. Sem nada no disco, o run ainda falha, pelo
+  dado.
+  * **Fica de fora: o timeout de 2 h (`WAIT_LIMIT`) continua falhando o run.** Uma coleta parada
+    ainda pode terminar depois, e um aviso derivado do estado dela passaria a dizer "nada faltou"
+    sobre um run que rodou sem o dado. Rodar com o que tem também no timeout exige **gravar** o
+    aviso no run (coluna ou tabela), não derivar.
+
+* ✅ **RESOLVIDO na PR-267 (por remoção)** — "Já enfileirado" vivia só enquanto a aba estava
+  aberta. A tela não enfileira mais coleta nenhuma: quem planeja e cria é o lançamento. A defesa
+  contra baixar a mesma janela duas vezes passa a ser só a do servidor, que continua **aberta**:
+  recusar (ou reaproveitar) uma coleta idêntica a uma que já está `queued`/`running`. ⚠️ A cesta
+  multiplica o alcance disso por até 20 por clique.
+
+## O que a fatia "a varredura coleta o que falta" (PR-268) deixou de fora
+
+* **O 409 de estudo e varredura não pega a colisão que diz pegar** (anterior à PR-268, achado
+  na revisão dela). As estratégias vão ao banco no `session.flush()` logo depois de
+  `strategies_for`, **fora** do `try` que traduz `IntegrityError` em 409. Como
+  `uq_strategies_name_version` não é DEFERRABLE, dois lançamentos idênticos ao mesmo tempo
+  estouram nesse flush, e o perdedor recebe 500. Vale para `routers/sweeps.py` e
+  `routers/studies.py` (flush na linha ~319). Nenhum teste de 409 existe em `test_studies*` nem
+  em `test_sweeps*`. Conserto: pôr o flush dentro do `try`, com um teste que force a colisão.
+* **As coletas vão para a fila sem `_job_id`** (igual à cesta): reenviar duplica downloads, e
+  um crash entre o `commit` e o enqueue deixa uma coleta `queued` que nunca entra na fila. Os
+  runs dela adiam até a fila ficar em silêncio por `WAIT_LIMIT`.
+* ✅ **RESOLVIDO na PR-270** — **A tela da varredura ainda não oferece "Collect and run"**: é a próxima fatia. ⚠️
+  `anythingToRun` (`collect/missing.ts`) compara só pelo símbolo e não serve para vários charts.
+
+## O que a fatia "a varredura pula o par vazio" (PR-269) deixou de fora
+
+* ✅ **RESOLVIDO na PR-270** — **A tela ainda bloqueia** o lançamento quando há par sem dado (`LaunchSweep.tsx`, `blocked`),
+  embora o servidor agora pule. É a próxima fatia: "Collect and run" / "rodar com o que tem" e os
+  pulados na tela de resultado (`SweepOut.skipped`).
+* ✅ **RESOLVIDO na PR-284 (o dashboard)** — **O dataset exportado e o dashboard não citam os
+  pulados.** Decidido pelo Guilherme (22/09): **só o dashboard.** `GET /sweeps/dashboard` ganhou
+  `totals.left_out` (cada par pulado, com em quantas varreduras) e `left_out` por varredura na
+  linha do tempo; a tela lista os pares logo abaixo de "Markets · Charts". O dataset exportado
+  continua sem citá-los, **por decisão**, não por esquecimento.
+* **A lista de varreduras** (`GET /sweeps`) não diz que uma varredura tem buraco.
+* ✅ **RESOLVIDO na PR-273 (por remoção do teto)** — **Ensaio e lançamento com coleta podem discordar no teto.** `PreviewSweepRequest` não tem
+  `collect_missing`, e `preview.runs` conta o lançamento **sem** coletar (o menor dos dois). Um
+  ensaio com `error: null` e 2900 runs pode virar 422 "over the 3000" no "Collect and run", que
+  roda também os pares descobertos. Conserto: o ensaio devolver as duas contagens, ou aceitar o
+  flag.
+* ✅ **RESOLVIDO na PR-270** (a guarda agora é `dataGap`) — **Para a #270:** `LaunchSweep.tsx` só mostra `serverError` quando `uncovered` está vazio, com
+  o comentário "o servidor põe `error` junto de `uncovered` num buraco de cobertura". Desde a
+  PR-269 isso só vale para "tudo pulado": num buraco parcial com erro de teto, a tela esconderia
+  a frase do teto. Rever a guarda junto com o botão.
+
+## O que a tela da varredura (PR-270) deixou de fora
+
+* **O prompt lista par num chart que o DSL recusa.** O portão pergunta o plano sobre todos os
+  `timeframes` do formulário, mas o `uncovered` do ensaio (`_worth_naming`, PR-269) só nomeia
+  charts em que algum ponto roda. Se M15 é recusado por todas as entradas e está vazio, o clique
+  abre o painel "EURUSD M15 — never collected" em vez de lançar. O servidor não baixa à toa (a
+  PR-268 só cria coleta para par com run), mas o painel pergunta sobre um par irrelevante.
+  Conserto: perguntar o plano só sobre os charts com ponto executável (o ensaio teria de dizê-los).
+* **Plano que falhou oferece "Run anyway" mesmo sem nada para rodar.** O ramo `plan.isError` do
+  `MissingDataPrompt` ignora `canRun`; na varredura com `dataGap`, o botão vai a 422 (falha
+  fechado, com a frase do servidor). Valia antes para backtest e cesta.
+
+## O que a fatia "o plano consulta a corretora" (PR-271) deixou de fora
+
+* **As sementes continuam oferecidas nos seletores.** `AAPL` e `US500` estão em `instruments` (semente
+  de exemplo) e não nesta corretora (o S&P aqui é `SPXm`). A PR-271 impede de **coletá-las**, mas o
+  `SymbolPicker` ainda as lista como se fossem mercados. Casa com a fatia do seletor "qualquer ativo
+  do MT5".
+* **O snapshot da corretora pode estar velho.** O plano confia no último `replace_snapshot` (10/09
+  hoje). Trocar de conta sem sincronizar deixa o `at_broker` respondendo pela conta anterior. O
+  snapshot tem `synced_at`; a tela poderia dizer a idade dele.
+* **O ensaio da varredura não sabe da corretora.** O `uncovered` do `/sweeps/preview` lista AAPL como
+  "never collected" (verdade), e o aviso âmbar diz que apertar o botão pergunta se dá para coletar —
+  a pergunta então responde que não.
+* **O 422 do backtest avulso não diz que a corretora não tem o ativo.** Com `collect_missing` num
+  símbolo fora da corretora, a recusa sai como "no candles in this window for AAPL H1 (never
+  collected)". Morde quando o plano falhou (`plan.isError`), porque ali a tela ainda oferece coletar.
+* **Os pulados não guardam o porquê.** `Sweep.skipped` (e o `skipped` da cesta) grava AAPL como
+  `UncoveredMarket` "never collected": não separa "você escolheu não coletar" de "a corretora não
+  tem". Recarregada, a tela de resultado diz só "no candles".
+* **Par coberto em parte e fora da corretora roda sobre o que existe, mesmo com "collect".** Coerente
+  com a tela (a linha diz "cannot be collected"), mas sem teste.
+* **"Tabela vazia = não sei" depende de outro pacote.** Só vale porque `replace_snapshot` recusa
+  snapshot vazio; nada em `coverage` prende isso. Alternativa mais robusta: ler `synced_at`.
+
+## O que a fatia "o estudo pergunta pelo dado" (PR-272) deixou de fora
+
+* **O ensaio do estudo não avisa antes do clique.** O `/studies/preview` não tem `uncovered` (a
+  varredura tem): a falta de dado só aparece quando se aperta "Run the study". Não fura — o clique
+  pergunta o plano —, mas a varredura avisa enquanto se edita.
+* **O walk-forward não pergunta de novo.** Ele parte de um estudo já lançado, cuja janela passou
+  pela checagem; se o dado for apagado entre os dois, o `POST /walkforwards` não sabe.
+
+## O que a fatia "sem teto de combinações" (PR-273) deixou de fora
+
+* **O ensaio valida cada ponto a cada edição.** `/studies/preview` e `/sweeps/preview` passam todo
+  documento pelo validador do DSL (o da varredura, duas vezes por documento). Em 3168 pontos é
+  rápido; em 10^5 o "enquanto você digita" fica lento e prende uma thread do servidor. Sem teto, o
+  custo do ensaio cresce com a grade — candidatos: validar uma vez por (entrada, chart) e contar.
+* ✅ **RESOLVIDO na PR-285** — **O tempo não aparece na tela.** Decidido pelo Guilherme (22/09):
+  estimar as duas coisas, cada uma com o seu número. **Medido do próprio banco, nunca escrito em
+  constante** (`estimates.py`): backtest = mediana de segundos por barra de calendário dos últimos
+  200 runs terminados × as barras pedidas; coleta = mediana de segundos por ano das últimas 200
+  coletas bem-sucedidas, **por time frame** (a geral como reserva) × os anos planejados. Somados,
+  porque as duas filas são seriais. Sem histórico, a tela diz que não há estimativa em vez de zero.
+  Aparece no ensaio da varredura (`backtest_time`) e no painel "faltam dados" (`time` por par do
+  `POST /collections/plan`, e o total).
+  * **Fica de fora: o estudo.** O `/studies/preview` não recebe a janela (`PreviewStudyRequest` não
+    tem datas), então não há barras para multiplicar. Vale a mesma função (`backtests_time`) no dia
+    em que o ensaio do estudo souber a janela — a tela de lançamento do estudo já a tem.
+  * **Uma mediana para todos os setups.** A estrutura custa mais por barra que um MME9; uma taxa
+    por tipo de setup seria mais justa, e exige saber o tipo de cada run medido (está no documento
+    da estratégia, não numa coluna).
+* ✅ **RESOLVIDO na PR-274** — **O estudo recusa em vez de podar** combinações inválidas: agora
+  descarta e nomeia, como a varredura.
+
+## O que a fatia "o estudo poda o que não roda" (PR-274) deixou de fora
+
+* **O resumo do estudo conta só o que sobrou.** `points_total`/`points_profitable` são sobre os
+  pontos que rodaram: uma grade pedida de 9 com 2 podados vira "X de 7", e a tela de resultado não
+  diz que o espaço pedido era 9. O heatmap mostra "can't run" só onde **toda** combinação empilhada
+  na célula foi podada — numa grade de 3+ eixos a poda parcial some. Derivável de `grid` + `points`:
+  uma linha "N of M combinations could not run at this chart".
+* **"Célula sem ponto = podada" não tem guarda.** Vale porque antes toda combinação tinha ponto; se um
+  dia existir exclusão de run/ponto, a derivação passa a mentir.
+* **A checagem de dado roda antes da poda.** Uma grade em que nada roda, sobre uma janela sem dado,
+  recebe "no candles" em vez de "nothing runs" — a causa barata (a grade) fica atrás da cara.
+
+## ⚠️ LIVE — uma sessão nova lê o `venue.outcomes` desde o começo, 500 por barra (achado em 18/09)
+
+`MT5Broker.ensure_group` cria o grupo em `_PENDING = "0"` (o início do stream) e `on_bar` lê no
+máximo `_BATCH = 500` entradas novas por barra. O stream nunca é aparado. Com N entradas de sessões
+antigas, uma sessão nova só alcança os **próprios** fills depois de ~N/500 barras — uma posição real
+que o ledger não vê nesse meio-tempo. Achado porque `test_broker_integration.py` passou a falhar
+local (5 de 8) quando o stream do Redis de desenvolvimento cruzou 500 entradas (523 em 18/09); no
+CI passa porque o Redis nasce vazio. Confirmado que não é a PR-275: falha igual com as mudanças
+dela guardadas. Consertos candidatos: grupo criado em `$` **antes** do aquecimento (o motivo do "0"
+era não perder fill durante o aquecimento — criar cedo em `$` resolve os dois), ou ler em laço até
+esgotar, e aparar o stream (`MAXLEN`/`MINID`). O teste precisa de um stream próprio ou de um Redis
+limpo, senão volta a depender de quantas vezes a suíte já rodou nesta máquina.
+
+## `BothSides`: o cancel do outro lado chega um bar depois (achado na revisão da PR-282)
+
+Com `side: both` nos setups swing, quando um lado executa no bar K a ordem do outro lado é
+cancelada no **fechamento** de K e só sai do livro em K+1. Se os dois lados estivessem armados
+juntos, a ordem do outro lado ainda poderia executar dentro de K — o broker recusa a segunda
+entrada com posição aberta, mas o caso nunca foi exercitado ponta a ponta. **Hoje é inalcançável:**
+medido em 22/09, com ~5 000 trades aleatórios nos cinco setups, os dois lados nunca ficaram armados
+ao mesmo tempo (o fechamento que desarma um é o que arma o outro). Volta a importar no dia em que um
+filtro ou um setup novo armar sem o cruzamento da média — aí vale um teste com a `BacktestBroker`
+real e as duas metades armadas.
+
+## O alvo virou eixo de grade (PR-286), e o filtro de média longa ainda não
+
+Pedido dele em 22/09: ao cadastrar uma variação no catálogo, escolher **vários riscos/retornos**,
+incluindo **sem alvo** — porque há setups que conduzem o stop sozinhos e o alvo atrapalha. Feito:
+o eixo é `exit.take_profit.params.rr`, com valores `off, 2, 3`. O servidor conhece esse caminho por
+nome (`grid.TAKE_PROFIT_RR`): um número **constrói** o bloco `{type: risk_multiple, params: {rr}}`,
+`off` o **apaga**, e a leitura inversa devolve `None` para um documento sem alvo, que é o que põe o
+run de volta no eixo no heatmap.
+
+✅ **Conferido em 28/09: já funciona.** A tela oferece `off` no eixo da média longa
+(`offIsASetting`), o documento sai com `long_average_period: null` e o motor lê como filtro
+desligado. Quatro entradas do catálogo já usam (MM9 BASE COMPLETO: `[off, 20, 50, 100, 200]`; com
+`off` saem 452 trades em média por run, com 200 saem 324). O texto abaixo ficou de antes.
+
+⚠️ **O mesmo problema continua aberto em `long_average_period`** (anotado no teste de eixos): uma
+grade pode variar o período do filtro de média longa, mas **não pode pedir o filtro desligado**,
+porque `null` não é um valor que o eixo enumera — "com filtro contra sem filtro" ainda são dois
+estudos. O conserto agora tem precedente: o eixo aceitar `off` e o servidor tratar o `null` como
+"parâmetro ausente" em vez de "parâmetro nulo". ⚠️ Não é a mesma mecânica: ali o campo existe e é
+`None` legítimo, aqui o bloco inteiro some.
+
+## Filtro de média longa nos MME9 publicados (PR-287) — o que a revisão deixou
+
+1. **"Trade aberto conduz independente da média longa" não tem teste próprio** no 9.1, no 9.2/9.3
+   e no 9.4. Hoje vale pela estrutura: nos três, o `return` com posição aberta e a condução vêm
+   **antes** do bloqueio do filtro, então ele não alcança a condução. Um teste com
+   `breakeven_at_r` ligado e o filtro recusando fecharia isso — o sinal de condução tem que sair.
+2. **O mesmo buraco da regra "a média longa conta em todo candle" existe no breakout e no ponto
+   contínuo**: `test_long_average_filter.py` não passa nenhum candle com posição aberta, então um
+   mutante que pula o `update` durante o trade sobrevive lá. O teste que a PR-287 escreveu para os
+   três publicados (`test_the_long_average_keeps_counting_while_a_trade_is_open`) é o molde.
+
+## Varredura guarda só o que precisa (PR-288) — o que ficou para depois
+
+Decidido com ele em 22–23/09, para varreduras de 500–800 ativos: run de varredura guarda **métricas
+sempre**, **trades só se passou na régua** (lucro líquido > 0 e mínimo de trades por gráfico: M1/M5
+60, M15/M30/H1 30, H4/D1/W1 nenhum) e **nunca** retrato nem curva de equity. `backtests.recorded`
+diz o que cada run guardou; o botão "re-rodar este ponto" reconstrói tudo (engine determinística).
+
+1. **Medir o "depois".** A mesma consulta de 22/09 (tamanho de retrato, curva e trades por run)
+   sobre uma varredura pequena real, com o Docker de pé e a fila vazia. Até lá o ganho é estimativa
+   (~549 kB → ~0,4 kB por run negativo).
+2. **As ~5 mil runs de varredura antigas continuam `full`** e ocupam os 2,9 GB de hoje. Limpar
+   retrato e curva delas é uma operação à parte, que pede o ok dele.
+3. **Os próximos passos do plano** (`docs/localdocs/banco-de-combinacoes-e-ml.md`, local): MFE/MAE
+   em R em cada trade; RR sem eixo = varredura sem alvo; features da decisão; decisões recusadas
+   gravadas; paralelizar os workers.
+4. **O teste de propriedade do retrato quase não exercita o Ponto Contínuo nem a continuação**:
+   caminhada aleatória raramente os qualifica. A chave vive no loop, fora do alcance dos setups, mas
+   um gerador de mercado que os qualifique fecharia a lacuna.
+
+## MFE/MAE em cada trade (PR-289) — o que ficou para depois
+
+1. **Ao vivo, um fill atrasado pode superestimar o MFE.** O broker ao vivo assume que todo fill
+   drenado aconteceu no candle que acabou de fechar. Um stop executado nos últimos segundos do
+   candle N que só chega depois de `on_bar(N)` faz o candle N ser lido inteiro — inclusive uma
+   máxima impressa depois da saída. É o único caminho para um MFE alto demais; só no ao vivo, nunca
+   em backtest ou varredura. Conserto: comparar `fill.time` com o candle antes de ler o candle.
+2. **`with_target` é exato por trade, não por run**: com alvo, um trade termina antes e pode abrir
+   espaço para uma entrada que a run sem alvo não viu. Medir o tamanho desse efeito por setup antes
+   de confiar em somas de alvos derivados (o guardião mediu 0 divergências de acerto em 889 pares,
+   mas comparando só até a primeira divergência de sequência).
+3. **`testing.ImmediateFillBroker` não observa excursões**: seus trades saem com MFE = MAE = entrada
+   (`mfe_r = 0`), não `None`. Só afeta testes.
+
+## Varredura sem alvo e escada de alvos (PR-290) — o que ficou para depois
+
+1. **Falta um teste de integração do caminho que justifica a escada**: um run de varredura que perde
+   sem alvo, ganha num degrau e por isso guarda os trades. As peças estão testadas em separado
+   (`target_ladder`, `recorded_for(target_net_r=...)`); o worker juntando as duas só é coberto pelo
+   run avulso do teste de fluxo. Precisa de um cenário de candles que perca sem alvo e ganhe com um.
+2. **Com eixo de RR na grade, os degraus abaixo do próprio alvo também contam para a régua**: um run
+   com alvo de 5 R pode guardar os trades por causa do degrau de 0,5 R. É a regra como combinada
+   (qualquer degrau), mas vale perguntar a ele se quer restringir aos degraus que o run de fato
+   poderia ter (≤ alvo próprio) — hoje isso já é o que acontece, porque acima do alvo o degrau é nulo.
+
+## MME9 breakout: martelo + filtro de média longa derrubava o run — resolvido na PR-292
+
+**144 runs** da varredura de teste de 23/09 caíram com `a long stop at 1.16221 is on the wrong side
+of 1.16281`, todos `mme9_breakout` + `entry_point: martelo` + `long_average_period: 100` em M15.
+Causa confirmada no GBPUSD M15: o martelo fechou às 05:30 de 12/09/2022; a média longa de 100 ainda
+aquecia (os dados começam em 09/09/2022 05:00), então o filtro segurou a ordem; às 05:45 a média
+ficou pronta, a janela do martelo ainda estava aberta, e a ordem foi oferecida num candle que já
+tinha ido a 1.16284 e fechado em 1.16281 — compra stop abaixo do mercado, e o sinal recusa lançando.
+(A primeira hipótese anotada aqui, "o filtro recusa por estar abaixo da média", estava errada.)
+
+**Decisão dele (23/09, opção A):** o padrão venceu — nada é colocado e o relógio do padrão recomeça.
+Feito em `swing._reconcile_pattern` (`_passed_by`), que é compartilhado com o Ponto Contínuo.
+
+**Onde a trava fica (opção a, 23/09):** depois do filtro de média longa. Enquanto o filtro segura a
+ordem, o padrão continua vivo, como antes; ele só é descartado no candle em que o filtro libera e o
+preço já passou — exatamente os candles que antes quebravam. Conferido: 150 runs da varredura, que não
+quebraram, reproduzem o banco até a última casa com a correção.
+
+Fica em aberto:
+- um sinal inválido por outro motivo ainda derrubaria o run inteiro em vez de virar uma recusa
+  registrada;
+- a regra olha só o **fechamento**, como a validação do sinal: uma ordem segura por vários candles
+  cuja máxima passou do nível mas cujo fechamento voltou ainda é colocada depois, num nível que o
+  preço já negociou.
+
+## Teste: ordem armada numa zona que sai da janela de 200 regiões (24/09)
+
+Achado pelo `engine-guardian` no PR das varreduras de zonas: trocar `StructureStrategy._tracked` por
+`return True` passa na suíte inteira do motor. Falta o cenário em que uma zona armada, com a ordem
+parada no book, é empurrada para fora da janela de `_MAX_ZONES` regiões — a ordem tem que ser
+cancelada. O buraco é anterior ao PR (a forma antiga com `any(...)` passaria igual).
+
+## Varredura: pontos equivalentes compartilham um run — o que ficou para depois (24/09)
+
+O PR que faz a varredura rodar uma vez os pontos que só diferem num parâmetro que a entrada não lê
+cobre só os setups de estrutura (`structure_choch`, `structure_continuation`), porque é onde a tabela
+`DIALS_READ` foi provada contra `activation_for`. Fica em aberto:
+- os setups de média (MME9 e Ponto Contínuo) têm `entry_point`, `stop_buffer_ticks`, `gift_stop` e
+  `volume_filter` com a mesma forma — falta a tabela deles, provada da mesma maneira;
+- o estudo (`/studies`) expande grades pelo mesmo caminho e ainda roda cada ponto;
+- a chave de equivalência compara o JSON do documento: `0` e `0.0` no mesmo eixo contam como
+  diferentes (só custa um run a mais, nunca junta o que difere).
+
+## ~~Seletores de ativo mostram só os instrumentos cadastrados (24/09)~~ — FEITO (PR-306 busca na corretora, PR-329 o lançamento coleta sozinho; conferido 02/10)
+
+"Mesmo que eu colete no coletor vários ativos sempre aparece somente os mesmos 4." As telas de
+varredura, backtest, estudo e basket listam `GET /instruments` (a tabela `instruments`: 4 linhas —
+AAPL, US500, EURUSD, GBPUSD), enquanto a corretora tem 84 símbolos em `broker_symbols`. Pedido:
+**digitar, buscar e adicionar** o ativo na hora de lançar qualquer teste, a partir dos símbolos da
+corretora, criando o instrumento (tick, contrato, spread) quando ainda não existe.
+
+A investigar junto: houve coletas de AUDUSD e USDCHF que não viraram `instruments` nem `datasets`
+— a coleta de um símbolo novo talvez não registre o instrumento, o que também o esconderia dos
+seletores.
+
+**Investigado em 25/09 (PR-305):** as coletas de AUDUSD e USDCHF não sumiram, **travaram**. Foram
+pedidas em H1 desde 1966 (a sugestão pelo orçamento de barras, porque o formulário foi enviado antes
+de a medição do símbolo responder), a biblioteca do MT5 levanta `OSError` para data anterior a 1970
+no Windows, e o `run_collection` só tratava `LookupError` — as duas linhas ficaram em `running, 0 de
+61 anos` para sempre, sem instrumento nem dataset. O PR-305 fecha a linha como `failed` em qualquer
+erro, o coletor não pede nada antes de 1970 e a tela não sugere antes de 1970. O pedido dos
+seletores continua de pé.
+
+## A coleta pode ser enviada antes de a medição do símbolo responder (25/09) — PENDENTE
+
+Origem: PR-305. Enquanto o `probe` do símbolo não volta, a janela sugerida é só o orçamento de
+barras (60 anos no H1, agora limitado a 1970), e o botão já envia. Medido em 24/09: AUDUSD pedido
+às 01:13, medição gravada às 01:16 — o pedido saiu com a janela do orçamento, não com a de 2010 que a
+medição daria. Opções: segurar o envio até a medição responder (ou falhar), ou mostrar que a janela
+ainda não foi medida. Junto: um erro ao **conectar** ao MT5 (antes do `run_collection`) ainda
+deixaria a linha em `queued`.
+
+**FEITO no PR-306 (a parte da tela):** varredura, basket e estudo passam a buscar em **todos** os
+símbolos da corretora, com a mesma busca que o backtest já tinha. Um ativo nunca coletado pode ser
+escolhido; ele aparece como "never collected" e trava o lançamento com um link para a tela de
+coleta. A API o recusa com 422, e nenhum "coletar e rodar" resolve: tick, contrato e tick value só
+o terminal sabe, então o instrumento nasce na coleta.
+
+**Continua em aberto:**
+
+1. Lançar direto um ativo nunca coletado, enfileirando antes dos runs a coleta que cria o
+   instrumento. Para isso o `POST /sweeps` precisa aceitar símbolo sem `Instrument` e esperar a
+   coleta terminar.
+2. A grade de catalogados continua embaixo da busca. Com centenas de instrumentos (plano do ML) ela
+   deixa de ser escaneável; trocar por "catalogados filtrados pela busca" ou por grupos.
+3. O `POST /sweeps/preview` pula símbolo desconhecido em silêncio (`coverage.py`, `continue`), e a
+   prévia não o menciona.
+
+## Teste fora da amostra julgado em pedaços (25/09) — FEITO no PR-307, com pendências
+
+A pedido dele, um teste fora da amostra terminado pode ser fatiado **à mão** por ano calendário ou
+em blocos de N trades. Cada ponto passa se ≥ X% das fatias fecharem acima de zero R, com pelo menos
+2 fatias contadas. A análise é gravada (`sweep_slicings`, migração 0026) junto com a regra, e não
+roda nada: os runs de teste passam a guardar os trades mesmo quando perdem (`retention`).
+
+Pendências:
+
+- **Testes lançados antes de 25/09** não têm os trades dos perdedores (`recorded = metrics`). A
+  análise mostra "no trades kept" em vez de julgar; para julgá-los, é preciso lançar o teste de novo.
+- **Walk-forward de verdade** (caminho B: reotimizar a cada janela, uma varredura por janela) fica
+  para depois de o fatiamento mostrar se vale o custo.
+- ~~O ano reservado é outro teste fora da amostra da mesma varredura. Nada impede, ainda, que ele
+  seja lançado antes da hora; hoje isso depende da disciplina.~~ **Feito (01/10): o ano reservado é
+  usado uma vez por varredura.** `POST /sweeps/{id}/holdout` com uma janela que divide alguma barra
+  (pontas que só se tocam não contam, `holdout.overlaps`) com um teste anterior da mesma varredura —
+  ou com uma dobra de um walk-forward dela, contada desde o lançamento, mesmo antes do treino
+  terminar — é recusado com **409**, e o corpo lista os testes (`used_by`: tipo, id, dobra, janela,
+  quando). Com `retest: true` ele roda e grava `retest` e `retest_of` (ids) na `holdout_rule`; o
+  `GET /sweeps/{id}/holdout` devolve `retest_of` (lido na hora) e `earlier_uses`, e a tela mostra o
+  selo "Retest". O walk-forward da varredura segue a mesma regra no lançamento (409 sem `retest`);
+  as dobras dele não se bloqueiam, e cada teste de dobra registra só os olhares anteriores ao
+  walk-forward. Sem migração (JSONB).
+
+## Operar contra setups consistentemente ruins (25/09) — PENDENTE, para o FINAL, com tudo pronto
+
+Pergunta dele: se vários setups perdem muito (80–90%), dá para inverter a entrada e operar contra
+eles? Combinado: fica para o fim do projeto, depois de seleção, walk-forward e cluster prontos.
+
+Por que quase nunca funciona (registrar para não repetir a discussão):
+
+1. **Os custos não se invertem.** Um sinal sem vantagem perde o spread, a comissão e o swap a
+   cada trade, e o espelho paga os mesmos custos. Os dois perdem.
+2. **Os piores de milhares de combinações são sorte, como os melhores.** Fora da amostra, os dois
+   extremos voltam para o meio.
+3. **O setup não é simétrico.** O espelho de 15% de acerto com 3R:1R é 85% de acerto com 1R:3R,
+   que não é o oposto em resultado. A entrada limite na zona (SMC), invertida, vira outro tipo de
+   ordem. O stop estrutural e a condução do trade também não se espelham.
+
+Quando pode funcionar: **R bruto (antes de custos) negativo de forma consistente**, em muitos
+trades, anos e ativos. Há um sinal, só que ao contrário.
+
+Plano, na ordem:
+
+1. **Triagem sem rodar nada**: grupos (entrada, gráfico) com **mediana** negativa numa varredura,
+   não os piores runs isolados.
+2. **Separar custo de sinal**: R bruto vs. líquido. Bruto perto de zero significa que a perda é
+   custo, e a ideia morre aqui.
+3. **Só se o bruto for claramente negativo**: construir a opção "inverter direção" no motor (não
+   existe hoje; passa pelo `engine-guardian`) e testar o espelho **fora da amostra**, com o mesmo
+   rigor dos vencedores (teste reservado + fatiamento por ano/blocos).
+
+## O painel geral de varreduras (`GET /sweeps/dashboard`) leva 10 s (25/09) — MELHORADO no PR-347 (28/09)
+
+**28/09:** com 1,57 milhão de runs (1,3 milhão sem resultado, quase todos cancelados à mão) a
+abertura fria tinha ido a **52 s**. O PR-347 lê inteiros só os runs com resultado e traz os outros
+**contados pelo Postgres**, com a mesma regra de medição única: **14,5 s**, números idênticos
+(teste novo passa no código antigo e no novo). Ainda aberto:
+- ~6 s de Python montando 257 mil runs com resultado e ~8 s de SQL (a ordenação vai a disco: o
+  `work_mem` de 4 MB não sobe porque o container do Postgres tem 64 MB de `/dev/shm`);
+- a chave do cache custa 1,8 s em toda abertura, mesmo quente;
+- os cancelados à mão contam como `failed` no painel. Um estado `cancelled` de verdade os separaria.
+
+Texto original (25/09):
+
+Medido em 25/09 com cerca de 80 mil runs no banco: **10,3 s**. É o mesmo problema que o PR-313
+resolveu no resumo de uma varredura: lê todos os runs de todas as varreduras como objetos do ORM
+para calcular medianas. O conserto segue o mesmo molde:
+
+1. ler só as colunas usadas;
+2. guardar o resumo de cada varredura já assentada (o `sweeps.summary` do PR-313 já tem as
+   contagens e, por entrada, as medianas);
+3. recalcular só as varreduras que ainda rodam.
+
+⚠️ O painel remove medições duplicadas entre varreduras (`distinct`), então o resumo por varredura
+não pode ser somado direto. É preciso ver o que dá para reaproveitar.
+
+## O tick value é uma foto do câmbio, e o run não guarda a foto que usou (25/09) — PENDENTE
+
+Medido em 25/09, testando os gêmeos do cluster (PR-317). Três runs de USDCHF H4 da varredura MM9,
+rodados de novo com a mesma estratégia, janela, candles (7 764), custo e versão do motor, deram os
+**mesmos trades** (992, 992, 944) e **outro resultado em dinheiro** (−9 039,83 no original contra
+−9 027,16 no gêmeo). O motor é determinístico: rodando local três vezes, com e sem imagens, deu
+−9 027,16 todas as vezes. O que mudou foi o **instrumento**. A coleta das 17:15 UTC regravou o
+USDCHF com `tick_value = 1,2065`, o câmbio daquele momento, e o backtest lê o `tick_value` atual
+na hora em que roda.
+
+Dois problemas, de tamanhos diferentes:
+
+1. **Reprodutibilidade (pequeno, conserto claro).** O run não guarda a especificação do
+   instrumento que usou (tick_size, tick_value, contract_size, dígitos). Uma coleta posterior muda
+   o resultado de qualquer run refeito. Conserto: gravar a especificação no run, na hora de
+   lançar (coluna JSONB em `backtests`), e o worker usar essa em vez da atual.
+2. **Modelo (maior).** Para pares cotados fora de USD (USDCHF, USDJPY, EURGBP, CADJPY, XAUUSD…), o
+   `tick_value` é **um câmbio fixo, do dia da coleta**, aplicado a 17 anos de histórico. O valor do
+   ponto em USD variou muito nesse período, então o resultado em dinheiro é aproximado. Em R não
+   muda, porque R divide pelo mesmo `tick_value` em cima e embaixo, exceto pelo arredondamento do
+   lote. Conserto possível: converter pelo câmbio da época (candle do par de conversão,
+   p. ex. USDCHF para CHF → USD) no momento de cada trade. Mexe no motor (`costs`, `portfolio`),
+   então passa pelo guardian.
+
+⚠️ Até lá: **compare estratégias em R**, não em dinheiro, quando houver pares não-USD. As métricas
+de seleção (PR-309/310), o fatiamento e o cluster já trabalham em R.
+
+## Editar uma estratégia já catalogada (26/09) — PENDENTE
+
+Pedido dele: *"não tem opção de alterar uma estratégia já catalogada, seria bom"*. Hoje uma entrada
+da prateleira (`catalog_entries`) não tem edição de grade nem de documento pela tela; para mudar um
+eixo é preciso catalogar outra. Cuidado ao fazer: varreduras e runs antigos apontam para a entrada,
+então editar não pode reescrever o que já rodou (versionar, ou copiar ao editar).
+
+## ~~A prévia da varredura lista cada ponto recusado, e passou de 1 GB (26/09)~~ — FECHADO (PR-327)
+
+Com a grade do "CONTINUATION FULL OTIMIZATION" (~435 mil pontos por tempo gráfico), a resposta de
+`POST /sweeps/preview` chegou a 1,09 GB e uma vez derrubou a API (`stack smashing detected`, nginx
+devolvendo 502). Mesmo com o `htf_offset` opcional (PR-326), os `htf` menores ou iguais ao gráfico
+continuam recusados ponto a ponto. Agrupar `GridRefusal` por motivo, com a contagem e alguns
+exemplos, em vez de um item por ponto.
+
+## Aproveitar o backtest de uma varredura anterior (26/09) — PENDENTE
+
+Pergunta dele: *"hoje nós já aproveitamos uma corrida que já foi feita antes?"*. Dentro de uma
+varredura, sim (pontos equivalentes compartilham um run — no CONTINUATION, só 18% dos pontos
+válidos rodam). Entre varreduras, não: o documento da estratégia é reaproveitado
+(`strategies_for`), mas o backtest roda de novo. Quando estratégia, ativo, tempo gráfico, janela,
+capital, custos e `engine_version` forem iguais a um run terminado, o lançamento poderia apontar
+para ele em vez de enfileirar outro. Cuidado: retenção (`retention`) apaga trades de runs ruins, e
+um run apagado não pode ser a resposta de outro.
+
+## A prévia de uma grade enorme leva meio minuto (26/09) — PENDENTE
+
+Em fluxo (PR-327) a prévia do CONTINUATION em H1+H4 lê 870 mil documentos em ~35 s com 126 MB. A
+tela pergunta de novo a cada edição (400 ms de espera). A maior parte é montar cada documento
+(`grid._copy` + `fit_name`); dá para cortar sem mudar a resposta.
+
+## Reaproveitar run idêntico (PR-345, 28/09) — o que ficou para depois
+
+1. **Nada obriga a subir a versão do motor.** O reaproveitamento só é honesto se toda mudança que
+   pode mexer num resultado subir `tradeforge_engine.__version__` — e ela ficou em 0.1.0 de julho a
+   28/09 atravessando vários consertos. Candidato: um check de CI (ou item no template de PR) que
+   acusa diff em `packages/engine/src` sem mudança da versão; o engine-guardian pode cobrar.
+2. **O Xeon grava no mesmo banco.** Um worker remoto com código antigo e a mesma versão viraria
+   "original" de runs daqui. Hoje ele roda 0.1.0 (inelegível); ao atualizar, subir junto com a
+   versão, nunca um motor diferente sob o mesmo número.
+3. **Barra corrigida no lugar não é vista**: mesma contagem, mesma primeira e última barra, outro
+   preço. Fecharia com um hash dos dados da janela gravado no run.
+4. **Pedaços de um run mais longo** (2020–25 respondendo 2022–24, ou emendar um ano): medir antes
+   quanto aquecimento, trade aberto na virada e saldo mudam o resultado.
+5. **A tela não mostra que um run é cópia** (`reused_from`).
+
+## O relógio do servidor é do ativo (30/09) — o que ficou para depois
+
+- ~~**O coletor não recusa um relógio diferente do que o ativo já tem.**~~ **Feito (01/10).** Um
+  ativo que já tem dataset e recebe outro `server_offset` é recusado com `ClockChangedError`
+  (`tradeforge_db.instruments.refuse_a_new_clock`): a mensagem diz o símbolo, o relógio gravado, o
+  novo e o `--server-offset` a usar. A recusa vem **antes de gravar o parquet** (backfill pela
+  linha de comando e coleta pelo agente), não só no `upsert_instruments`. Sem dataset, o relógio
+  ainda pode mudar — é assim que se corrige um primeiro palpite errado.
+- **Semana do agregador começa na segunda; a do MT5, no domingo (servidor).** Sem barras no domingo
+  do servidor não muda nada (forex/UKOIL abrem segunda 00:00 servidor), mas um ativo que negocia no
+  domingo do servidor teria o W1 de cima cortado diferente do gráfico. Não medido.
+- **Os runs com `htf` do motor 0.4.0** (UKOIL M15/M30/H1 da `87b0efc0`) ficaram obsoletos: foram
+  cortados em UTC. Não são reaproveitados (versão do motor), mas continuam no banco.
+
+
+## Clones no ranking e no dataset (01/10) — o que ficou para depois
+
+`GET /sweeps/{id}/runs` agora esconde, por padrão, os runs que fizeram exatamente os trades de um
+lançado antes deles na mesma (entrada, gráfico, ativo) — a mesma regra do `distinct` do teste fora da
+amostra (`holdout.BEHAVIOUR_FIELDS`) —, e o CSV ganhou `clone_of`. Ficou em aberto:
+- **Custo medido no banco real (01/10, leitura):** na página padrão (acima do piso) o tempo ficou
+  igual ao de antes nas varreduras de 175 mil runs; com `all_runs` ficou 1,2–2× (a janela ordena
+  todos os runs medidos da entrada; 65 mil runs: ~300 → ~700 ms com paralelismo). Se pesar, a saída
+  é gravar a chave do comportamento (hash) em `backtest_metrics` quando o run termina — migration.
+- **Runs de zero trade viram um grupo só** por (entrada, gráfico, ativo): todos "fizeram o mesmo"
+  (nada). Com `all_runs` isso esconde milhares de runs sem trade atrás de um. Correto pela definição,
+  mas pode valer tratar zero trade à parte.
+- ~~**O desempate do "primeiro" difere do teste fora da amostra.**~~ **Feito (01/10).** Holdout,
+  walk-forward, página e CSV usam `created_at`, nome da estratégia e id — o mesmo original nos três.
+- **Página de todas as entradas (só pela API) ficou mais lenta**: sem constraint única de ponto
+  próprio por (sweep, estratégia), a entrada de cada run vem de um `GROUP BY` em `sweep_points`
+  (~1,7× na página padrão). A tela sempre pede por entrada e não paga isso.
+- **O `sweep_points` é lido inteiro a cada página** (já era antes: o filtro por entrada é um seq
+  scan de ~2 GB no banco de hoje). Um índice parcial `(sweep_id, entry_id) WHERE same_as IS NULL`
+  provavelmente resolve — medir.
+
+
+## Walk-forward por recorte (01/10) — o que ficou para depois
+
+O walk-forward da varredura ganhou `mode: "cut"`: cada dobra é respondida pelos runs da própria
+varredura-mãe recortados em anos inteiros (`year_cut`), sem rodar nada — e os runs passaram a gravar
+`trades_by_years` (rev_0043) junto do `r_by_years`. Ficou em aberto:
+- **Ranquear por outra métrica no recorte.** Só R líquido: o recorte guarda R e nº de trades por
+  ano, nada mais. Profit factor, expectativa, Sharpe ou drawdown em R dos anos de treino exigiriam
+  guardar mais por ano (ganho/perda brutos por célula, a curva de R ou os trades) — migration e mais
+  bytes em todo run. Hoje o pedido com outra métrica ou `max_drawdown_r` é 422.
+- **Runs antigos ficam de fora** (`no_counts`): os gravados antes de 01/10 não têm `trades_by_years`,
+  e as cópias (`reuse`) de um original antigo herdam o nulo. Só uma varredura rodada (ou copiada de
+  um original) depois desta versão responde por recorte. Dá para preencher os que guardaram trades
+  (os positivos) a partir da tabela `trades`; os perdedores, só rodando de novo.
+- **A contagem é dos trades com R** (com stop) — os mesmos que o `r_by_years` soma. Um trade sem stop
+  está no `total_trades` e em nenhuma célula, então o piso do recorte pode ser mais duro que o do run.
+- **Síncrono no pedido** (numa thread): uma varredura de ~100 mil runs é lida e recortada na hora.
+  Não medido no banco real; se passar de alguns segundos, vira um job curto.
+- **A guarda do recorte é conservadora**: um run que recusou um sinal por lote zero em qualquer ano
+  não tem recorte nenhum (`refused_cut`), mesmo dos anos certos.
+
+## A varredura guarda todos os trades (02/10, PR-373) — o que ficou para depois
+
+- **A fila de modelos (`template_queue_job`) não leva `keep_all_trades`.** Cada item lança uma
+  varredura comum. Para rodar uma base de ML ativo por ativo pela fila, o modelo precisa do campo.
+- **Combinar varreduras** só marca a combinada como "todos os trades" quando todas as partes são.
+- **Espaço não medido ainda:** medir na primeira base (MM9 para ML, 16 ativos) antes de crescer.
+
+## Os testes de broker falham com o sistema rodando (02/10) — PENDENTE
+
+`apps/api/tests/test_broker_integration.py` falha 5 de 8 localmente quando a pilha está de pé (agente do
+coletor e workers do Xeon ligados ao mesmo Redis), também no `develop`. No CI, isolado, passa. Os testes leem
+e escrevem streams/chaves no Redis do `.env`, o mesmo do sistema em uso. Conserto provável: um banco Redis
+próprio para os testes (`REDIS_DB` de teste, como o `POSTGRES_DB=tradeforge_test`), ou prefixo de chaves.
+
+## Ruína e spread proporcional (02/10, PR-377) — o que ficou para depois
+
+- **Só a varredura cota o spread de cripto.** Um backtest avulso, um estudo ou uma cesta da mesma cripto
+  continuam cobrando pontos fixos: resultados não comparáveis com os da varredura.
+- **O preço de referência é o último fechamento do dia do lançamento**: o mesmo corpo de varredura, lançado
+  em dias diferentes, grava `cost_model` diferente e não reaproveita runs de cripto entre esses dias.
+- **Cripto sem D1/H4/H1 nos últimos 60 dias** volta a cobrar pontos fixos sem avisar.
+- **Drawdown acima de 1 no ranking e no dataset** (piso, mediana, `/best`): não conferido.
+- **Ordem em repouso preenche depois da ruína** (o motor só para o dimensionamento) — hoje os setups
+  descartam a ordem em repouso ao abrir posição, então não acontece; um setup novo pode mudar isso.
+
+## Falhas reais na varredura M5 de 03–04/10 — PENDENTE
+
+Dos ~399 mil runs `failed` dos últimos dois dias, quase todos foram cancelados à mão em 02/10. Os de verdade:
+
+- **58 runs (M5) com drawdown acima de 100%**: a conta de 10 000 terminou em −21 574 (`max_drawdown_pct`
+  1,70) e o `CHECK` de `backtest_metrics` recusou a gravação. O saldo atravessou o zero: a ruína
+  (`ruined_at`, PR-377) para o dimensionamento, mas uma posição aberta ainda perde além do saldo (gap, custo).
+  É do motor: decidir se a ruína fecha a conta em zero ou se o drawdown fica limitado a 1. Passa pelo
+  engine-guardian.
+- **29 runs (M5/M30) com `finished_at` antes de `started_at`** (`ck_backtests_finished_after_started`):
+  provavelmente um run reposto por resume/release que guardou o `started_at` novo e o `finished_at` antigo.
+- **5 runs (M5) com `ENOMEM`** lendo Parquet: memória no limite com 14–16 workers no M5. Lembrar disso
+  antes do M1.
+
+## O aquecimento lia o histórico ralo antes do início real (04/10) — o que ficou para depois
+
+- **A régua da densidade é por ano.** O conserto corta o aquecimento no primeiro ano real (`density`), mas um ano
+  que passa dos 80% ainda pode ter meses ralos (UsaTec M15 2017: jan/fev ~400 barras/mês contra ~1 900; o ano
+  inteiro deu 18 622, logo abaixo do piso). Uma régua por mês resolveria o resto.
+- **Dois meses ralos travaram o setup por sete anos** (structure_continuation, UsaTec M15 2018–2024: 0 trades
+  aquecendo em 2017 inteiro, 157 sem aquecimento). Barras ruins no início não deveriam calar o setup para sempre:
+  investigar no motor qual estado da estrutura nunca se desfaz (engine-guardian).
+- **Runs antigos afetados:** todo par cortado pela guarda (#379) desde 02/10 — metais, índices e cripto em
+  M15/M30/H1/H4 — aqueceu no histórico ralo. Relançar os que importarem.
+
+## A pausa deixa lotes na fila (04/10) — PENDENTE
+
+Pausando a d3249da1 (UsaTec, ~563 mil runs em lotes de 24), a API retirou 67 392 jobs e deixaram 19 296 lotes
+`batch-*` no Redis; os workers seguiram pegando. Removidos à mão. Provável: os ids de lote que a pausa recalcula
+(`jobs_for`) não batem com os do lançamento para parte dos lotes. Conferir antes de confiar na pausa de novo.
+
+## Parar um worker no meio de um lote deixa runs `failed` para sempre (06/10) — PENDENTE
+
+Trocando os workers da Contabo no meio da d3aabdc2 (SIGTERM, arq cancela o lote e diz "will be run again"),
+`process_batch` marcou os runs ainda não terminados como `failed` ("the batch was stopped: CancelledError()") —
+de propósito, para nenhum ficar `running` sem dono. Mas o lote devolvido pula `failed`, então os 259 runs não
+voltaram: foram recolocados à mão (status → queued + jobs próprios). Num cancelamento que o arq vai repetir, os
+runs deveriam voltar a `queued`, não `failed`; `failed` só quando é a última tentativa (timeout real).
+
+## Desdobramentos de ações (14/10, ADR-0034) — o que ficou para depois
+
+- **Proventos nas ações americanas.** Só desdobramento é ajustado; o dividendo é um gap real no preço do CFD e a
+  corretora credita/debita o ajuste na posição. O backtest não credita nada. Pequeno em setups curtos; medir antes.
+- **XP ajusta por proventos, e o ajuste muda a cada provento novo.** A série inteira é reescalada pela corretora:
+  recoletar só o ano corrente depois de um provento deixa um degrau na virada do ano entre o arquivo antigo e o
+  novo. Antes de recoletar ações BR, recoletar a série toda (ou detectar o degrau). E os preços antigos não são os
+  negociados (PETR4 out/2021: R$ 8,53 contra ~R$ 28) — custo fixo por ordem em R$, tick e números redondos
+  ficam distorcidos no passado.
+- **Contínuos da B3 (WIN$, WDO$).** Conferir se a rolagem deixa salto na série contínua da XP (o detector só olha
+  ações).
+- **Tick ruim no bruto:** NVDA M15 tem um salto de +54% numa vela de 2018-12-27 20:45 que não é desdobramento.
+  Um detector de velas absurdas (fora de N ATR do vizinho) na coleta.
+- **Refazer o que foi calculado com os dados sem ajuste:** varreduras de ações EUA (92fdba03, d1118475, eac59511 e
+  outras), as bases de ML delas e as telas de melhores. Decisão dele.
+
+## O rótulo cobra o spread medido (14/10, ADR-0031) — o que ficou para depois
+
+- **A API cobra o spread de ação em ticks fixos.** Só cripto é proporcional (`_priced`). Numa série
+  de ação ajustada por desdobramento (NVDA ×40 desde 2016), o spread de hoje em ticks vira vários
+  por cento do preço antigo. O ML já cobra proporcional; a varredura ainda não.
+- **Spread medido é uma leitura só.** O catálogo guarda um número. O das ações EUA foi a mediana de
+  10 leituras num pregão (14/10, Tradeview), e o do WIN/WDO/DOL/BIT foi lido do contrato vigente,
+  porque a série contínua da XP não tem bid/ask. Um spread por hora do dia, ou medido das velas, seria
+  mais fiel.
+- **A comissão das ações BR e dos futuros B3 não está no catálogo.** O rótulo cobra a do run, e quase
+  todas rodaram com 0.
+
+## Série reescalada pela corretora (14/10) — o que ficou para depois
+
+- ~~**A sessão ao vivo ainda não percebe a rolagem sozinha.**~~ FEITO no PR-460: o publicador relê as 30
+  velas anteriores a cada vela nova, segura a vela reescalada, recoleta o ativo e pede o reinício.
+- ~~**Sinais no tick do contrato.**~~ FEITO no PR-461 (`instruments.price_step`, `on_the_step`).
+- **Os anos que a corretora não entrega mais.** Reescalada a série, a coleta recusa se a corretora não serve
+  os anos mais antigos em disco (escreveria um degrau). Hoje é decisão à mão: mover os arquivos antigos e
+  coletar do começo da corretora. Daria para reescalar os anos antigos pela razão medida.
+- ~~**A imagem da API ainda tem a regra antiga do spread.**~~ FEITO: a API foi reconstruída no deploy do
+  PR-461.
+
+## A grade de stops do ML (14/10, ADR-0031) — o que ficou para depois
+
+- **O swap de uma célula com alvo é o do trade inteiro.** O alvo é lido da MFE, sem broker próprio, e
+  o trade que bate o alvo no 3º dia paga o swap dos 150 dias. Com swap negativo, a célula sai pior do
+  que seria; com swap positivo (raro), melhor. Guardar a barra em que cada alvo foi atingido resolveria.
+- **Entradas que só um stop maior aceitaria não estão na base.** Uma ordem stop com escorregamento entre
+  meio R do setup e meio R de um stop 2× é recusada no 1×, e a grade só cobre as entradas da base.
+- **O stop multiplicado não é arredondado ao tick.** O motor aceita qualquer preço, e a diferença é menor
+  que um tick. Para levar a célula escolhida ao ao vivo, ela precisa do passo do contrato (`on_the_step`).
+- ~~**O relatório da grade**~~ FEITO no PR-463 (`tradeforge-ml grid`). Falta **o modelo por célula**:
+  estimar, por entrada, o R esperado de cada stop × alvo e ficar com o melhor, ou pular. Ele precisa
+  bater a melhor regra fixa do relatório na validação, e só depois ver o ano reservado.
+- **O drawdown das regras soma mercados que rodam juntos.** O relatório soma todos os trades da base
+  numa conta só, em ordem de fechamento. É a conta de quem opera todos os mercados com o mesmo risco
+  por trade, sem limite de posições abertas. Uma conta real teria limite de exposição.
+
+## Gap de abertura (ADR-0035, 15/10)
+
+- [origem: gap de abertura] **Não lançar varredura com `opening_gap` antes de reconstruir os workers.** O
+  worker não valida o documento, e o motor antigo ignora parâmetros que não conhece. O run sairia sem o
+  gap, com a mesma versão 0.6.0, e o reaproveitamento poderia copiá-lo depois. Uma trava de verdade
+  seria o worker recusar parâmetro desconhecido (validar com o schema, como o `timeframe_refusal` da
+  API já faz). Adiado: pede revisar o custo dessa validação em milhões de runs. **15/10:** workers
+  daqui e do Xeon reconstruídos no e93b77f. A Contabo (desligada desde 14/10) ainda tem o código
+  antigo: atualizar antes de religá-la, ou não religar.
+- [origem: gap de abertura] **`unread_params` não sabe que a opção é inerte no D1/W1.** Ele só lê o
+  bloco do setup, sem o tempo gráfico. Uma varredura em D1 que varie a opção roda o par duas vezes.
+  Adiado: ninguém varre essa opção em D1 hoje.
+- [origem: gap de abertura] **Trava no reaproveitamento para `opening_gap`.** Sugestão do
+  engine-guardian (15/10): não copiar um run com `opening_gap: true` feito antes de os workers
+  saberem da opção. Isso fecha o risco do worker antigo sem depender de disciplina. Adiado: os
+  workers não têm como dizer hoje se conhecem a opção, já que a versão é a mesma.
+
+## Memória do worker num lote longo (15/10) — o que ficou para depois
+
+Seis workers num lote de M5 de 11 anos chegaram a ~3 GB cada e travaram a VM de 24 GB (Postgres e Redis
+juntos, sinais sem vela por 14 min). O teto por worker (`TRADEFORGE_WORKER_MEMORY`, 5 GB) isola o estrago,
+mas não reduz o consumo. Medido num worker, lote de 24 runs do Usa500 M5 de 2015–2025:
+
+- [origem: VM travada 15/10] **Cada vela custa ~0,9 KB em memória.** As 607 mil barras foram de 156 MB
+  para 719 MB. São objetos `Candle` com campos `Decimal`. Guardar a série em colunas (arrays) cortaria
+  isso muitas vezes, mas mexe no coletor, no cache e na leitura do motor.
+- [origem: VM travada 15/10] **O lote cresce com combinações × barras.** O pico foi 3,1 GB, quase
+  todo nos resultados das 24 combinações, que ficam juntos até a gravação. O tamanho do lote é fixo por
+  tempo gráfico (24, e 6 no M1). Ele poderia ser medido pelo número de barras da janela, para um lote de
+  série longa sair menor.
+- [origem: VM travada 15/10] **A soma ainda tem de caber no teto do WSL.** O limite protege de um worker,
+  não de todos: workers × ~3 GB + os 6 GB do Postgres tem de caber no `.wslconfig` antes de lançar M5
+  longo. O Xeon, com 10 workers em 26 GB, não cabe se todos pegarem lotes desses ao mesmo tempo.

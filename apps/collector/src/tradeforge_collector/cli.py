@@ -2,27 +2,67 @@
 
     tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31
     tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31 --source mt5
+    tradeforge-collector agent
+    tradeforge-collector splits detect
+    tradeforge-collector splits add AMZN 2022-06-06 20:1
 
 `--source mock` is the default, and that is a deliberate choice: the command a new
 contributor runs first must work on their machine, on Linux, with no broker account.
 `--source mt5` is the one that needs Windows, a terminal that is open and logged in,
 and a symbol the broker actually offers.
+
+With the market closed, `--source mt5` also needs `--server-offset`: the broker's clock
+is otherwise read from the newest tick, and a shut market freezes that tick. The
+collector refuses rather than guess — see `mt5_source.offset_is_plausible`.
 """
 
 import argparse
 import datetime as dt
 import logging
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from tradeforge_collector.backfill import backfill
 from tradeforge_collector.gaps import format_report
+from tradeforge_collector.lifetime import DEFAULT_GRACE
+from tradeforge_collector.live import (
+    DEFAULT_MAX_BACKFILL,
+    LiveSource,
+    Subscription,
+    TickerLiveSource,
+    run,
+    run_on_demand,
+)
 from tradeforge_collector.source import MarketDataSource
+from tradeforge_collector.splits import (
+    Split,
+    already_applied,
+    bring_up_to_date,
+    find_candidates,
+    observed_gap,
+    refuse_unless_the_bars_split,
+)
+from tradeforge_collector.storage import read_candles
 from tradeforge_collector.synthetic import SyntheticSource
 from tradeforge_collector.timeframes import TIMEFRAME_STEP
+from tradeforge_db.instruments import CatalogueEntry, upsert_instruments
 from tradeforge_db.session import create_db_engine, create_session_factory, session_scope
+from tradeforge_db.splits import record_split, splits_of, stock_markets
 from tradeforge_engine.domain import AssetClass
+
+if TYPE_CHECKING:
+    import uuid
+
+    from arq.typing import WorkerSettingsType
+    from redis import Redis
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from tradeforge_collector.publisher import RedisCandlePublisher
+    from tradeforge_collector.rescale import Comparison
+    from tradeforge_engine.domain import Candle
 
 DEFAULT_DATA_DIR = Path("data/ohlcv")
 
@@ -33,6 +73,32 @@ def _date(value: str) -> dt.datetime:
         return dt.datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=dt.UTC)
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from None
+
+
+def _day(value: str) -> dt.date:
+    """A day, with no clock: a split's day is the broker's, converted where it is used."""
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from None
+
+
+def _ratio(value: str) -> tuple[int, int]:
+    """`20:1` — shares after the split for shares before it. `1:10` is a reverse split."""
+    after, colon, before = value.partition(":")
+    if colon and after.isdigit() and before.isdigit() and int(after) > 0 and int(before) > 0:
+        return int(after), int(before)
+    raise argparse.ArgumentTypeError(f"expected AFTER:BEFORE like 20:1 or 1:10, got {value!r}")
+
+
+def _hours(value: str) -> dt.timedelta:
+    """`+3`, `-5`, `5.5` — hours ahead of UTC. Some timezones are half hours."""
+    try:
+        return dt.timedelta(hours=float(value))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected hours ahead of UTC, like +3 or -5.5, got {value!r}"
+        ) from None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -57,12 +123,547 @@ def _parser() -> argparse.ArgumentParser:
         help="override the class inferred from the symbol's MT5 path",
     )
     fill.add_argument(
+        "--server-offset",
+        type=_hours,
+        metavar="HOURS",
+        help=(
+            "the broker's clock, in hours ahead of UTC (e.g. +3). Otherwise it is measured "
+            "from the newest tick — which only works while the market is open, because a "
+            "closed market freezes that tick"
+        ),
+    )
+    fill.add_argument(
         "--no-catalogue",
         action="store_true",
         help="write the Parquet but do not touch Postgres",
     )
 
+    # Re-reading a contract specification used to mean re-running a backfill, which downloads
+    # thousands of candles to refresh a handful of fields. Broker specs change on their own
+    # schedule — a spread is re-quoted far more often than history is re-downloaded — so
+    # refreshing them deserves a command that does not touch Parquet at all.
+    catalogue = commands.add_parser(
+        "catalogue",
+        help="refresh contract specs (including the spread) without downloading candles",
+    )
+    catalogue.add_argument("symbols", nargs="+", metavar="SYMBOL")
+    catalogue.add_argument(
+        "--source",
+        choices=("mock", "mt5"),
+        default="mt5",
+        help="mt5: a real terminal (default, since specs are what a terminal knows)",
+    )
+    catalogue.add_argument(
+        "--asset-class",
+        choices=[member.value for member in AssetClass],
+        help="override the class inferred from the symbol's MT5 path",
+    )
+    catalogue.add_argument(
+        "--server-offset",
+        type=_hours,
+        metavar="HOURS",
+        help=(
+            "the broker's clock, in hours ahead of UTC (e.g. +3). REQUIRED with --source mt5: "
+            "the spread guard dates the last quote by undoing this offset, and a closed "
+            "market is exactly what corrupts the measured one"
+        ),
+    )
+
+    # Share splits (14/10): Tradeview sends US shares' history unadjusted. See `splits.py`.
+    splits = commands.add_parser(
+        "splits", help="record share splits and adjust the stored bars for them"
+    )
+    actions = splits.add_subparsers(dest="action", required=True)
+    detect = actions.add_parser(
+        "detect", help="list daily gaps that look like a split nobody recorded (writes nothing)"
+    )
+    detect.add_argument("symbols", nargs="*", metavar="SYMBOL", help="default: every share")
+    detect.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    add = actions.add_parser("add", help="record a split and adjust the stored bars for it")
+    add.add_argument("symbol")
+    add.add_argument(
+        "effective_on", type=_day, metavar="YYYY-MM-DD", help="first day at the new price"
+    )
+    add.add_argument("ratio", type=_ratio, metavar="AFTER:BEFORE", help="20:1, 1:10, 11:10")
+    add.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    apply = actions.add_parser(
+        "apply",
+        help="adjust the stored bars for the splits already recorded (safe to run again)",
+    )
+    apply.add_argument("symbols", nargs="+", metavar="SYMBOL")
+    apply.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+
+    # The loop the whole of phase 3 hangs from. It has no natural end, so it is a command that
+    # is expected to be killed — see `_live` for why Ctrl-C is a clean exit here.
+    live = commands.add_parser(
+        "live",
+        help="watch a symbol and publish each closed candle to a Redis stream",
+        description=(
+            "Polls the source for the bar that just closed and publishes it to "
+            "candles.{symbol}.{timeframe}. It never works out 'closed' from a clock: the "
+            "source is asked for the closed bar by position, because a broker's offset is "
+            "measured from the newest tick and a shut market freezes that measurement."
+        ),
+    )
+    live.add_argument("symbol", nargs="?", help="the symbol to watch; left out with --broker")
+    live.add_argument(
+        "timeframes",
+        nargs="*",
+        choices=sorted(TIMEFRAME_STEP),
+        metavar="TIMEFRAME",
+        help="one or more timeframes to watch on this symbol, e.g. M1 M5",
+    )
+    live.add_argument(
+        "--broker",
+        metavar="SLUG",
+        help=(
+            "watch whatever is asked of this broker (ADR-0032): its terminal and clock come from "
+            "the brokers table, and the pairs from live:wanted:<slug>, renewed by each session"
+        ),
+    )
+    live.add_argument(
+        "--source",
+        choices=("mock", "mt5"),
+        default="mock",
+        help="mock: deterministic synthetic data (default). mt5: a real terminal (Windows)",
+    )
+    live.add_argument(
+        "--asset-class",
+        choices=[member.value for member in AssetClass],
+        help="override the class inferred from the symbol's MT5 path",
+    )
+    live.add_argument(
+        "--server-offset",
+        type=_hours,
+        metavar="HOURS",
+        help=(
+            "the broker's clock, in hours ahead of UTC (e.g. +3). Only labels the candle here "
+            "— whether a bar closed is read from its position, never from this"
+        ),
+    )
+    live.add_argument(
+        "--every",
+        type=float,
+        default=5.0,
+        # Far shorter than the shortest bar, because a close is only noticed on the poll after
+        # it happens: five seconds on M1 means a bar is announced within 5s of closing.
+        help="seconds between polls (default: 5)",
+    )
+    live.add_argument(
+        "--once",
+        action="store_true",
+        help="poll a single time and exit — what a smoke test runs",
+    )
+    live.add_argument(
+        "--max-backfill",
+        type=int,
+        default=DEFAULT_MAX_BACKFILL,
+        metavar="BARS",
+        help=(
+            f"how many bars one gap fill may ask for after an outage "
+            f"(default: {DEFAULT_MAX_BACKFILL}). A longer hole is reported, not truncated "
+            f"quietly — repair it with a backfill"
+        ),
+    )
+    live.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DEFAULT_DATA_DIR,
+        help="the collected candles: a pair new to its stream is caught up from their last bar",
+    )
+    live.add_argument("--redis-host", default=os.environ.get("REDIS_HOST", "localhost"))
+    live.add_argument("--redis-port", type=int, default=int(os.environ.get("REDIS_PORT", "6379")))
+
+    # The host agent (ADR-0021), run under a loop that stops it when the stack's Redis goes.
+    # Redis comes from REDIS_HOST/REDIS_PORT, like every other setting of this process.
+    agent = commands.add_parser(
+        "agent",
+        help="serve the API's collection jobs until the Docker stack goes away",
+        description=(
+            "Runs the host agent that answers the API's MetaTrader jobs. It exits by itself, "
+            "with status 0, once Redis has not answered for --grace seconds — the stack was "
+            "stopped — and carries on if Redis comes back sooner. If Redis does not answer at "
+            "start, it exits at once with status 2: start the stack first."
+        ),
+    )
+    agent.add_argument(
+        "--grace",
+        type=float,
+        default=DEFAULT_GRACE,
+        metavar="SECONDS",
+        help=f"how long a lost Redis may take to come back (default: {DEFAULT_GRACE:g})",
+    )
+    agent.add_argument(
+        "--broker",
+        metavar="SLUG",
+        help=(
+            "serve one broker's queue (collect.<slug>) with its terminal and clock from the "
+            "brokers table (ADR-0032); without it, the legacy queue and TRADEFORGE_SERVER_OFFSET"
+        ),
+    )
+
     return parser
+
+
+def _agent(args: argparse.Namespace) -> int:
+    """Serve the collection queue until stopped or until the stack's Redis is gone."""
+    # Deferred like `_live`'s imports: `--help` and the other subcommands need neither arq nor
+    # the agent's database wiring.
+    import asyncio  # noqa: PLC0415
+
+    from tradeforge_collector.agent import (  # noqa: PLC0415
+        WorkerSettings,
+        serve_broker,
+        settings_on_queue,
+    )
+    from tradeforge_collector.supervisor import serve  # noqa: PLC0415
+
+    worker_settings: type = WorkerSettings
+    if args.broker:
+        from tradeforge_db.brokers import broker_by_slug, collect_queue  # noqa: PLC0415
+
+        engine = create_db_engine()
+        try:
+            with session_scope(create_session_factory(engine)) as session:
+                broker = broker_by_slug(session, args.broker)
+                serve_broker(broker.slug, broker.terminal_path, broker.server_offset)
+                queue = collect_queue(broker.slug)
+        finally:
+            engine.dispose()
+        # The same settings, on this broker's queue: one terminal, one queue (ADR-0032).
+        worker_settings = settings_on_queue(queue)
+
+    try:
+        # arq's settings type is structural; the agent's class matches it without naming it.
+        settings: WorkerSettingsType = cast("WorkerSettingsType", worker_settings)
+        return asyncio.run(
+            serve(settings, redis_settings=WorkerSettings.redis_settings, grace=args.grace)
+        )
+    except KeyboardInterrupt:
+        # A first Ctrl-C is caught inside `serve`, which stops the worker and returns 0. This is
+        # the second one, pressed while it is still stopping — the answer is the same.
+        return 0
+
+
+def _catalogue_command(args: argparse.Namespace) -> int:
+    """Upsert contract specs for the named symbols. No Parquet, no candles.
+
+    `--server-offset` is mandatory against a real terminal, and the reason is circular in a
+    way worth stating. The spread guard refuses a quote older than a few minutes, and it dates
+    the quote by undoing the server's clock offset. When that offset is *measured* rather than
+    stated, it comes from the newest tick — so a closed market, the very thing the guard
+    exists to detect, is what makes the offset wrong. Measured on this project's terminal: 47
+    minutes after the US close the offset read +2 h against the true +3, which makes a
+    47-minute-old quote look one minute old and waves the stale spread straight through.
+
+    Demanding the offset up front costs one flag and closes the loop. The backfill does not
+    demand it because there `offset_is_plausible` can still refuse the gross case; here the
+    dangerous case is a short closure, which is precisely the size that slips under it.
+    """
+    if args.source == "mt5" and args.server_offset is None:
+        raise ValueError(
+            "catalogue needs --server-offset with --source mt5 (for example --server-offset "
+            "+3): the spread guard dates the last quote with it, and a measured offset is "
+            "wrong exactly when the market is shut, which is when the guard has to bite"
+        )
+
+    source = _source(args)
+    engine = create_db_engine()
+    try:
+        with session_scope(create_session_factory(engine)) as session:
+            for symbol in args.symbols:
+                spec = source.instrument(symbol)
+                spread = source.spread_points(symbol)
+                upsert_instruments(session, (CatalogueEntry(spec, spread),))
+                # Printed as the pair it is: the number and its unit. A spread means nothing
+                # without the tick it is counted in, and "12" alone has burned this project
+                # once already on the difference between MT5 points and engine ticks.
+                shown = "unknown" if spread is None else f"{spread.normalize()} ticks"
+                print(f"{spec.symbol}: tick {spec.tick_size.normalize()}, spread {shown}")
+    finally:
+        engine.dispose()
+    return 0
+
+
+def _live(args: argparse.Namespace) -> int:
+    """Watch one symbol on one or more timeframes until interrupted.
+
+    The source comes through the same `_source` seam the backfill uses, so `--source mock` runs
+    this entire loop on a Linux box with no terminal — which is the only reason its behaviour
+    can be under test at all.
+    """
+    # Imported here rather than at module scope so `--help` and the other subcommands never
+    # need a Redis client, the same reason `_source` defers the MetaTrader import.
+    from redis import Redis  # noqa: PLC0415
+
+    from tradeforge_collector.publisher import RedisCandlePublisher  # noqa: PLC0415
+
+    if args.broker:
+        return _live_broker(args)
+    if not args.symbol or not args.timeframes:
+        raise ValueError("name a symbol and at least one timeframe, or a --broker to serve")
+    _refuse_unstamped_timeframes(args.timeframes)
+
+    source = _source(args)
+    if not isinstance(source, LiveSource):
+        raise ValueError(f"the {args.source} source cannot be watched live")
+    subscriptions = [Subscription(args.symbol, timeframe) for timeframe in args.timeframes]
+
+    client = Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
+    publisher = RedisCandlePublisher(client)
+
+    logging.getLogger(__name__).info(
+        "watching %s on %s, polling every %.0fs",
+        args.symbol,
+        ", ".join(args.timeframes),
+        args.every,
+    )
+    try:
+        run(
+            source,
+            publisher,
+            subscriptions,
+            every=args.every,
+            polls=1 if args.once else None,
+            max_backfill=args.max_backfill,
+        )
+    except KeyboardInterrupt:
+        # ⚠️ A clean stop, not a failure. This command is meant to be killed — it is a loop with
+        # no natural end — and a traceback on Ctrl-C teaches the reader to ignore tracebacks.
+        logging.getLogger(__name__).info("stopped")
+    finally:
+        client.close()
+    return 0
+
+
+def _remembered(
+    root: Path, publisher: "RedisCandlePublisher", pair: Subscription
+) -> "list[Candle]":
+    """What the live loop remembers of a pair it starts watching (14/10): the newest of the
+    stream's last bars and the disk's — the disk's after the series was collected again in a new
+    scale, the stream's when the machine was off and the disk is behind it."""
+    from tradeforge_collector.live import MEMORY  # noqa: PLC0415
+    from tradeforge_collector.storage import coverage  # noqa: PLC0415 — pyarrow, only when live
+
+    streamed = publisher.recent(pair, MEMORY)
+    stored = coverage(root, pair.symbol, pair.timeframe)
+    if stored is None or (streamed and streamed[-1].time > stored.date_to):
+        return streamed
+    reach = TIMEFRAME_STEP[pair.timeframe] * MEMORY * 10  # past a weekend or a holiday's gap
+    tail = read_candles(
+        root, pair.symbol, pair.timeframe, start=stored.date_to - reach, end=stored.date_to
+    )
+    return tail[-MEMORY:]
+
+
+def _stored_until(root: Path, pair: Subscription) -> dt.datetime | None:
+    """The last bar collected for this pair, or `None` when nothing was."""
+    from tradeforge_collector.storage import coverage  # noqa: PLC0415 — pyarrow, only when live
+
+    stored = coverage(root, pair.symbol, pair.timeframe)
+    return None if stored is None else stored.date_to
+
+
+def _live_broker(args: argparse.Namespace) -> int:
+    """One broker's live loop: its own terminal, watching what sessions ask of it (ADR-0032).
+
+    A process apart from the collection agent on purpose: the agent attaches and detaches the
+    terminal around every job, and the live loop holds one connection for hours — a job closing
+    the shared connection under it would take the feed down mid-bar.
+    """
+    from redis import Redis  # noqa: PLC0415
+
+    from tradeforge_collector.demand import wanted  # noqa: PLC0415
+    from tradeforge_collector.mt5_source import MT5Source  # noqa: PLC0415 — ADR-02 boundary
+    from tradeforge_collector.publisher import RedisCandlePublisher  # noqa: PLC0415
+    from tradeforge_db.brokers import broker_by_slug, broker_ticker  # noqa: PLC0415
+
+    log = logging.getLogger(__name__)
+    engine = create_db_engine()
+    factory = create_session_factory(engine)
+    with session_scope(factory) as session:
+        broker = broker_by_slug(session, args.broker)
+        slug, path, offset = broker.slug, broker.terminal_path, broker.server_offset
+        broker_id = broker.id
+
+    terminal = MT5Source(server_offset=offset, path=path).connect()
+    tickers: dict[str, str] = {}
+    source = TickerLiveSource(terminal, tickers)
+    client = Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
+    publisher = RedisCandlePublisher(client)
+
+    def demand() -> list[Subscription]:
+        asked = []
+        for pair in wanted(client, slug):
+            if pair.timeframe in _UNSTAMPED_TIMEFRAMES:
+                log.warning(
+                    "%s %s asked for, not watched: %s",
+                    pair.symbol,
+                    pair.timeframe,
+                    _UNSTAMPED_TIMEFRAMES[pair.timeframe],
+                )
+                continue
+            if pair.symbol not in tickers:
+                with session_scope(factory) as session:
+                    tickers[pair.symbol] = broker_ticker(session, pair.symbol)
+            asked.append(pair)
+        return asked
+
+    def on_rescale(pair: Subscription, comparison: "Comparison") -> bool:
+        """The broker rewrote the series (14/10, a roll of `WIN$`): collect every timeframe of it
+        on disk again, whole and through this terminal, then have its sessions restarted on it."""
+        log.warning(
+            "%s: the broker's bars are %.4f times the ones published — collecting the series "
+            "again and restarting its sessions",
+            pair.symbol,
+            comparison.ratio,
+        )
+        try:
+            _collect_whole(
+                terminal,
+                factory,
+                root=args.data_dir,
+                symbol=pair.symbol,
+                ticker=tickers.get(pair.symbol, pair.symbol),
+                broker_id=broker_id,
+            )
+            _restart_markets(client, factory, slug, pair.symbol)
+        except Exception:
+            log.exception("%s: the rescaled series could not be collected again", pair.symbol)
+            return False
+        return True
+
+    log.info("watching what is asked of %s, polling every %.0fs", slug, args.every)
+    try:
+        run_on_demand(
+            source,
+            publisher,
+            demand,
+            every=args.every,
+            polls=1 if args.once else None,
+            max_backfill=args.max_backfill,
+            on_disk=lambda pair: _stored_until(args.data_dir, pair),
+            tail=lambda pair: _remembered(args.data_dir, publisher, pair),
+            on_rescale=on_rescale,
+        )
+    except KeyboardInterrupt:
+        log.info("stopped")
+    finally:
+        client.close()
+        terminal.close()
+        engine.dispose()
+    return 0
+
+
+def _collect_whole(  # noqa: PLR0913 — keyword-only; the series, where it is, and whose it is
+    terminal: MarketDataSource,
+    factory: "sessionmaker[Session]",
+    *,
+    root: Path,
+    symbol: str,
+    ticker: str,
+    broker_id: "uuid.UUID",
+) -> None:
+    """Collect every timeframe of `symbol` on disk again, from its first bar to now, as rows the
+    collections screen shows — through the live loop's own terminal, which a job of the agent
+    would attach and detach under it (`_live_broker`)."""
+    from tradeforge_collector.collect import (  # noqa: PLC0415 — pyarrow, only when live
+        DatabaseJournal,
+        run_collection,
+        year_slices,
+    )
+    from tradeforge_collector.source import TickerSource  # noqa: PLC0415
+    from tradeforge_collector.storage import coverage, symbol_path  # noqa: PLC0415
+    from tradeforge_db.collections import create_collection  # noqa: PLC0415
+
+    asked = terminal if ticker == symbol else TickerSource(terminal, internal=symbol, ticker=ticker)
+    now = dt.datetime.now(tz=dt.UTC)
+    for folder in sorted(symbol_path(root, symbol).glob("timeframe=*")):
+        timeframe = folder.name.removeprefix("timeframe=")
+        stored = coverage(root, symbol, timeframe)
+        if stored is None:
+            continue
+        session = factory()
+        try:
+            row = create_collection(
+                session,
+                symbol=symbol,
+                broker_symbol=None if ticker == symbol else ticker,
+                timeframe=timeframe,
+                date_from=stored.date_from,
+                date_to=now,
+                asset_class=None,
+                years_total=len(year_slices(stored.date_from, now)),
+            )
+            session.commit()
+            run_collection(
+                asked,
+                DatabaseJournal(
+                    session,
+                    row.id,
+                    root=root,
+                    timeframe=timeframe,
+                    broker_id=broker_id,
+                    broker_symbol=ticker,
+                ),
+                root=root,
+                symbol=symbol,
+                timeframe=timeframe,
+                date_from=stored.date_from,
+                date_to=now,
+            )
+        finally:
+            session.close()
+
+
+def _restart_markets(
+    client: "Redis", factory: "sessionmaker[Session]", slug: str, symbol: str
+) -> None:
+    """Ask the supervisor to restart every market of `symbol` this broker is watched for."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from tradeforge_collector.demand import wanted  # noqa: PLC0415
+    from tradeforge_collector.restarts import request_restart  # noqa: PLC0415
+    from tradeforge_db.models import Instrument  # noqa: PLC0415
+
+    with session_scope(factory) as session:
+        instrument_id = session.execute(
+            select(Instrument.id).where(Instrument.symbol == symbol)
+        ).scalar_one()
+    now = dt.datetime.now(tz=dt.UTC)
+    for timeframe in sorted(
+        {pair.timeframe for pair in wanted(client, slug) if pair.symbol == symbol}
+    ):
+        request_restart(client, instrument_id, timeframe, at=now)
+        logging.getLogger(__name__).info("%s %s: restart asked for", symbol, timeframe)
+
+
+# Timeframes whose live stamp is known to be wrong, mapped to the sentence that says why.
+#
+# ⚠️ D1 is not a suspicion. Measured against the backfill: 499 of 499 daily bars carried the
+# date of the **following** session, because the broker's day starts at its own midnight —
+# UTC+3 — and the offset that shifts an intraday bar by three hours shifts a daily one across
+# a date boundary. Intraday was checked against H1 in the same pass and is sound.
+#
+# Refusing rather than warning, because the consumer of this stream is a paper session that
+# will not be reading the log: a bar labelled with tomorrow's date is a bar the engine will
+# happily trade at the wrong time, and the wrongness is a whole day rather than a rounding.
+_UNSTAMPED_TIMEFRAMES = {
+    "D1": (
+        "a daily bar is stamped one day ahead here: the broker's day opens at its own "
+        "midnight (UTC+3), so undoing the offset moves the bar across the date boundary. "
+        "Measured at 499 of 499 in the backfill. Intraday (M5, M15, H1, H4) is sound - watch "
+        "one of those, and use `backfill` for daily history until this is fixed"
+    ),
+}
+
+
+def _refuse_unstamped_timeframes(timeframes: Sequence[str]) -> None:
+    """Stop before the first poll on a timeframe this collector cannot label correctly."""
+    for timeframe in timeframes:
+        reason = _UNSTAMPED_TIMEFRAMES.get(timeframe)
+        if reason is not None:
+            raise ValueError(f"refusing to watch {timeframe} live: {reason}")
 
 
 def _source(args: argparse.Namespace) -> MarketDataSource:
@@ -74,7 +675,7 @@ def _source(args: argparse.Namespace) -> MarketDataSource:
     from tradeforge_collector.mt5_source import MT5Source  # noqa: PLC0415 — the ADR-02 boundary
 
     asset_class = AssetClass(args.asset_class) if args.asset_class else None
-    return MT5Source(asset_class=asset_class).connect()
+    return MT5Source(asset_class=asset_class, server_offset=args.server_offset).connect()
 
 
 def _backfill(args: argparse.Namespace) -> int:
@@ -114,15 +715,98 @@ def _backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _splits(args: argparse.Namespace) -> int:
+    engine = create_db_engine()
+    try:
+        factory = create_session_factory(engine)
+        if args.action == "detect":
+            return _detect_splits(factory, args.data_dir, args.symbols)
+        if args.action == "apply":
+            return _apply_splits(factory, args.data_dir, args.symbols)
+        after, before = args.ratio
+        with session_scope(factory) as session:
+            record = record_split(
+                session, args.symbol, args.effective_on, shares_after=after, shares_before=before
+            )
+            _refuse_a_split_the_bars_do_not_show(args.data_dir, args.symbol, Split.of(record))
+        # ⚠️ Committed before the files are rewritten, not after: a rewrite that stops halfway is
+        # finished by `splits apply`, and that needs the split recorded to know what to do.
+        print(f"recorded {args.symbol} {args.effective_on} {after}:{before}")
+        return _apply_splits(factory, args.data_dir, [args.symbol])
+    finally:
+        engine.dispose()
+
+
+def _detect_splits(factory: "sessionmaker[Session]", data_dir: Path, symbols: Sequence[str]) -> int:
+    with session_scope(factory) as session:
+        markets = [m for m in stock_markets(session) if not symbols or m.symbol in symbols]
+        recorded = {
+            m.symbol: {r.effective_on for r in splits_of(session, m.symbol)} for m in markets
+        }
+    found = 0
+    for market in markets:
+        daily = read_candles(data_dir, market.symbol, "D1")
+        for candidate in find_candidates(daily, market.server_offset):
+            if candidate.effective_on in recorded[market.symbol]:
+                continue
+            found += 1
+            ratio = f"{candidate.shares_after}:{candidate.shares_before}"
+            print(
+                f"{market.symbol} {candidate.effective_on} {ratio} "
+                f"(open/close {candidate.observed:.4f}) -> tradeforge-collector splits add "
+                f"{market.symbol} {candidate.effective_on} {ratio}"
+            )
+    print(f"{found} unrecorded split(s) in {len(markets)} share(s)")
+    return 0
+
+
+def _refuse_a_split_the_bars_do_not_show(data_dir: Path, symbol: str, split: Split) -> None:
+    """Only a gap on disk shows the stored bars are still raw on that day (see `splits.py`).
+
+    Unless the files already name this split in their stamp: then they were adjusted for it and
+    only the record was missing, and the gap they no longer show is the proof, not a refusal.
+    """
+    if already_applied(data_dir, symbol, split):
+        return
+    daily = read_candles(data_dir, symbol, "D1")
+    if observed_gap(daily, split.effective_at, "D1") is None:
+        raise ValueError(
+            f"{symbol} has no daily bars on both sides of {split.key}: nothing to check the split "
+            "against, so it is not recorded"
+        )
+    refuse_unless_the_bars_split(daily, [split], timeframe="D1", where=symbol)
+
+
+def _apply_splits(factory: "sessionmaker[Session]", data_dir: Path, symbols: Sequence[str]) -> int:
+    for symbol in symbols:
+        with session_scope(factory) as session:
+            splits = tuple(map(Split.of, splits_of(session, symbol)))
+        if not splits:
+            print(f"{symbol}: no split recorded")
+            continue
+        rewritten = bring_up_to_date(data_dir, symbol, splits)
+        for part in rewritten:
+            print(f"{symbol} {part.timeframe} {part.year}: {part.candles} bars adjusted")
+        print(f"{symbol}: {len(splits)} split(s), {len(rewritten)} year file(s) rewritten")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch a subcommand and return a shell exit code."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     args = _parser().parse_args(argv)
     try:
-        return _backfill(args)
+        commands = {
+            "catalogue": _catalogue_command,
+            "live": _live,
+            "backfill": _backfill,
+            "agent": _agent,
+            "splits": _splits,
+        }
+        return commands[args.command](args)
     except (LookupError, ValueError, ConnectionError) as error:
-        # These are the ways a backfill legitimately fails: a symbol the broker does not
+        # These are the ways either command legitimately fails: a symbol the broker does not
         # offer, a range with no data, a terminal that is not running. A stack trace
         # would say nothing a user can act on.
         print(f"error: {error}", file=sys.stderr)

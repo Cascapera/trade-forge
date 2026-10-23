@@ -120,15 +120,30 @@ uv run tradeforge-collector backfill EURUSD H1 2024-01-01 2024-12-31
 
 ```bash
 uv run uvicorn tradeforge_api.main:create_app --factory --port 8000   # the API
-uv run arq tradeforge_api.worker.WorkerSettings                       # the backtest worker
+uv run python -m tradeforge_api.worker_main                           # the backtest worker
 npm run dev -w @tradeforge/web                                        # the UI at :5173
 ```
 
-**4. Open [http://localhost:5173](http://localhost:5173).** The builder opens on a ready-made
-MA-cross template — click **Save & configure backtest**, pick `EURUSD` and your dates, and
-**Run backtest**. The results screen above is what you get: metrics, the equity curve and every
-trade. (Prefer the terminal? The same flow is three `curl`s — `POST /strategies`,
+**4. Open [http://localhost:5173](http://localhost:5173).** Building and running are two screens:
+in **Catalogue**, **New strategy** opens the builder on a ready-made template — answer its side
+and **Save strategy** (saving does not put it on the shelf; **Add to the catalogue** does). Then
+**Run it in New backtest**, pick `EURUSD` and your dates, and **Run backtest**. The results screen
+above is what you get: metrics, the equity curve and every trade. (Prefer the terminal? The same flow is three `curl`s — `POST /strategies`,
 `POST /backtests`, then poll `GET /backtests/{id}`.)
+
+### On Windows, with a MetaTrader 5 terminal
+
+The whole containerised stack plus the MT5 collector agent (which cannot run in Docker, ADR-0021)
+come up and go down together:
+
+```powershell
+.\tradeforge.ps1 up        # Docker Desktop if needed, the stack, then the agent in the background
+.\tradeforge.ps1 status    # containers, the agent, the collection queue, the agent's last log lines
+.\tradeforge.ps1 down      # the stack; the agent stops by itself once Redis is gone
+```
+
+Run it from a terminal: a program that captures its output through a pipe waits for the agent
+(see the script's `.NOTES`).
 
 ### Running the tests
 

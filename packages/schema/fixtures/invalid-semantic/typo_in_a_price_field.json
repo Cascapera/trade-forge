@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "name": "Campo de preço escrito errado",
+  "description": "`price.clsoe` — duas letras trocadas no ref mais digitado da DSL. Passou a ser bem-formado quando a gramática ganhou `id.componente`, porque `price` é um identificador legítimo e `clsoe` um nome de componente legítimo; a camada semântica então via um namespace reservado e devolvia 'não é indicador' sem olhar a cauda. O motor resolvia para nulo e a condição ficava falsa em toda barra, para sempre, sem uma palavra",
+  "timeframe": "H1",
+  "indicators": [{ "id": "bb", "type": "BOLLINGER", "params": { "period": 20 } }],
+  "entry": {
+    "long": {
+      "op": "crosses_above",
+      "left": { "ref": "price.clsoe" },
+      "right": { "ref": "bb.upper" }
+    },
+    "short": null
+  },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 1, "side": "low" } }
+  },
+  "risk": { "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } } }
+}

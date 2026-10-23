@@ -1,0 +1,288 @@
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+
+import { apiFailure, windowUsedBy } from '../api/failure'
+import { useCreateHoldout } from '../api/hooks'
+import type { HoldoutRank, SweepOut } from '../api/types'
+import { floorPlaceholder } from '../sweep/rankFloor'
+
+import { RetestPrompt } from './WindowUses'
+
+const METRICS: { value: HoldoutRank; label: string }[] = [
+  { value: 'net_profit', label: 'Net profit' },
+  { value: 'profit_factor', label: 'Profit factor' },
+  { value: 'sharpe', label: 'Sharpe' },
+  { value: 'expectancy', label: 'Expectancy' },
+  { value: 'net_r', label: 'Net R' },
+  { value: 'recovery_r', label: 'Net R per R of drawdown' },
+  { value: 'positive_years', label: 'Share of years positive' },
+]
+
+/** A limit typed by hand: blank is "no limit", anything else must be a positive number. */
+function limitOf(value: string): { ok: boolean; value: string | undefined } {
+  if (value.trim() === '') return { ok: true, value: undefined }
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0
+    ? { ok: true, value: String(number) }
+    : { ok: false, value: undefined }
+}
+
+/** The calendar day of an ISO instant, which is what a date input holds. */
+function day(iso: string): string {
+  return iso.slice(0, 10)
+}
+
+/** The instant a date input's day starts, in UTC — how the sweep's own windows are written. */
+function startOf(value: string): string {
+  return `${value}T00:00:00Z`
+}
+
+/**
+ * Test a finished sweep's best points on a window none of them was chosen on (24/09).
+ *
+ * ⚠️ **The window starts where the search ended, by default, and the server refuses any overlap.**
+ * A test that shares bars with the search is partly the search again. The default is only where
+ * the first honest window can begin; the reader moves the end to however much data exists.
+ *
+ * The trade floor is per chart and blank means the ranking floor (01/10, `sweep/rankFloor`) — 60 on
+ * M1 and M5, 30 up to H1, then 20, 10 and 5 — which each field shows as its placeholder. Before it,
+ * blank was the keeping floor, 1 above H1, and the first test ranked D1 runs of one trade. The floor
+ * actually used is shown on the test once it runs, so a blank here never hides what was applied.
+ *
+ * ⚠️ **The reserved window is used once (01/10).** A window an earlier test of this sweep already
+ * used comes back as a 409 naming those tests; only then is the retest box offered, and only a
+ * box ticked by hand sends the launch again with `retest`.
+ */
+export function HoldoutLauncher(props: { sweep: SweepOut }): React.JSX.Element {
+  const { sweep } = props
+  const navigate = useNavigate()
+  const create = useCreateHoldout(sweep.id)
+  const [dateFrom, setDateFrom] = useState(day(sweep.date_to))
+  const [dateTo, setDateTo] = useState(day(new Date().toISOString()))
+  const [topN, setTopN] = useState(3)
+  const [metric, setMetric] = useState<HoldoutRank>('net_profit')
+  // 25/09: limits on the run's risk in R, typed as R and as a percentage. Blank is no limit.
+  const [maxDrawdownR, setMaxDrawdownR] = useState('')
+  const [minYearsPercent, setMinYearsPercent] = useState('')
+  const [floors, setFloors] = useState<Record<string, string>>({})
+  // 28/09: points that make the very same trades are one answer, not N.
+  const [distinct, setDistinct] = useState(true)
+  const [retest, setRetest] = useState(false)
+  const usedBy = windowUsedBy(create.error)
+
+  const overlaps = dateFrom < day(sweep.date_to) && day(sweep.date_from) < dateTo
+  const backwards = dateTo <= dateFrom
+  const floorsValid = Object.values(floors).every(
+    (value) => value === '' || (/^\d+$/.test(value) && Number(value) >= 1),
+  )
+  const drawdownLimit = limitOf(maxDrawdownR)
+  const yearsLimit = limitOf(minYearsPercent)
+  const yearsValid = yearsLimit.ok && (yearsLimit.value === undefined || Number(yearsLimit.value) <= 100)
+  const limitsValid = drawdownLimit.ok && yearsValid
+  const blocked =
+    overlaps || backwards || !floorsValid || !limitsValid || topN < 1 || create.isPending
+
+  function launch(): void {
+    const minTrades: Record<string, number> = {}
+    for (const [timeframe, value] of Object.entries(floors)) {
+      if (value !== '') minTrades[timeframe] = Number(value)
+    }
+    create.mutate(
+      {
+        date_from: startOf(dateFrom),
+        date_to: startOf(dateTo),
+        top_n: topN,
+        metric,
+        ...(drawdownLimit.value === undefined ? {} : { max_drawdown_r: drawdownLimit.value }),
+        ...(yearsLimit.value === undefined
+          ? {}
+          : { min_positive_year_share: String(Number(yearsLimit.value) / 100) }),
+        min_trades: minTrades,
+        distinct,
+        ...(retest ? { retest: true } : {}),
+      },
+      {
+        onSuccess: (created) => {
+          void navigate(`/sweeps/${created.id}`)
+        },
+      },
+    )
+  }
+
+  const input = 'rounded border border-slate-700 bg-slate-900 px-2 py-1'
+  return (
+    <section
+      aria-label="test on a reserved window"
+      className="space-y-3 rounded border border-slate-800 p-4"
+    >
+      <div>
+        <h3 className="font-semibold">Test on a reserved window</h3>
+        <p className="text-sm text-slate-400">
+          Run the best points of each entry, chart and market again over a window none of them was
+          chosen on. The only second opinion a sweep can get.
+        </p>
+      </div>
+      <div className="flex flex-wrap items-end gap-4 text-sm">
+        <label className="flex flex-col gap-1">
+          From
+          <input
+            type="date"
+            value={dateFrom}
+            onChange={(event) => {
+              setDateFrom(event.target.value)
+            }}
+            className={input}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          To
+          <input
+            type="date"
+            value={dateTo}
+            onChange={(event) => {
+              setDateTo(event.target.value)
+            }}
+            className={input}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          Best per chart
+          <input
+            type="number"
+            min={1}
+            max={100}
+            value={topN}
+            onChange={(event) => {
+              setTopN(Number(event.target.value))
+            }}
+            className={`${input} w-20`}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          Ranked by
+          <select
+            value={metric}
+            onChange={(event) => {
+              setMetric(event.target.value as HoldoutRank)
+            }}
+            className={input}
+          >
+            {METRICS.map((one) => (
+              <option key={one.value} value={one.value}>
+                {one.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <fieldset className="text-sm">
+        <legend className="mb-1 text-slate-400">
+          Fewest trades to be ranked, per chart — blank keeps the ranking floor
+        </legend>
+        <div className="flex flex-wrap gap-3">
+          {sweep.timeframes.map((timeframe) => (
+            <label key={timeframe} className="flex items-center gap-1">
+              {timeframe}
+              <input
+                aria-label={`fewest trades on ${timeframe}`}
+                inputMode="numeric"
+                placeholder={floorPlaceholder(timeframe)}
+                value={floors[timeframe] ?? ''}
+                onChange={(event) => {
+                  setFloors((current) => ({ ...current, [timeframe]: event.target.value }))
+                }}
+                className={`${input} w-20`}
+              />
+            </label>
+          ))}
+        </div>
+      </fieldset>
+      <fieldset className="text-sm">
+        <legend className="mb-1 text-slate-400">
+          Limits on the risk in R — blank sets none. A run recorded before 25/09 has no risk in R
+          and never passes a limit.
+        </legend>
+        <div className="flex flex-wrap gap-4">
+          <label className="flex flex-col gap-1">
+            Deepest drawdown (R)
+            <input
+              inputMode="decimal"
+              placeholder="no limit"
+              value={maxDrawdownR}
+              onChange={(event) => {
+                setMaxDrawdownR(event.target.value)
+              }}
+              className={`${input} w-28`}
+            />
+          </label>
+          <label className="flex flex-col gap-1">
+            Years positive, at least (%)
+            <input
+              inputMode="decimal"
+              placeholder="no limit"
+              value={minYearsPercent}
+              onChange={(event) => {
+                setMinYearsPercent(event.target.value)
+              }}
+              className={`${input} w-28`}
+            />
+          </label>
+        </div>
+      </fieldset>
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={distinct}
+          onChange={(event) => {
+            setDistinct(event.target.checked)
+          }}
+        />
+        Skip clones — a point with the same trades as a better one, or with entries all within its
+        (or holding all of them), gives its place to the next
+      </label>
+      {!limitsValid && (
+        <p role="alert" className="text-sm text-amber-300">
+          A limit is a positive number, and a share of years at most 100%.
+        </p>
+      )}
+      {overlaps && (
+        <p role="alert" className="text-sm text-amber-300">
+          This window shares bars with the one searched ({day(sweep.date_from)} →{' '}
+          {day(sweep.date_to)}): it would not be out of sample.
+        </p>
+      )}
+      {backwards && (
+        <p role="alert" className="text-sm text-amber-300">
+          The window has to end after it starts.
+        </p>
+      )}
+      {!floorsValid && (
+        <p role="alert" className="text-sm text-amber-300">
+          A trade floor is a whole number of at least 1.
+        </p>
+      )}
+      {usedBy !== null ? (
+        <RetestPrompt
+          message={apiFailure(create.error, 'This window was already used.')}
+          uses={usedBy}
+          retest={retest}
+          onRetest={setRetest}
+        />
+      ) : (
+        create.isError && (
+          <p role="alert" className="text-sm text-red-400">
+            {apiFailure(create.error, 'Could not launch the test.')}
+          </p>
+        )
+      )}
+      <button
+        type="button"
+        disabled={blocked}
+        onClick={launch}
+        className="rounded bg-sky-600 px-4 py-2 text-sm font-medium disabled:opacity-40"
+      >
+        {create.isPending ? 'Launching…' : retest ? 'Run the retest' : 'Run the test'}
+      </button>
+    </section>
+  )
+}

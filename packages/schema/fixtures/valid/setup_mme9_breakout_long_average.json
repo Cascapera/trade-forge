@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "name": "9.1 filtrado por uma média longa",
+  "description": "A mesma entrada da MME9, só que o setup comprado só coloca ordem quando o preço de entrada — não o fechamento da barra — fica acima de uma exponencial de 200 períodos. O filtro é opcional; aqui está ligado.",
+  "timeframe": "M15",
+  "setup": {
+    "type": "mme9_breakout",
+    "params": {
+      "side": "long",
+      "period": 9,
+      "breakeven_at_r": 2,
+      "volume_filter": false,
+      "long_average_period": 200
+    }
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 1 } }
+  }
+}

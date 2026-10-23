@@ -58,9 +58,83 @@ describe('api client', () => {
     expect((error as ApiError).detail).toEqual(['weird'])
   })
 
+  it('says the server did not answer when the proxy sends its own HTML page', async () => {
+    // ⚠️ nginx answers 502 with HTML while the API restarts; parsing it used to surface as
+    // "Unexpected token '<'", which says nothing a reader can act on (26/09).
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        text: () => Promise.resolve('<html> <head><title>502 Bad Gateway</title></head></html>'),
+      }),
+    )
+
+    const failure = await api.listInstruments().catch((error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(ApiError)
+    expect((failure as ApiError).status).toBe(502)
+    expect((failure as ApiError).detail).toMatch(/did not answer \(HTTP 502\)/)
+  })
+
+  it('hands a preview its abort signal, so a superseded one can be withdrawn', async () => {
+    const fetchMock = mockFetch(200, { runs: 0 })
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+
+    await api.previewSweep(
+      {
+        entry_ids: [],
+        symbols: [],
+        timeframes: [],
+        date_from: '2024-01-01T00:00:00Z',
+        date_to: '2024-02-01T00:00:00Z',
+      },
+      controller.signal,
+    )
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/sweeps/preview',
+      expect.objectContaining({ signal: controller.signal }),
+    )
+  })
+
   it('treats an empty body as null', async () => {
     vi.stubGlobal('fetch', mockFetch(200, undefined))
     await expect(api.getEquity('x')).resolves.toBeNull()
+  })
+
+  it('leaves an unset filter out of the run-log URL entirely', async () => {
+    // Not a cosmetic detail. `?symbol=` asks the API for runs whose symbol is the empty string and
+    // matches nothing, so the screen's "All" — which is an empty string — has to *disappear*, not
+    // be sent along. An empty filter and an absent one are different requests.
+    const fetchMock = mockFetch(200, { total: 0, items: [] })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.listBacktests({})
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/backtests', expect.anything())
+
+    await api.listBacktests({ symbol: '', timeframe: 'H1' })
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/backtests?timeframe=H1', expect.anything())
+  })
+
+  it('sends every run-log filter that was set', async () => {
+    const fetchMock = mockFetch(200, { total: 0, items: [] })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.listBacktests({ symbol: 'EURUSD', timeframe: 'M15', status: 'done', limit: 20 })
+
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/api/backtests?symbol=EURUSD&timeframe=M15&status=done&limit=20',
+      expect.anything(),
+    )
+  })
+
+  it('takes no filters at all', async () => {
+    const fetchMock = mockFetch(200, { total: 0, items: [] })
+    vi.stubGlobal('fetch', fetchMock)
+    await api.listBacktests()
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/backtests', expect.anything())
   })
 
   it('reaches the trades and backtest-creation endpoints', async () => {
@@ -72,5 +146,62 @@ describe('api client', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/backtests/x/trades?limit=100&offset=0', expect.anything())
     expect(fetchMock).toHaveBeenCalledWith('/api/backtests', expect.objectContaining({ method: 'POST' }))
+  })
+
+  it('reaches the reserved-window test of a sweep, and its comparison', async () => {
+    const fetchMock = mockFetch(202, { id: 't', runs: 1, skipped: [] })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.createHoldout('s-1', {
+      date_from: '2026-01-01T00:00:00Z',
+      date_to: '2026-09-19T00:00:00Z',
+      top_n: 3,
+      metric: 'net_profit',
+      min_trades: {},
+    })
+    await api.getHoldout('t')
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/sweeps/s-1/holdout',
+      expect.objectContaining({ method: 'POST' }),
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/sweeps/t/holdout',
+      expect.objectContaining({ method: 'GET' }),
+    )
+  })
+
+  it('reads a sweep without its runs, and its runs a ranked page at a time', async () => {
+    const fetchMock = mockFetch(200, {})
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.getSweep('s-1', 'none')
+    await api.getSweepRuns('s-1', { entryId: 'e-1', rankBy: 'drawdown', offset: 20, limit: 10 })
+    await api.getSweepRuns('s-1', {
+      entryId: 'e-1',
+      rankBy: 'return',
+      offset: 0,
+      limit: 10,
+      allRuns: true,
+    })
+    await api.getSweepRuns('s-1', {
+      entryId: 'e-1',
+      rankBy: 'return',
+      offset: 0,
+      limit: 10,
+      showClones: true,
+    })
+    await api.getSweep('s-1')
+
+    const paths = fetchMock.mock.calls.map((call) => String(call[0]))
+    expect(paths).toEqual([
+      '/api/sweeps/s-1?runs=none',
+      '/api/sweeps/s-1/runs?entry_id=e-1&rank_by=drawdown&offset=20&limit=10',
+      '/api/sweeps/s-1/runs?entry_id=e-1&rank_by=return&offset=0&limit=10&all_runs=true',
+      '/api/sweeps/s-1/runs?entry_id=e-1&rank_by=return&offset=0&limit=10&show_clones=true',
+      '/api/sweeps/s-1',
+    ])
   })
 })

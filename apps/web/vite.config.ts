@@ -13,6 +13,11 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
+        // ⚠️ Without this the live-session feed does not connect, and it fails the worst way a
+        // proxy can: the upgrade request is served as an ordinary HTTP request, so the browser
+        // reports a closed socket and nothing anywhere says "your proxy does not do WebSocket".
+        // The same line has a counterpart in `nginx.conf` for the built image.
+        ws: true,
       },
     },
   },

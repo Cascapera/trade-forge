@@ -26,12 +26,13 @@ context.
 """
 
 from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Final
+from typing import Final, Self
 
-from tradeforge_engine.domain import Candle, Money
+from tradeforge_engine.domain import Candle, Money, Side
 
 
 class SwingKind(StrEnum):
@@ -138,6 +139,17 @@ class FVGDetector:
     its right — it is defined by the three that end on the current one — so it confirms with no
     lag and no lookahead: a rule acting on it acts on the next open. Only Decimal highs and lows
     are compared, so it is exact and context-independent.
+
+    **The middle candle must also close beyond the gap's origin**, and that is the author's rule
+    rather than the textbook one — his indicator is in `docs/referencia/indicador-regioes-order-
+    block.md`, and where the two disagree it wins. The geometric test alone admits a shape he does
+    not trade: three bars that leave an untraded band while the middle one closes back *inside*
+    it, which is a hole price is still arguing over rather than one it left behind. Requiring the
+    close makes the middle bar commit to the direction that made the hole.
+
+    Measured over 3480 real AAPL H1 candles: the geometric test alone reports 482 bullish and 388
+    bearish gaps, his rule 428 and 347 — so 95 of them, better than one in six, were shapes the
+    engine marked and he does not.
     """
 
     def __init__(self) -> None:
@@ -149,13 +161,14 @@ class FVGDetector:
         if len(self._window) < 3:  # noqa: PLR2004 — a gap is a three-candle pattern
             return None
 
-        first, _middle, third = self._window
-        if first.high < third.low:
-            # Bullish: an untraded band from the first high up to the third low.
+        first, middle, third = self._window
+        if first.high < third.low and middle.close > first.high:
+            # Bullish: an untraded band from the first high up to the third low, left by a middle
+            # bar that closed clear of it.
             return FairValueGap(
                 kind=FVGKind.BULLISH, top=third.low, bottom=first.high, time=third.time
             )
-        if first.low > third.high:
+        if first.low > third.high and middle.close < first.low:
             # Bearish: an untraded band from the third high up to the first low.
             return FairValueGap(
                 kind=FVGKind.BEARISH, top=first.low, bottom=third.high, time=third.time
@@ -196,6 +209,16 @@ class StructureBreak:
     trend: Trend
     level: Money
     time: datetime
+    level_time: datetime
+    """The bar that *set* the level this break crossed — where the structure was last defended.
+
+    Distinct from `time`, which is the bar that crossed it, and the two together are what make a
+    break legible on a chart: a horizontal line from `level_time` to `time` is the structure that
+    held, drawn for exactly as long as it held. Without this, the level can only be drawn as a
+    line of arbitrary length, and how long the structure stood — the thing that says whether a
+    break means anything — is not recoverable from the record.
+    """
+
     origin: Money
     origin_time: datetime
 
@@ -203,103 +226,305 @@ class StructureBreak:
 class MarketStructure:
     """Tracks trend through breaks of structure (BOS) and changes of character (CHoCH).
 
-    The method (its author's, pinned by a hand-worked golden):
+    **A transcription of the author's own Profit indicator**, which he has traded from for
+    years. That provenance is the design: this is not a reading of what SMC "should" mean, it
+    is the machine whose marks he recognises, ported so that a backtest disagrees with his
+    screen about nothing. Where the two could differ, the indicator wins.
 
-    * A **BOS** continues the trend. Going up: after the top, two *consecutive* correction bars —
-      each a strictly lower high **and** lower low than the bar before, the first measured against
-      the top candle — arm it; then a candle **closing** above the top confirms it. Other bars may
-      sit between the correction and the close. Every BOS re-anchors the CHoCH level to the lowest
-      low of its move (top through break), and lifts the top to the breaking bar.
-    * A **CHoCH** turns the trend, and needs no correction: a candle simply **closes** beyond the
-      anchor — the lowest low that the last up-move defended (going down), or the highest high the
-      last down-move defended (going up). It flips the bias and points the next CHoCH at the high
-      or low of the move that just reversed.
-    * **Bootstrap.** With no trend yet, the first BOS in either direction — two correction bars and
-      a close through — sets the initial bias; from there the sequence runs.
+    Its state is four running extremes and two armed levels, and the whole method falls out of
+    when each is reset:
 
-    Only Decimal highs, lows and closes are compared, so it is exact and context-independent, and
-    every break is confirmed on a *closed* candle, so a rule acting on one acts on the next open.
+    * **`_low_down` / `_high_down`** — the extremes tracked while the bias is down;
+      **`_low_up` / `_high_up`** — the same going up. All four move on every bar, and only a
+      break resets them.
+    * **A BOS is armed by a two-bar counter-move and confirmed by a close.** Going up: two
+      consecutive bars each making a lower high **and** a lower low arm it at `_high_up`, the
+      highest high so far; a candle **closing above** that level confirms. Going down mirrors
+      it. Only the first counter-move arms — a second one while a level is already armed is
+      ignored, so the level waits for its close rather than being dragged along by the
+      pullback.
+    * **Confirming a BOS plants the anchor the opposite CHoCH will need**, and *that* is the
+      rule this class exists to get right: a bullish BOS sets the bearish CHoCH anchor to
+      `_lowest_since_armed` — **the lowest low between the bar that armed the BOS and the bar
+      that confirmed it**. Not the lowest low of the whole leg, and not the lowest low since
+      the last high: only the stretch the pullback and its resolution occupy.
+    * **A CHoCH needs no counter-move.** A close through the anchor turns the bias, and plants
+      the opposite anchor from whichever level is standing — the armed BOS if there is one, the
+      running extreme if there is not.
+
+    **The first bar starts the machine as the Pascal does, without its mark (05/10).** There, an
+    unset level is the number zero, so the first close of a series is "above" the bullish anchor
+    and fires a CHoCH at 0.00: the bias turns up, the bearish anchor lands on that bar's low, and
+    the machine is running. On a chart that mark is harmless paint; in an engine it is an order on
+    a level that is not a price, so it is not emitted — but everything it *does* is. And the second
+    bar reads the bar before it as zeros, as the Pascal does: rising is a higher high and a higher
+    low, falling cannot happen, and a close under the first bar's low is the mirror CHoCH, at a
+    real price, which *is* emitted.
+
+    ⚠️ **Why the effect and not only the mark.** Until 05/10 the anchor was simply left unset, and
+    a series that began in a climb that never came back to its first low could break nothing,
+    ever: a bearish BOS was the only way to plant the anchor a bullish CHoCH needs. UsaTec H1 from
+    January 2017 made no break in three years — and every structure setup on it no trade — while
+    the same bars from April made 482.
+
+    **The bias the machine runs on is not the bias it reports.** `_direction` is the Pascal's `DIR`
+    and turns up on the first bar; `trend` stays `None` until a break the machine emitted settles
+    one, because a strategy reading it must not act on the indicator's starting assumption.
     """
-
-    _MIN_CORRECTION: Final = 2
 
     def __init__(self) -> None:
         self._trend: Trend | None = None
+        # The Pascal's `DIR`: which branch reads the bar. -1 on a fresh series, as there.
+        self._direction = Trend.BEARISH
         self._previous: Candle | None = None
-        # Up-leg tracking (toward a bullish BOS): top, the lowest low since it, correction count.
-        # Each extreme carries the bar it happened on, so a break can report where its impulse
-        # started — the window an order block has to be found in.
-        self._up_top: Money | None = None
-        self._up_top_time: datetime | None = None
-        self._up_low: Money | None = None
-        self._up_low_time: datetime | None = None
-        self._up_corr = 0
-        self._up_armed = False
-        # Down-leg tracking (toward a bearish BOS).
-        self._dn_bottom: Money | None = None
-        self._dn_bottom_time: datetime | None = None
-        self._dn_high: Money | None = None
-        self._dn_high_time: datetime | None = None
-        self._dn_corr = 0
-        self._dn_armed = False
-        # CHoCH anchors: the level a *closing* candle must cross to turn the trend. After a break
-        # the anchor facing back the way it came *is* that break's origin.
-        self._choch_down: Money | None = None  # break below -> bearish CHoCH (while bullish)
+        self._before_previous: Candle | None = None
+
+        # The four running extremes. `_down` are read while the bias is bearish, `_up` while it
+        # is bullish; both pairs advance on every bar regardless, exactly as the indicator does.
+        self._low_down: Money | None = None
+        self._low_down_time: datetime | None = None
+        self._high_down: Money | None = None
+        self._low_up: Money | None = None
+        self._low_up_time: datetime | None = None
+        self._high_up: Money | None = None
+        self._high_up_time: datetime | None = None
+
+        # The armed levels: the price a close has to pass for a BOS to confirm. `None` means
+        # nothing is armed — the Pascal writes 0 and 999999 for these, which are sentinels and
+        # not prices.
+        self._armed_low: Money | None = None
+        self._armed_low_time: datetime | None = None
+        self._armed_high: Money | None = None
+        self._armed_high_time: datetime | None = None
+
+        # The CHoCH anchors, each planted by the BOS that confirmed in the opposite direction.
+        self._choch_down: Money | None = None
         self._choch_down_time: datetime | None = None
-        self._choch_up: Money | None = None  # break above -> bullish CHoCH (while bearish)
+        self._choch_up: Money | None = None
         self._choch_up_time: datetime | None = None
 
+        # The extremes accumulated **only while a BOS is armed** — the heart of the method.
+        # While nothing is armed they simply follow the current bar, so that the moment one
+        # arms they start from the bar beside it; once armed they only extend.
+        self._lowest_since_armed: Money | None = None
+        self._lowest_since_armed_time: datetime | None = None
+        self._highest_since_armed: Money | None = None
+        self._highest_since_armed_time: datetime | None = None
+
     def update(self, candle: Candle) -> StructureBreak | None:
-        """Fold in one closed candle; return the structure break it confirms, or `None`."""
-        previous = self._previous
-        self._previous = candle
+        """Fold in one closed candle; return the break it confirmed, or `None`.
 
-        # Reversal first: a CHoCH takes precedence over a continuation on the same bar.
-        if (
-            self._trend is Trend.BULLISH
-            and self._choch_down is not None
-            and candle.close < self._choch_down
-        ):
-            level = self._choch_down
-            self._flip_to_bearish(candle)
-            return self._break(StructureKind.CHOCH, Trend.BEARISH, level, candle)
-        if (
-            self._trend is Trend.BEARISH
-            and self._choch_up is not None
-            and candle.close > self._choch_up
-        ):
-            level = self._choch_up
-            self._flip_to_bullish(candle)
-            return self._break(StructureKind.CHOCH, Trend.BULLISH, level, candle)
-
-        # Continuation / bootstrap: a BOS in whichever direction the trend allows (either, if none).
-        if self._trend in (Trend.BULLISH, None):
-            broken = self._update_up_leg(candle, previous)
-            if broken is not None:
-                self._on_bullish_bos(candle)
-                return self._break(StructureKind.BOS, Trend.BULLISH, broken, candle)
-        if self._trend in (Trend.BEARISH, None):
-            broken = self._update_down_leg(candle, previous)
-            if broken is not None:
-                self._on_bearish_bos(candle)
-                return self._break(StructureKind.BOS, Trend.BEARISH, broken, candle)
-        return None
-
-    def _break(
-        self, kind: StructureKind, trend: Trend, level: Money, candle: Candle
-    ) -> StructureBreak:
-        """Build the break, reading its origin from the anchor the handler just planted.
-
-        Call this *after* the state handler has run: settling the new trend is what records where
-        the impulse came from, as the anchor an opposite CHoCH would now have to cross. A bullish
-        break leaves `_choch_down` on the low it rose from; a bearish one leaves `_choch_up` on the
-        high it fell from.
+        At most one break per bar. The Pascal can emit a BOS and a CHoCH on the same candle —
+        the BOS plants the opposite anchor, and the very same close can already be through it —
+        but a bar that both continues and reverses the trend is not something a strategy can
+        act on twice, and the second mark is the one that decides the bias. So the reversal is
+        reported and the continuation is folded into the state, which is what the next bar sees.
         """
-        if trend is Trend.BULLISH:
-            origin, origin_time = self._choch_down, self._choch_down_time
+        previous, before = self._previous, self._before_previous
+        self._before_previous, self._previous = previous, candle
+
+        self._advance_extremes(candle)
+        if previous is None:
+            self._start(candle)
+            return None
+
+        if before is None:
+            # The second bar: the Pascal reads the bar before the previous one as zeros. A price is
+            # above zero, so rising is a higher high and a higher low, and falling cannot happen.
+            rising = candle.high > previous.high and candle.low > previous.low
+            falling = False
         else:
-            origin, origin_time = self._choch_up, self._choch_up_time
-        # Both are planted by the handler that just ran; narrowing here is for the type checker.
+            rising = (
+                candle.high > previous.high
+                and candle.low > previous.low
+                and previous.high > before.high
+                and previous.low > before.low
+            )
+            falling = (
+                candle.high < previous.high
+                and candle.low < previous.low
+                and previous.high < before.high
+                and previous.low < before.low
+            )
+
+        if self._direction is Trend.BULLISH:
+            return self._on_bullish_bar(candle, rising=rising, falling=falling)
+        return self._on_bearish_bar(candle, rising=rising, falling=falling)
+
+    def _start(self, candle: Candle) -> None:
+        """The first bar, as the Pascal runs it — its CHoCH at 0.00 done, not emitted.
+
+        The bearish branch arms and confirms nothing on a bar with no history, and its CHoCH test
+        reads an anchor of zero, which the first close is above: the bearish anchor lands on the
+        low so far, the high so far is this bar's, nothing is armed, and the bias turns up. The
+        bullish branch then runs on the same bar and finds nothing either: no history to arm on,
+        and no close can be under its own bar's low.
+        """
+        self._track_highest(candle, armed=False)
+        self._choch_down, self._choch_down_time = self._low_down, self._low_down_time
+        self._high_up, self._high_up_time = candle.high, candle.time
+        self._armed_high = self._armed_high_time = None
+        self._direction = Trend.BULLISH
+        self._track_lowest(candle, armed=False)
+
+    # ----------------------------------------------------------------------- #
+
+    def _advance_extremes(self, candle: Candle) -> None:
+        """The four running extremes, moved on every bar before anything is decided."""
+        if self._low_down is None or candle.low < self._low_down:
+            self._low_down, self._low_down_time = candle.low, candle.time
+        if self._high_down is None or candle.high > self._high_down:
+            self._high_down = candle.high
+        if self._low_up is None or candle.low < self._low_up:
+            self._low_up, self._low_up_time = candle.low, candle.time
+        if self._high_up is None or candle.high > self._high_up:
+            self._high_up, self._high_up_time = candle.high, candle.time
+
+    def _on_bullish_bar(
+        self, candle: Candle, *, rising: bool, falling: bool
+    ) -> StructureBreak | None:
+        """The `DIR = 1` branch, in its original order."""
+        if rising:
+            # Housekeeping for the other direction: the pullback that would arm a bearish BOS.
+            self._armed_low, self._armed_low_time = self._low_down, self._low_down_time
+            self._high_down = candle.high
+
+        if falling and self._armed_high is None:
+            # The counter-move arms the BOS at the highest high reached so far. Only the first
+            # one: a second pullback while a level waits does not move it.
+            self._armed_high, self._armed_high_time = self._high_up, self._high_up_time
+            self._low_up, self._low_up_time = candle.low, candle.time
+
+        confirmed: StructureBreak | None = None
+        if self._armed_high is not None and candle.close > self._armed_high:
+            confirmed = self._emit(
+                StructureKind.BOS,
+                Trend.BULLISH,
+                self._armed_high,
+                self._armed_high_time,
+                candle,
+                anchor=(self._lowest_since_armed, self._lowest_since_armed_time),
+            )
+            self._armed_high = self._armed_high_time = None
+            # The rule this class exists for: the bearish CHoCH now sits on the lowest low
+            # between the arming and this close.
+            self._choch_down = self._lowest_since_armed
+            self._choch_down_time = self._lowest_since_armed_time
+
+        self._track_lowest(candle, armed=self._armed_high is not None)
+
+        if self._choch_down is not None and candle.close < self._choch_down:
+            reversal = self._emit(
+                StructureKind.CHOCH,
+                Trend.BEARISH,
+                self._choch_down,
+                self._choch_down_time,
+                candle,
+                anchor=(
+                    (self._high_up, self._high_up_time)
+                    if self._armed_high is None
+                    else (self._armed_high, self._armed_high_time)
+                ),
+            )
+            self._choch_up = reversal.origin
+            self._choch_up_time = reversal.origin_time
+            self._low_down, self._low_down_time = candle.low, candle.time
+            self._armed_low = self._armed_low_time = None
+            self._trend = self._direction = Trend.BEARISH
+            return reversal
+        return confirmed
+
+    def _on_bearish_bar(
+        self, candle: Candle, *, rising: bool, falling: bool
+    ) -> StructureBreak | None:
+        """The `DIR = -1` branch — the mirror."""
+        if rising and self._armed_low is None:
+            self._armed_low, self._armed_low_time = self._low_down, self._low_down_time
+            self._high_down = candle.high
+
+        if falling:
+            self._armed_high, self._armed_high_time = self._high_up, self._high_up_time
+            self._low_up, self._low_up_time = candle.low, candle.time
+
+        confirmed: StructureBreak | None = None
+        if self._armed_low is not None and candle.close < self._armed_low:
+            confirmed = self._emit(
+                StructureKind.BOS,
+                Trend.BEARISH,
+                self._armed_low,
+                self._armed_low_time,
+                candle,
+                anchor=(self._highest_since_armed, self._highest_since_armed_time),
+            )
+            self._armed_low = self._armed_low_time = None
+            self._choch_up = self._highest_since_armed
+            self._choch_up_time = self._highest_since_armed_time
+
+        self._track_highest(candle, armed=self._armed_low is not None)
+
+        if self._choch_up is not None and candle.close > self._choch_up:
+            reversal = self._emit(
+                StructureKind.CHOCH,
+                Trend.BULLISH,
+                self._choch_up,
+                self._choch_up_time,
+                candle,
+                anchor=(
+                    (self._low_down, self._low_down_time)
+                    if self._armed_low is None
+                    else (self._armed_low, self._armed_low_time)
+                ),
+            )
+            self._choch_down = reversal.origin
+            self._choch_down_time = reversal.origin_time
+            self._high_up, self._high_up_time = candle.high, candle.time
+            self._armed_high = self._armed_high_time = None
+            self._trend = self._direction = Trend.BULLISH
+            return reversal
+        return confirmed
+
+    def _track_lowest(self, candle: Candle, *, armed: bool) -> None:
+        """Follow the current low while nothing is armed; extend it while something is.
+
+        Called **after** the arm and confirm checks, exactly where the Pascal calls it. That
+        ordering is the whole reason the anchor covers the pullback: on the bar that arms, this
+        has already been following the bar beside it, so the window opens there rather than at
+        the arming bar itself.
+        """
+        if not armed or self._lowest_since_armed is None or candle.low < self._lowest_since_armed:
+            self._lowest_since_armed, self._lowest_since_armed_time = candle.low, candle.time
+
+    def _track_highest(self, candle: Candle, *, armed: bool) -> None:
+        """The mirror of `_track_lowest`."""
+        if (
+            not armed
+            or self._highest_since_armed is None
+            or candle.high > self._highest_since_armed
+        ):
+            self._highest_since_armed, self._highest_since_armed_time = candle.high, candle.time
+
+    def _emit(  # noqa: PLR0913 — one axis each; a break is this many facts
+        self,
+        kind: StructureKind,
+        trend: Trend,
+        level: Money | None,
+        level_time: datetime | None,
+        candle: Candle,
+        *,
+        anchor: tuple[Money | None, datetime | None],
+    ) -> StructureBreak:
+        """Build the break. `anchor` is the extreme the move came from — its `origin`.
+
+        The origin is where the impulse started, which is both the stretch an order block must
+        be found in and the level the opposite CHoCH will be anchored to. Those are the same
+        price for the same reason: the move begins where the structure it broke was last
+        defended.
+        """
+        origin, origin_time = anchor
+        # Every one of these is planted in the same statement as its price; the narrowing is
+        # for the type checker, not for a case that can happen.
+        assert level is not None  # noqa: S101
+        assert level_time is not None  # noqa: S101
         assert origin is not None  # noqa: S101
         assert origin_time is not None  # noqa: S101
         return StructureBreak(
@@ -307,126 +532,16 @@ class MarketStructure:
             trend=trend,
             level=level,
             time=candle.time,
+            level_time=level_time,
             origin=origin,
             origin_time=origin_time,
         )
 
     @property
     def trend(self) -> Trend | None:
-        """The current structural bias, or `None` before the first BOS bootstraps it."""
+        """The bias in force, or `None` before the first emitted CHoCH settles one — never the
+        starting assumption the machine runs on (`_direction`)."""
         return self._trend
-
-    # -- up leg (bullish BOS) -------------------------------------------------- #
-
-    def _update_up_leg(self, candle: Candle, previous: Candle | None) -> Money | None:
-        """Advance the up-leg; return the broken top level if a bullish BOS confirms, else None."""
-        if self._up_top is None or self._up_low is None:
-            self._restart_up_leg(candle)
-            return None
-        if self._up_armed and candle.close > self._up_top:
-            self._lower_up_low(candle)  # the break bar closes the move
-            return self._up_top
-        if candle.high > self._up_top:  # a new high lifts the top and restarts the correction
-            self._restart_up_leg(candle)
-            return None
-        self._lower_up_low(candle)
-        if previous is not None and candle.high < previous.high and candle.low < previous.low:
-            self._up_corr += 1
-            if self._up_corr >= self._MIN_CORRECTION:
-                self._up_armed = True
-        else:
-            self._up_corr = 0  # a bar that is not a correction breaks the streak; arming stands
-        return None
-
-    def _restart_up_leg(self, candle: Candle) -> None:
-        """Start the up-leg over from `candle`: it is both the new top and the new low."""
-        self._up_top, self._up_low, self._up_corr, self._up_armed = (
-            candle.high,
-            candle.low,
-            0,
-            False,
-        )
-        self._up_top_time = self._up_low_time = candle.time
-
-    def _lower_up_low(self, candle: Candle) -> None:
-        """Drop the up-leg's low to this candle if it went lower. Ties keep the earlier bar — the
-        move began the first time price reached that level, not the last."""
-        if self._up_low is None or candle.low < self._up_low:
-            self._up_low, self._up_low_time = candle.low, candle.time
-
-    def _on_bullish_bos(self, candle: Candle) -> None:
-        self._trend = Trend.BULLISH
-        # The low the up-move defended is both the next CHoCH anchor and this break's origin.
-        self._choch_down, self._choch_down_time = self._up_low, self._up_low_time
-        self._choch_up = self._choch_up_time = None
-        self._restart_up_leg(candle)
-        self._reset_down_leg()
-
-    def _flip_to_bullish(self, candle: Candle) -> None:
-        self._trend = Trend.BULLISH
-        self._choch_down, self._choch_down_time = self._dn_bottom, self._dn_bottom_time
-        self._choch_up = self._choch_up_time = None
-        self._restart_up_leg(candle)
-        self._reset_down_leg()
-
-    def _reset_up_leg(self) -> None:
-        self._up_top, self._up_low, self._up_corr, self._up_armed = None, None, 0, False
-        self._up_top_time = self._up_low_time = None
-
-    # -- down leg (bearish BOS) ------------------------------------------------ #
-
-    def _update_down_leg(self, candle: Candle, previous: Candle | None) -> Money | None:
-        if self._dn_bottom is None or self._dn_high is None:
-            self._restart_down_leg(candle)
-            return None
-        if self._dn_armed and candle.close < self._dn_bottom:
-            self._raise_dn_high(candle)
-            return self._dn_bottom
-        if candle.low < self._dn_bottom:
-            self._restart_down_leg(candle)
-            return None
-        self._raise_dn_high(candle)
-        if previous is not None and candle.high > previous.high and candle.low > previous.low:
-            self._dn_corr += 1
-            if self._dn_corr >= self._MIN_CORRECTION:
-                self._dn_armed = True
-        else:
-            self._dn_corr = 0
-        return None
-
-    def _restart_down_leg(self, candle: Candle) -> None:
-        """Start the down-leg over from `candle`: it is both the new bottom and the new high."""
-        self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = (
-            candle.low,
-            candle.high,
-            0,
-            False,
-        )
-        self._dn_bottom_time = self._dn_high_time = candle.time
-
-    def _raise_dn_high(self, candle: Candle) -> None:
-        """Lift the down-leg's high to this candle if it went higher; ties keep the earlier bar."""
-        if self._dn_high is None or candle.high > self._dn_high:
-            self._dn_high, self._dn_high_time = candle.high, candle.time
-
-    def _on_bearish_bos(self, candle: Candle) -> None:
-        self._trend = Trend.BEARISH
-        # The high the down-move defended is both the next CHoCH anchor and this break's origin.
-        self._choch_up, self._choch_up_time = self._dn_high, self._dn_high_time
-        self._choch_down = self._choch_down_time = None
-        self._restart_down_leg(candle)
-        self._reset_up_leg()
-
-    def _flip_to_bearish(self, candle: Candle) -> None:
-        self._trend = Trend.BEARISH
-        self._choch_up, self._choch_up_time = self._up_top, self._up_top_time
-        self._choch_down = self._choch_down_time = None
-        self._restart_down_leg(candle)
-        self._reset_up_leg()
-
-    def _reset_down_leg(self) -> None:
-        self._dn_bottom, self._dn_high, self._dn_corr, self._dn_armed = None, None, 0, False
-        self._dn_bottom_time = self._dn_high_time = None
 
 
 class LiquiditySide(StrEnum):
@@ -927,10 +1042,13 @@ class OrderBlock:
     the last opposite candle before the break, and says to pick one and stay with it. This is the
     one.)
 
-    `top` and `bottom` bound the zone. For demand the base is the marking candle's own range,
-    extended *down* to the gap candle's low whenever that low ran deeper — the wick is part of
-    where they worked, and dropping it would put the zone above where price actually turned.
-    Supply mirrors it upward.
+    `top` and `bottom` bound the zone, and they are the marking candle's **own high and low** —
+    nothing added, nothing extended. His indicator draws exactly `[low[2], high[2]]`.
+
+    An earlier version of this widened the zone to swallow the gap candle's wick wherever that ran
+    past the marking candle, on the reasoning that the wick was part of where the size was worked.
+    That was not his rule, and it was not harmless: the edge is where the order rests, so a
+    widened zone is an order at a price he would not have used. It moved 22% of zones.
 
     `time` is the bar the zone is drawn on; `confirmed_at` is the bar whose close broke structure
     and revealed it. Both matter and they differ: the zone belongs to the past, but nothing could
@@ -950,62 +1068,150 @@ class OrderBlock:
     break_kind: StructureKind
     primary: bool
 
+    @property
+    def side(self) -> Side:
+        """The side a trade from this region faces: demand is bought, supply is sold."""
+        return Side.LONG if self.kind is ZoneKind.DEMAND else Side.SHORT
+
 
 @dataclass(slots=True)
 class TrackedZone:
-    """An order block and what price has since done to it.
+    """An order block and the one thing that can happen to it.
 
-    Two marks, both permanent once set, and they answer different questions.
+    `mitigated` says the region is spent: **price came back and touched its entry edge**, by wick,
+    once. The near edge is the top of a demand zone and the bottom of a supply zone — the side
+    price has to return to in order to trade there — so the first touch is the moment the orders
+    resting in the region are taken. There is nothing to add after that; a region is offered once.
 
-    `mitigated` says the zone is spent **for its own side**. It happens either the healthy way —
-    price came back, touched it, and then *closed* a full zone-width clear of it, so the orders
-    resting there have been filled and the move they fund is already underway — or the failed way:
-    price closed straight through, so whatever was defending the level is gone.
+    That is his indicator's rule verbatim (`docs/referencia/indicador-regioes-order-block.md`):
 
-    A touch is a wick; everything that *decides* is a close. That split is what lets a zone survive
-    a news spike: a bar can trade far outside it and still end up inside, and the market has not
-    left. It also removes the intrabar guess — a single bar whose wick both reaches the zone and
-    runs a width past it says nothing about which came first, so nothing is inferred from it.
+        ob.bull ? low <= ob.topo : high >= ob.fundo
 
-    `flipped` says price went *through* the zone, by wick or by close. A demand zone that price
-    traded down through has trapped every buyer who took it, and on the way back those buyers sell
-    to get out flat. That is the raw material of the flip setup: a zone marked flipped is where a
-    trade *against* the prevailing trend becomes reasonable. A wick through is enough to mark it
-    and leaves the zone still usable; a close through marks it **and** mitigates it.
+    An earlier version of this carried three more marks — `touched`, `departed`, `flipped` — and a
+    second way to die, `driven_off`, where a close a full zone-width clear counted as the region
+    having done its job. None of that is his method. The extra marks existed to feed a *flip*
+    setup, trading the region price had traded through against whoever was trapped in it; asked
+    directly, he said a dead region does not serve a flip, and the setup had never been built.
     """
 
     block: OrderBlock
-    touched: bool = False
-    departed: bool = False
-    flipped: bool = False
     mitigated: bool = False
+
+    mitigated_at: datetime | None = None
+    """The bar that took it — the **first** touch, never a later one.
+
+    Carried for the chart, which draws a region from the bar that marked it to the bar that
+    took it, so the rectangle's length is how long it stood. Nothing in the engine's decisions
+    reads this: `usable` is the whole rule, and it only ever asks the boolean.
+
+    ⚠️ First, and that is the entire subtlety of stamping it. `mitigated` is folded forward with
+    `or`, so it stays true through every later bar that also reaches the edge — and a stamp
+    written on the same terms would keep moving to the most recent one. The region would then be
+    drawn as having survived until the last time price happened to be there, which in a range is
+    hundreds of bars past the touch that actually killed it.
+    """
+
+    gap_index: int | None = None
+    """The detector's count of the bar that confirmed the region's gap — its third candle
+    (`OrderBlockDetector.bar_index`). `None` on a zone built by hand. What his minimum age is
+    counted from (`StructureStrategy`, `min_bars_to_touch`, 29/09)."""
+
+    touched_index: int | None = None
+    """The detector's count of the bar that first touched the entry edge — the bar `mitigated_at`
+    names, as a count rather than a time, so an age can be read off it without the calendar."""
 
     @property
     def usable(self) -> bool:
-        """Whether the zone still stands for the side it was marked on."""
+        """Whether the region still stands — nothing has come back to take it."""
         return not self.mitigated
 
-    @property
-    def flippable(self) -> bool:
-        """Whether breaking this zone would still count as a flip.
 
-        A flip has to be *abrupt* — one move that arrives and takes the zone out. Price that came
-        in, backed away, and only later returned to break it is a different story: the zone was
-        already being negotiated, so breaking it traps nobody the way a single decisive drive
-        does. A zone price has left after touching, or that is already mitigated, is past that.
-        """
-        return not self.departed and not self.mitigated
+@dataclass(slots=True)
+class _Region:
+    """A gap's region, followed from the bar the gap completed.
 
+    This is the piece that has to exist *before* a break reveals anything. A region is born the
+    moment its gap completes, and price starts working it from that bar — so by the time a break
+    makes it interesting, it may already be gone. Waiting for the break to start watching is what
+    made the engine offer regions the market had spent days earlier.
+    """
 
-@dataclass(frozen=True, slots=True)
-class _GapEvent:
-    """One confirmed gap, kept with the two candles a zone would be marked from."""
-
-    index: int  # bar index of the gap's third candle — adjacency is what groups a run
+    index: int  # bar index of the gap's third candle
     kind: FVGKind
-    time: datetime
-    first: Candle  # c1 — the candle the zone is drawn on
-    second: Candle  # c2 — the impulse candle whose wick may extend the zone
+    marking: Candle  # c1 — the candle the region is drawn on; its range *is* the region
+    mitigated: bool = False
+
+    @property
+    def top(self) -> Money:
+        return self.marking.high
+
+    @property
+    def bottom(self) -> Money:
+        return self.marking.low
+
+    @property
+    def near_edge(self) -> Money:
+        """The side price must come back to: a demand region's top, a supply region's bottom."""
+        return self.top if self.kind is FVGKind.BULLISH else self.bottom
+
+    def touched_by(self, candle: Candle) -> bool:
+        """His rule, on one candle: the first wick to reach the entry edge takes the region."""
+        if self.kind is FVGKind.BULLISH:
+            return candle.low <= self.near_edge
+        return candle.high >= self.near_edge
+
+
+class ZoneView(tuple[TrackedZone, ...]):
+    """The detector's regions, oldest first — a plain tuple, plus the lookup its readers need.
+
+    Every reader of the regions asks the same question of them: *which tracked region holds this
+    block?* Asked by walking the tuple, it compared whole `OrderBlock`s field by field against up
+    to two hundred regions, several times a bar — 17 million comparisons in one CHOCH run over 82k
+    bars, more than half its time (24/09). The index answers the same thing from a dict.
+
+    ⚠️ **Exactly what the walk answered, in the walk's order.** A block maps to *every* region
+    holding an equal block, oldest first, so "the first match" and "any match" both read the same
+    as before. The detector never offers one region twice — a break clears the leg's regions — so
+    the tuple is one or empty in practice; it is kept a tuple so that nothing here rests on that.
+    Built once per view, and a view is built only when the detector's list changes.
+    """
+
+    _index: dict[OrderBlock, tuple[TrackedZone, ...]]
+
+    def __new__(cls, zones: Iterable[TrackedZone] = ()) -> Self:
+        view = super().__new__(cls, zones)
+        index: dict[OrderBlock, tuple[TrackedZone, ...]] = {}
+        for tracked in view:
+            index[tracked.block] = (*index.get(tracked.block, ()), tracked)
+        view._index = index
+        return view
+
+    def holding(self, block: OrderBlock) -> tuple[TrackedZone, ...]:
+        """Every region holding an equal block, oldest first."""
+        return self._index.get(block, ())
+
+
+def holding(zones: Sequence[TrackedZone], block: OrderBlock) -> tuple[TrackedZone, ...]:
+    """Every region in `zones` holding an equal block, oldest first — indexed when it can be.
+
+    A `ZoneView` answers from its index; any other sequence (a test's hand-built tuple) is walked,
+    which is the same answer.
+    """
+    if isinstance(zones, ZoneView):
+        return zones.holding(block)
+    return tuple(tracked for tracked in zones if tracked.block == block)
+
+
+OPENING_GAP_LONGEST: Final = timedelta(hours=4)
+"""The longest bar an opening gap is read on (his choice, 15/10): M1 to H4. From D1 up every bar is
+a whole session, and the leap from one to the next is the three-bar test's to read."""
+
+SHORTEST_PAUSE: Final = timedelta(minutes=30)
+"""How long a chart has to go without a bar for the next one to open a session (ADR-0035).
+
+Longer than one bar is not enough on its own: an illiquid market skips the minutes nobody traded,
+and a hole of two M1 bars is not a session opening. Every pause he reads is far longer — B3's night,
+the CFDs' hour, FX's weekend — so the floor only refuses the holes of thin trading."""
 
 
 class OrderBlockDetector:
@@ -1016,182 +1222,222 @@ class OrderBlockDetector:
     bar, the stretch the break itself reports — for gaps pointing the same way as the break, and
     returns the zones they mark, primary first.
 
-    Three rules, all the author's:
+    Four rules, all the author's, and his indicator is the reference for the first three:
+    `docs/referencia/indicador-regioes-order-block.md`.
 
-    * **The gap must be in the impulse leg.** A gap left somewhere else is not the footprint of the
-      move that broke structure, so it marks nothing here.
-    * **The zone is the candle before the gap**, widened by the gap candle's wick when that wick
-      ran past it.
-    * **Consecutive gaps are one event.** Price gapping on bar after bar is one continuous push;
-      it takes a pause — a bar that completes no gap — before a fresh gap starts a second zone.
-      Without this an impulsive leg would mark a zone on nearly every bar of itself.
+    * **The region is born at the gap, not at the break.** It is the marking candle's own range,
+      and it starts being worked the moment the gap completes. This is the rule the detector used
+      to get wrong, and it was not a detail: a break confirms a median of 16 bars after the gap
+      (282 at the worst), so a region could be traded away for a week before anything asked about
+      it. Offered fresh at the break, it was an order at a level the market had already taken.
+    * **A region dies at the first touch of its entry edge**, by wick — see `TrackedZone`.
+    * **Consecutive gaps make one region.** While the gap condition holds bar after bar it is one
+      continuous push, and only the first bar of the run marks anything. His indicator latches on
+      exactly this, per direction, and so does this.
+    * **Only regions inside the impulse leg are offered.** A gap left elsewhere is not the
+      footprint of the move that broke structure. The leg is `origin_time` to the breaking bar,
+      which the break reports itself.
 
-    Nothing is reported until a break confirms on a closed candle, so a zone is only ever known
-    from `confirmed_at` onward, and a strategy acting on it acts at the next open.
+    So a region has two lives. It is *followed* from its gap, by anyone or no one; it is *offered*
+    when a break reveals it, and only if it is still standing then. Nothing is reported before the
+    break, so a strategy still only ever acts from `confirmed_at` onward and acts at the next open.
 
-    Every zone it marks is then kept and followed — see `zones` and `TrackedZone` — because a zone
-    that has been used up, or traded through, is not thereby uninteresting: the flip setup trades
-    exactly those.
-
-    **A zone is born clean.** The impulse leg that revealed it is not replayed against it, and the
-    breaking bar does not touch it either. That is deliberate twice over. Nobody could know the
-    zone existed until the break confirmed, so counting the leg against it would be acting on
-    hindsight; and the leg *is* price leaving the zone — by the gap's own construction the impulse
-    candle overlaps the marking candle, so replaying it would mark almost every zone touched, and
-    often mitigated, at birth.
+    **The opening gap** (`opening_gap`, his Profit indicator's rule, 15/10 — ADR-0035) is a fifth
+    rule, off unless asked for. After a pause in the chart, an opening bar that stays **wholly
+    beyond** the last bar before the pause — its low over that bar's high, or its high under its
+    low — marks that last bar as a region, on the opening bar itself. The three-bar test cannot
+    see this one: the leap is between two bars, and the bar before it never had to close beyond
+    anything. An opening whose wick comes back to the last bar has closed its own gap, and his
+    indicator draws nothing there: it is no gap, so it holds no latch either. Past that it is a gap
+    like the others in every way — the same latch, the same leg, the same first touch, the same age
+    counted from its own bar. A pause is a stretch with **no bars** longer than one bar and at
+    least `SHORTEST_PAUSE`; a break that fits inside a bar is invisible on that chart. Read only up
+    to `OPENING_GAP_LONGEST`: from D1 up every bar is a whole session already, and the three-bar
+    test reads the leap between them.
     """
 
     # A leg longer than this is not an impulse any more; the cap also bounds memory when a long
     # stretch of chart passes with no break at all.
     _MAX_LOOKBACK: Final = 500
-    # Zones outlive their usefulness but stay readable for the flip setup; keep the recent ones.
+    # Offered regions stay readable to strategies for a while after they die; keep the recent ones.
     _MAX_ZONES: Final = 200
 
-    def __init__(self) -> None:
+    def __init__(self, *, timeframe: timedelta | None = None, opening_gap: bool = False) -> None:
+        """`timeframe` is how long one of these bars lasts, and only the opening gap reads it: a
+        pause is told from the bars' spacing, so a detector asked for one without it is refused
+        rather than left to guess the spacing from the first two bars."""
+        if opening_gap and timeframe is None:
+            raise ValueError(
+                "an opening gap is read after a pause, and a pause needs the timeframe"
+            )
+        # The bar length the opening gap is read on, or `None` with the rule off — asked for on a
+        # chart above `OPENING_GAP_LONGEST` included, where it is off by his choice (15/10).
+        self._opening: timedelta | None = (
+            timeframe
+            if opening_gap and timeframe is not None and timeframe <= OPENING_GAP_LONGEST
+            else None
+        )
         self._fvgs = FVGDetector()
         self._window: deque[Candle] = deque(maxlen=3)
-        self._gaps: list[_GapEvent] = []
+        self._regions: list[_Region] = []
         self._zones: list[TrackedZone] = []
+        # ⚠️ **Only the zones still standing are advanced**, and the two lists must name the same
+        # objects. A touch is permanent (`_advance`), so folding a candle into a region already
+        # taken changes nothing — and with two hundred regions kept, doing it anyway was 16
+        # million calls in one CHOCH run over 82k bars, a quarter of its time (24/09). `_live` is
+        # `_zones` minus the mitigated, in the same order, and loses a region the moment it is
+        # taken or trimmed; `_view` is what `zones` hands out, rebuilt only when `_zones` changes.
+        self._live: list[TrackedZone] = []
+        self._view = ZoneView()
         self._index = -1
+        # The author's latch, one per direction: a run of gapping bars marks one region, not one
+        # per bar. Cleared by any bar that completes no gap that way.
+        self._gapping: dict[FVGKind, bool] = {FVGKind.BULLISH: False, FVGKind.BEARISH: False}
 
     @property
-    def zones(self) -> tuple[TrackedZone, ...]:
-        """Every zone marked so far, oldest first, each with what price has done to it since."""
-        return tuple(self._zones)
+    def zones(self) -> ZoneView:
+        """Every region offered so far, oldest first, each with whether price has taken it."""
+        return self._view
+
+    @property
+    def bar_index(self) -> int:
+        """How many bars this detector has read, less one — the count of the last bar folded in.
+        What `TrackedZone.gap_index` and `touched_index` are counted on; `-1` before any bar."""
+        return self._index
 
     def update(self, candle: Candle, break_: StructureBreak | None) -> tuple[OrderBlock, ...]:
-        """Fold in one closed candle and the break it confirmed (if any); return the zones marked.
+        """Fold in one closed candle and the break it confirmed (if any); return the zones offered.
 
         Pass the `StructureBreak` that `MarketStructure.update` returned for *this* candle, or
-        `None`. Returns the zones the break reveals, primary first, and `()` on every other bar.
+        `None`. Returns the regions the break reveals, primary first, and `()` on every other bar.
         """
         self._index += 1
         self._window.append(candle)
-        # Advance the zones already on the book *before* marking new ones: a zone cannot be
-        # touched or broken by the very bar whose close first revealed it.
-        for tracked in self._zones:
-            self._advance(tracked, candle)
+        # Everything already being followed advances *before* this bar can mark anything new. No
+        # region can be taken by the bar that created it — both his gap conditions, the three-bar
+        # one and the opening one, put price clear of the region on that bar.
+        taken = False
+        for tracked in self._live:
+            self._advance(tracked, candle, self._index)
+            taken = taken or tracked.mitigated
+        if taken:
+            self._live = [tracked for tracked in self._live if not tracked.mitigated]
+        for region in self._regions:
+            region.mitigated = region.mitigated or region.touched_by(candle)
 
         gap = self._fvgs.update(candle)
-        if gap is not None and len(self._window) == self._window.maxlen:
-            first, second, _third = self._window
-            self._gaps.append(
-                _GapEvent(
-                    index=self._index, kind=gap.kind, time=gap.time, first=first, second=second
-                )
-            )
-        self._gaps = [g for g in self._gaps if self._index - g.index <= self._MAX_LOOKBACK]
+        opening = self._opening_region(candle)
+        # ⚠️ **One latch for both rules.** A bar gapping either way keeps the run alive, so a push
+        # that leaps the pause and goes on gapping is one region, not one per rule — the bar after
+        # an opening gap would otherwise mark the very same candle again as a three-bar gap. With
+        # the opening gap off `opening` is always `None`, and this is the latch it always was.
+        gapping: set[FVGKind] = set()
+        if gap is not None:
+            gapping.add(gap.kind)
+        if opening is not None:
+            gapping.add(opening.kind)
+        for kind in self._gapping:
+            self._gapping[kind] = self._gapping[kind] and kind in gapping
+        if gap is not None and not self._gapping[gap.kind]:
+            if len(self._window) == self._window.maxlen:
+                marking, _impulse, _third = self._window
+                self._regions.append(_Region(index=self._index, kind=gap.kind, marking=marking))
+            self._gapping[gap.kind] = True
+        # The three-bar gap goes first: on a bar where both hold the same way, its marking candle
+        # is where the push began, and the opening bar only continues it.
+        if opening is not None and not self._gapping[opening.kind]:
+            self._regions.append(opening)
+            self._gapping[opening.kind] = True
+        self._regions = [r for r in self._regions if self._index - r.index <= self._MAX_LOOKBACK]
 
         if break_ is None:
             return ()
 
         wanted = FVGKind.BULLISH if break_.trend is Trend.BULLISH else FVGKind.BEARISH
         in_leg = [
-            gap_event
-            for gap_event in self._gaps
-            if gap_event.kind is wanted
-            and gap_event.first.time >= break_.origin_time
-            and gap_event.time <= break_.time
+            region
+            for region in self._regions
+            if region.kind is wanted
+            and not region.mitigated
+            and region.marking.time >= break_.origin_time
         ]
-        # Every gap up to this break belongs to the leg that just ended: a new leg starts at the
-        # breaking bar, so none of these can qualify again.
-        self._gaps = [g for g in self._gaps if g.time > break_.time]
+        # Every region up to this break belonged to the leg that just ended, taken or not: a new
+        # leg starts at the breaking bar, so none of them can be offered again.
+        self._regions = [r for r in self._regions if r.index > self._index]
 
         marked = tuple(
-            self._zone(run[0], break_, primary=position == 0)
-            for position, run in enumerate(self._runs(in_leg))
+            self._zone(region, break_, primary=position == 0)
+            for position, region in enumerate(in_leg)
         )
-        self._zones.extend(TrackedZone(block=block) for block in marked)
+        fresh = [
+            TrackedZone(block=block, gap_index=region.index)
+            for block, region in zip(marked, in_leg, strict=True)
+        ]
+        self._zones.extend(fresh)
+        self._live.extend(fresh)
         if len(self._zones) > self._MAX_ZONES:
+            # A trimmed region is no longer followed at all — the same as before `_live` existed,
+            # when the loop above only ever walked `_zones`.
+            trimmed = {id(tracked) for tracked in self._zones[: -self._MAX_ZONES]}
             del self._zones[: -self._MAX_ZONES]
+            self._live = [tracked for tracked in self._live if id(tracked) not in trimmed]
+        if marked:
+            self._view = ZoneView(self._zones)
         return marked
 
-    @staticmethod
-    def _advance(tracked: TrackedZone, candle: Candle) -> None:
-        """Fold one candle into a zone's state. Every mark is permanent once set."""
-        block = tracked.block
-        size = block.top - block.bottom
-        demand = block.kind is ZoneKind.DEMAND
+    def _opening_region(self, candle: Candle) -> _Region | None:
+        """The region an opening gap marks on this bar, or `None` (ADR-0035).
 
-        # Read before this bar changes anything. A bar that closes clean through both flips the
-        # zone and spends it, so the flip has to be judged on the history *behind* the bar — if
-        # this bar's own mitigation counted first, it would veto its own flip.
-        was_flippable = tracked.flippable
-
-        # Closing beyond the far side always spends the zone, whatever else is true of it. A level
-        # the market has closed through is gone: whether it was flippable, already departed, or
-        # untouched makes no difference to that.
-        through = candle.close < block.bottom if demand else candle.close > block.top
-        tracked.mitigated = tracked.mitigated or through
-
-        # The flip mark is the narrow one: only a still-flippable zone can be flipped, and the
-        # pierce is by wick — the drive has to arrive and take the zone out in one go.
-        pierced = candle.low < block.bottom if demand else candle.high > block.top
-        if was_flippable and pierced:
-            tracked.flipped = True
-
-        # Reaching the zone at all counts as a touch — by wick, like everything else here.
-        reached = candle.low <= block.top if demand else candle.high >= block.bottom
-        tracked.touched = tracked.touched or reached
-        # Leaving it is judged on the *close*, not the wick — the same line this module draws
-        # everywhere else. News can spike price far out of a zone and drag it straight back inside
-        # within one bar; that spike is not the market backing away from the level. Only a bar
-        # that ends up beyond the near edge has actually left. So a bar closing lower inside the
-        # zone, then one that pokes up but closes down and carries on through, is still one drive.
-        #
-        # `touched` is updated first on purpose: a single bar that dips into the zone and closes
-        # clear of it has touched and left, exactly as two bars doing the same would. Reading the
-        # old value here would make the flip mark depend on whether the move happened to land in
-        # one candle or two — the same strategy would flip on M5 and not on M15.
-        # Set *after* the flip mark above, and that ordering is semantic, not cosmetic: a bar that
-        # arrives, takes the zone out and closes clear must not use its own departure to veto its
-        # own flip. Same principle as reading `was_flippable` at the top. Moving this block up
-        # would silently break it.
-        cleared = candle.close > block.top if demand else candle.close < block.bottom
-        if tracked.touched and cleared:
-            tracked.departed = True
-
-        # Spent the healthy way: touched, then driven off by a full zone-width. The zone did its
-        # job, and the orders that were resting in it are now in the market.
-        #
-        # Measured on the close, like every other decision in this module. A news wick can throw
-        # price a long way past a zone and bring it back inside the same bar; treating that spike
-        # as the zone having worked would kill a level the market never actually left — and with
-        # it any flip that level still had in it, since a mitigated zone can no longer flip.
-        if not tracked.touched:
-            return
-        driven_off = (
-            candle.close > block.top + size if demand else candle.close < block.bottom - size
-        )
-        tracked.mitigated = tracked.mitigated or driven_off
-
-    @staticmethod
-    def _runs(gaps: list[_GapEvent]) -> list[list[_GapEvent]]:
-        """Split gaps into runs of consecutive bars. A break in the indices is the pause that
-        separates one gap event from the next."""
-        runs: list[list[_GapEvent]] = []
-        for gap in gaps:
-            if runs and gap.index == runs[-1][-1].index + 1:
-                runs[-1].append(gap)
-            else:
-                runs.append([gap])
-        return runs
-
-    @staticmethod
-    def _zone(gap: _GapEvent, break_: StructureBreak, *, primary: bool) -> OrderBlock:
-        """Mark the zone on the candle before `gap`, extended by the gap candle's wick."""
-        marking, impulse = gap.first, gap.second
-        if gap.kind is FVGKind.BULLISH:
-            kind = ZoneKind.DEMAND
-            top, bottom = marking.high, min(marking.low, impulse.low)
+        The bar before the pause is the region, and this bar is its gap's: the region is counted
+        from here, as a three-bar gap's is from its third candle. The gap is the whole bar's, not
+        its open's — his answer of 15/10: no region when the opening bar's wick closes the gap, or
+        when its close does not confirm the leap. A low clear of the last bar's high says both
+        (the close is never under the low), so it is the whole test, and strict as the three-bar
+        one is: a wick exactly on the edge is the first touch `TrackedZone` reads.
+        """
+        if self._opening is None or len(self._window) < 2:  # noqa: PLR2004 — this bar and the one before
+            return None
+        before = self._window[-2]
+        pause = candle.time - before.time
+        if pause <= self._opening or pause < SHORTEST_PAUSE:
+            return None
+        if candle.low > before.high:
+            kind = FVGKind.BULLISH
+        elif candle.high < before.low:
+            kind = FVGKind.BEARISH
         else:
-            kind = ZoneKind.SUPPLY
-            top, bottom = max(marking.high, impulse.high), marking.low
+            return None
+        return _Region(index=self._index, kind=kind, marking=before)
+
+    @staticmethod
+    def _advance(tracked: TrackedZone, candle: Candle, index: int) -> None:
+        """Fold one candle into an offered region: the first touch of its entry edge takes it.
+
+        The whole rule, and permanent once set. What was here before — a flip mark, a departure
+        mark, and a second death by being driven a full width clear — was the engine's invention
+        and is documented as such on `TrackedZone`.
+        """
+        block = tracked.block
+        if block.kind is ZoneKind.DEMAND:
+            reached = candle.low <= block.top
+        else:
+            reached = candle.high >= block.bottom
+        # The stamp goes on the transition, not on the condition. Writing it whenever `reached`
+        # is true would keep overwriting it with every later visit — see `TrackedZone`.
+        if reached and not tracked.mitigated:
+            tracked.mitigated_at = candle.time
+            tracked.touched_index = index
+        tracked.mitigated = tracked.mitigated or reached
+
+    @staticmethod
+    def _zone(region: _Region, break_: StructureBreak, *, primary: bool) -> OrderBlock:
+        """Offer a region that is still standing — its marking candle's range, edge to edge."""
+        kind = ZoneKind.DEMAND if region.kind is FVGKind.BULLISH else ZoneKind.SUPPLY
         return OrderBlock(
             kind=kind,
-            top=top,
-            bottom=bottom,
-            time=marking.time,
+            top=region.top,
+            bottom=region.bottom,
+            time=region.marking.time,
             confirmed_at=break_.time,
             break_kind=break_.kind,
             primary=primary,
@@ -1199,6 +1445,8 @@ class OrderBlockDetector:
 
 
 __all__ = [
+    "OPENING_GAP_LONGEST",
+    "SHORTEST_PAUSE",
     "FVGDetector",
     "FVGKind",
     "FairValueGap",
@@ -1218,4 +1466,6 @@ __all__ = [
     "TrackedZone",
     "Trend",
     "ZoneKind",
+    "ZoneView",
+    "holding",
 ]

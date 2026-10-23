@@ -2,11 +2,12 @@
 
 import dataclasses
 import datetime as dt
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 
 import pytest
 
-from tradeforge_engine.domain import Candle, OrderRequest, Side, Signal, SignalKind
+from tradeforge_engine.domain import Candle, OrderRequest, Side, Signal, SignalKind, to_tick
+from tradeforge_engine.loop import ENGINE_CONTEXT
 from tradeforge_engine.testing import AAPL, EURUSD
 
 
@@ -143,3 +144,47 @@ def test_an_order_request_cannot_carry_both_a_limit_and_a_stop() -> None:
             stop_price=Decimal("1.10500"),
             client_id="zone-1",
         )
+
+
+# --------------------------------------------------------------------------- #
+# What a stop modification is allowed to be (ADR-0018)                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_stop_modification_must_carry_the_new_level() -> None:
+    """The same shape of refusal as an anonymous cancel, and worse consequences. Reaching the
+    broker with no level, it would have to guess between "leave the stop alone" and "remove the
+    protection" — and one of those answers turns a stopped position into an unstopped one."""
+    with pytest.raises(ValueError, match="stop_loss is required"):
+        Signal(kind=SignalKind.MODIFY_STOP, side=Side.LONG, reference_price=Decimal("1.10000"))
+
+
+def test_a_stop_modification_is_not_an_order() -> None:
+    """It acts on a position that already exists. Built as an `OrderRequest` it would carry a
+    volume nobody asked for and sit in the queue waiting to open a *second* position."""
+    with pytest.raises(ValueError, match="not an order"):
+        OrderRequest(
+            symbol="EURUSD",
+            side=Side.LONG,
+            intent=SignalKind.MODIFY_STOP,
+            volume=Decimal(1),
+            decided_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+            stop_loss=Decimal("1.09500"),
+        )
+
+
+def test_to_tick_rounds_in_the_direction_it_is_told() -> None:
+    """The helper on its own, both directions, so no two callers can be wrong the same way and
+    still agree with each other.
+
+    It moved here from `setups.py` when a second module needed it. The rule it encodes is the
+    one thing every caller shares: the direction is asked for, never inferred, because
+    "nearest" is right for a measurement and wrong for a level.
+    """
+    with localcontext(ENGINE_CONTEXT):
+        tick = Decimal("0.01")
+        assert to_tick(Decimal("88.995"), tick, ROUND_FLOOR) == Decimal("88.99")
+        assert to_tick(Decimal("111.005"), tick, ROUND_CEILING) == Decimal("111.01")
+        # already on the grid: rounding must not move it in either direction
+        assert to_tick(Decimal("89"), tick, ROUND_FLOOR) == Decimal("89")
+        assert to_tick(Decimal("89"), tick, ROUND_CEILING) == Decimal("89")

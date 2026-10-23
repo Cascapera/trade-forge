@@ -71,6 +71,19 @@ def test_a_zero_contract_size_is_refused() -> None:
         an_instrument(contract_size=Decimal(0))
 
 
+@pytest.mark.parametrize("hours", [14.5, -14.5])
+def test_a_broker_clock_no_timezone_has_is_refused(hours: float) -> None:
+    """A clock is a timezone: within fourteen hours of UTC, both ways (30/09)."""
+    with pytest.raises(ValueError, match="clock sits within"):
+        an_instrument(server_offset=dt.timedelta(hours=hours))
+
+
+@pytest.mark.parametrize("hours", [14, -14, -5.5])
+def test_the_ends_of_the_inhabited_world_are_clocks(hours: float) -> None:
+    clock = dt.timedelta(hours=hours)
+    assert an_instrument(server_offset=clock).server_offset == clock
+
+
 def test_an_order_for_no_volume_is_refused() -> None:
     with pytest.raises(ValueError, match="volume must be positive"):
         an_order(volume=Decimal(0))

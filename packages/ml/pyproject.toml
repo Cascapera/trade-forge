@@ -1,0 +1,33 @@
+[project]
+name = "tradeforge-ml"
+version = "0.1.0"
+description = "Meta-labeling (ADR-0031): the event base a model learns from, and later the models. Offline, out of the API's and the workers' images."
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+dependencies = [
+    # The runs and their trades are read from the database the API writes.
+    "tradeforge-db",
+    "pyarrow>=18.1",
+    # The variables (ADR-0031, rule 1), from the collector's Parquet files, with numpy.
+    "tradeforge-engine",
+    "numpy>=2.0",
+    # The sessions are read in their cities' clocks (`zoneinfo`); Windows has no time zone
+    # database of its own, so it comes as a package there.
+    "tzdata>=2024.1; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+# The models (`model`, `train`) — out of the API's and the workers' images (ADR-0031): those
+# install this package for its event base and replay, and scikit-learn brings scipy, ~100 MB
+# no worker reads. The root's dev group installs it where models are trained and tested.
+models = ["scikit-learn>=1.5"]
+
+[project.scripts]
+tradeforge-ml = "tradeforge_ml.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tradeforge_ml"]

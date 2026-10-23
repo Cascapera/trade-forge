@@ -1,0 +1,594 @@
+"""One order from the queue to the venue — with no terminal, no queue and no clock that ticks.
+
+The point of the split this file tests: the code that *can lose money* is one small class
+(`MT5Gateway`), and every decision that leads to calling it is here, runnable on Linux in CI.
+
+⚠️ The fake gateway is not a stand-in for MT5 and must not be read as one. It answers the four
+questions `OrderGateway` asks and nothing else — what a real terminal does with a request is
+`test_gateway_smoke.py`'s business, against a real terminal. A fake that pretended to be MT5
+would agree with correct code and with wrong code alike, which this project has already paid for.
+"""
+
+import datetime as dt
+from collections.abc import Sequence
+from decimal import Decimal
+from typing import Any
+
+import pytest
+
+from tradeforge_engine.domain import OrderRequest, Side, SignalKind
+from tradeforge_executor.gateway import Placement
+from tradeforge_executor.router import Outcome, Router, start_of_day
+from tradeforge_executor.safety import KillSwitch, Limits
+from tradeforge_executor.wire import (
+    HeldPosition,
+    Instruction,
+    WireCancel,
+    WireModifyStop,
+    WireOrder,
+    order_fields,
+    order_from_fields,
+)
+
+NOON = dt.datetime(2026, 8, 25, 12, tzinfo=dt.UTC)
+
+
+def an_order(**overrides: Any) -> WireOrder:
+    values: dict[str, Any] = {
+        "symbol": "EURUSD",
+        "side": Side.LONG,
+        "intent": SignalKind.ENTRY,
+        "volume": Decimal("0.10"),
+        "decided_at": NOON,
+        "stop_loss": Decimal("1.09500"),
+    }
+    values.update(overrides)
+    return WireOrder(client_id="zone-42", session_id="s-1", request=OrderRequest(**values))
+
+
+def a_placement(
+    *,
+    accepted: bool = True,
+    volume: str = "0.10",
+    deal: int | None = 555,
+    spread: str = "0.00002",
+) -> Placement:
+    """A venue answer. ``deal=None`` is the *resting* shape -- accepted, nothing executed.
+
+    ⚠️ The two are not interchangeable, and `Placement.__post_init__` now refuses to let this
+    helper pretend otherwise: a filled volume without a deal ticket is an answer no terminal
+    gives. Measured -- a resting buy limit comes back `retcode=10009`, `volume` echoed, `deal=0`.
+    """
+    executed = accepted and deal is not None
+    return Placement(
+        accepted=accepted,
+        ticket=99 if accepted else None,
+        filled_volume=Decimal(volume) if executed else Decimal(0),
+        price=Decimal("1.10000") if executed else None,
+        retcode=10009 if accepted else 10013,
+        comment="done" if accepted else "invalid request",
+        raw={"retcode": 10009 if accepted else 10013},
+        deal=deal if executed else None,
+        spread=Decimal(spread) if executed else None,
+    )
+
+
+class FakeGateway:
+    """The four questions `OrderGateway` asks, and a record of what it was told to send."""
+
+    def __init__(  # noqa: PLR0913 — keyword-only knobs on a double, not a real signature
+        self,
+        *,
+        balance: str = "10000",
+        realised: str = "0",
+        positions: int = 0,
+        placement: Placement | None = None,
+        broken: str | None = None,
+        withdraws: bool = True,
+        holding: HeldPosition | None = None,
+        holding_readable: bool = True,
+    ) -> None:
+        self._balance = Decimal(balance)
+        self._realised = Decimal(realised)
+        self._positions = positions
+        self._placement = placement or a_placement()
+        self._broken = broken
+        self.sent: list[tuple[OrderRequest, str]] = []
+        self.withdrawn: list[str] = []
+        self._withdraws = withdraws
+        self.holding = holding
+        self._holding_readable = holding_readable
+        self.asked_held: list[str] = []
+        self.tightened: list[tuple[int, Decimal]] = []
+        self.asked_since: dt.datetime | None = None
+
+    def send(self, order: OrderRequest, *, client_id: str) -> Placement:
+        if self._broken == "send":
+            raise ConnectionError("the terminal went away mid-order")
+        self.sent.append((order, client_id))
+        return self._placement
+
+    def withdraw(self, client_id: str) -> Placement:
+        """Whatever the double was told to answer, plus a record that it was asked."""
+        self.withdrawn.append(client_id)
+        return Placement(
+            accepted=self._withdraws,
+            ticket=77 if self._withdraws else None,
+            filled_volume=Decimal(0),
+            price=None,
+            retcode=10009 if self._withdraws else 10013,
+            comment="removed" if self._withdraws else "no such order",
+            raw={"withdrew": 1 if self._withdraws else 0},
+        )
+
+    def holdings(self) -> tuple[HeldPosition, ...]:
+        """Everything the double was told this executor is holding, across every symbol."""
+        return () if self.holding is None else (self.holding,)
+
+    def held(self, symbol: str) -> HeldPosition | None:
+        """What the double was told this executor is holding.
+
+        ⚠️ `None` is "nothing of ours is open" and `holding_readable=False` is "the terminal could
+        not be asked". Two different answers with two different remedies, so two different knobs:
+        collapsing them would make a broken terminal indistinguishable from a flat account.
+        """
+        self.asked_held.append(symbol)
+        if not self._holding_readable:
+            raise ConnectionError("the terminal went away mid-read")
+        return self.holding
+
+    def tighten(self, ticket: int, stop_loss: Decimal) -> Placement:
+        """⚠️ Recorded from a real `TRADE_ACTION_SLTP` on 26/08: `retcode=10009` with `deal=0`
+        and `order=0`. Nothing executed, so `Placement` reads it as a fill of nothing — which is
+        exactly right for a stop move, and comes free from the `deal` gate added in #155."""
+        self.tightened.append((ticket, stop_loss))
+        return Placement(
+            accepted=True,
+            ticket=ticket,
+            filled_volume=Decimal(0),
+            price=None,
+            retcode=10009,
+            comment="Request executed",
+            raw={"retcode": 10009, "deal": 0, "order": 0},
+        )
+
+    def balance(self) -> Decimal:
+        if self._broken == "account":
+            raise ConnectionError("no account")
+        return self._balance
+
+    def open_positions(self) -> int:
+        return self._positions
+
+    def realised_since(self, moment: dt.datetime) -> Decimal:
+        self.asked_since = moment
+        return self._realised
+
+
+class Switch:
+    def __init__(self, engaged: bool, *, name: str = "test") -> None:
+        self._engaged = engaged
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def engaged(self) -> bool:
+        return self._engaged
+
+
+def route(  # noqa: PLR0913 — the router's inputs, with defaults
+    gateway: FakeGateway,
+    *,
+    order: Instruction | None = None,
+    limits: Limits | None = None,
+    switches: Sequence[KillSwitch] = (),
+    now: dt.datetime = NOON,
+    core_is_alive: bool = True,
+) -> Outcome:
+    router = Router(gateway=gateway, limits=limits or Limits(), switches=switches)
+    return router.route_one(order or an_order(), now=now, core_is_alive=core_is_alive)
+
+
+# --------------------------------------------------------------------------------------------
+# The happy path, and the one thing that must never happen on any other
+# --------------------------------------------------------------------------------------------
+
+
+def test_an_admitted_order_reaches_the_venue() -> None:
+    gateway = FakeGateway()
+
+    outcome = route(gateway)
+
+    assert outcome.allowed is True
+    assert outcome.sent is True
+    assert len(gateway.sent) == 1
+    assert gateway.sent[0][1] == "zone-42", "the client id did not travel with the order"
+
+
+@pytest.mark.parametrize(
+    ("label", "kwargs"),
+    [
+        ("kill switch", {"switches": [Switch(True, name="handle")]}),
+        ("silent core", {"core_is_alive": False}),
+        ("volume cap", {"limits": Limits(max_volume=Decimal("0.01"))}),
+        ("window", {"limits": Limits(window_open=dt.time(1), window_close=dt.time(2))}),
+    ],
+)
+def test_a_refused_order_never_reaches_the_venue(label: str, kwargs: Any) -> None:
+    """⚠️ **The property that matters more than any other in this file.** A safeguard that
+    refuses *after* the order went out is not a safeguard; it is a log entry. Asserted on the
+    gateway's own record rather than on the verdict, because the verdict is what the refusal
+    already says and the question here is whether anything moved.
+    """
+    gateway = FakeGateway()
+
+    outcome = route(gateway, **kwargs)
+
+    assert outcome.allowed is False, label
+    assert gateway.sent == [], f"{label}: the order was sent anyway"
+    assert outcome.placement is None
+
+
+def test_a_refusal_carries_the_rule_that_refused_it() -> None:
+    outcome = route(FakeGateway(), switches=[Switch(True, name="the-handle")])
+
+    assert outcome.reason is not None
+    assert "the-handle" in outcome.reason
+
+
+# --------------------------------------------------------------------------------------------
+# A terminal that is not answering
+# --------------------------------------------------------------------------------------------
+
+
+def test_an_account_that_cannot_be_read_is_a_refusal_not_a_crash(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """⚠️ Reading the account is the first thing that touches the terminal, and a terminal that
+    is not answering is exactly when an order must not go out.
+
+    Letting the exception escape would abort the loop and leave the entry unacknowledged — so
+    the same order would be retried against the same dead terminal, for ever.
+    """
+    gateway = FakeGateway(broken="account")
+
+    with caplog.at_level("CRITICAL"):
+        outcome = route(gateway)
+
+    assert outcome.allowed is False
+    assert outcome.reason is not None
+    assert "terminal could not be read" in outcome.reason
+    assert gateway.sent == []
+
+
+def test_a_venue_that_throws_mid_order_is_an_outcome_not_a_crash(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """⚠️ Recorded, not raised. The alternative is a loop that dies on the first timeout and an
+    order whose fate nobody wrote down — which is the one thing `order_audit` exists to prevent.
+    """
+    gateway = FakeGateway(broken="send")
+
+    with caplog.at_level("CRITICAL"):
+        outcome = route(gateway)
+
+    assert outcome.allowed is False
+    assert outcome.reason is not None
+    assert "venue could not be reached" in outcome.reason
+
+
+def test_an_order_the_venue_rejects_is_reported_as_not_sent() -> None:
+    """⚠️ Separates "we sent it" from "it worked". `allowed` is this machine's answer and
+    `sent` is the venue's, and collapsing them would file a broker rejection as a safeguard
+    refusal — sending an investigation to the wrong machine."""
+    gateway = FakeGateway(placement=a_placement(accepted=False))
+
+    outcome = route(gateway)
+
+    assert outcome.allowed is True, "our own rules did admit it"
+    assert outcome.sent is False, "but the venue did not take it"
+    assert outcome.placement is not None
+    assert outcome.placement.retcode == 10013
+
+
+# --------------------------------------------------------------------------------------------
+# The account snapshot the safeguards judge
+# --------------------------------------------------------------------------------------------
+
+
+def test_the_daily_loss_is_counted_from_midnight_utc() -> None:
+    """⚠️ UTC, not the broker's day and not the machine's. A cap that resets on a different clock
+    from the one the window is written in resets in the middle of a session, and the person who
+    set it to 2% could not say when it starts."""
+    gateway = FakeGateway()
+
+    route(gateway, now=dt.datetime(2026, 8, 25, 23, 30, tzinfo=dt.UTC))
+
+    assert gateway.asked_since == dt.datetime(2026, 8, 25, 0, 0, tzinfo=dt.UTC)
+
+
+def test_the_day_starts_at_utc_midnight_even_for_a_clock_in_another_zone() -> None:
+    """01:00 on the 26th at UTC+3 is 22:00 on the **25th** in UTC — so the day that matters
+    started at midnight on the 25th. Reading the wall-clock date would reset the cap an hour
+    early and let a bad night start again."""
+    at_broker = dt.datetime(2026, 8, 26, 1, tzinfo=dt.timezone(dt.timedelta(hours=3)))
+
+    assert start_of_day(at_broker) == dt.datetime(2026, 8, 25, 0, 0, tzinfo=dt.UTC)
+
+
+def test_the_position_count_the_safeguards_see_comes_from_the_venue() -> None:
+    """Not from a counter this process keeps. A count kept in memory is a count that is wrong
+    after a restart, and after a restart is exactly when it matters."""
+    gateway = FakeGateway(positions=1)
+
+    outcome = route(gateway, limits=Limits(max_positions=1))
+
+    assert outcome.allowed is False
+    assert outcome.reason is not None
+    assert "already open" in outcome.reason
+
+
+def test_the_loss_cap_uses_the_balance_the_venue_reports() -> None:
+    """2% of 1 000 is 20. An implementation with a hard-coded denominator would admit this."""
+    gateway = FakeGateway(balance="1000", realised="-20")
+
+    assert route(gateway).allowed is False
+
+
+# --------------------------------------------------------------------------------------------
+# What crosses the wire
+# --------------------------------------------------------------------------------------------
+
+
+def test_an_order_survives_the_round_trip_unchanged() -> None:
+    """⚠️ The encoding and the decoding are inverse, and the prices come back as the same
+    `Decimal` they went in as. A float round-trip at the edge would give back exactly the
+    precision the engine runs in `Decimal` to keep."""
+    order = an_order(
+        take_profit=Decimal("1.11000"), limit_price=Decimal("1.09800"), reason="zone-42 armed"
+    )
+
+    fields = order_fields(order.request, session_id=order.session_id, client_id=order.client_id)
+    back = order_from_fields(fields)
+
+    assert back == order
+    assert str(back.request.limit_price) == "1.09800", "the quantum changed"
+
+
+def test_an_absent_price_is_absent_from_the_wire_not_empty() -> None:
+    """⚠️ Redis has no NULL. Written as `""`, the empty string would be the only thing telling
+    "no take profit" from "a take profit of nothing" — and `Decimal("")` raises where `None`
+    reads."""
+    order = an_order(take_profit=None, limit_price=None)
+
+    fields = order_fields(order.request, session_id="s-1", client_id="c-1")
+
+    assert "take_profit" not in fields
+    assert "limit_price" not in fields
+    assert order_from_fields(fields).request.take_profit is None
+
+
+def test_a_malformed_entry_raises_rather_than_defaulting() -> None:
+    """⚠️ A `fields.get("volume", "0")` would turn a malformed entry into an order for nothing —
+    sent successfully, recorded as fine — and the session would spend the day believing it had a
+    position. A `KeyError` is a message on a dead-letter path; a zero-volume order is a lie."""
+    fields = order_fields(an_order().request, session_id="s-1", client_id="c-1")
+    del fields["volume"]
+
+    with pytest.raises(KeyError, match="volume"):
+        order_from_fields(fields)
+
+
+def test_every_field_on_the_wire_is_a_string() -> None:
+    """A stream entry has no other shape. A `Decimal` handed to `xadd` is an error at the socket,
+    and a `float` is a wrong number that never raises."""
+    fields = order_fields(an_order().request, session_id="s-1", client_id="c-1")
+
+    assert all(isinstance(value, str) for value in fields.values())
+
+
+def test_an_exit_reaches_the_venue_with_the_kill_switch_engaged() -> None:
+    """⚠️ The wiring, not the rule. `test_safety.py` proves `admits` exempts an exit; this proves
+    the router actually **tells** it which kind of order it is holding.
+
+    Asserted on the gateway's own record, the same way the refusal test above is: the question is
+    whether anything moved, and a router that judged correctly and then failed to send would look
+    identical from the verdict alone.
+    """
+    gateway = FakeGateway()
+
+    outcome = route(
+        gateway,
+        order=an_order(intent=SignalKind.EXIT),
+        switches=[Switch(True, name="the-handle")],
+    )
+
+    assert outcome.allowed is True, "the handle locked the door from inside"
+    assert [client_id for _order, client_id in gateway.sent] == ["zone-42"], (
+        "the exit was allowed and then not sent"
+    )
+    (sent, _name) = gateway.sent[0]
+    assert sent.intent is SignalKind.EXIT, "something other than the exit went out"
+
+
+def test_an_entry_with_the_same_switch_still_never_reaches_the_venue() -> None:
+    """The separating half. Without it the test above passes just as well against a router that
+    stopped consulting the safeguards at all."""
+    gateway = FakeGateway()
+
+    outcome = route(
+        gateway,
+        order=an_order(intent=SignalKind.ENTRY),
+        switches=[Switch(True, name="the-handle")],
+    )
+
+    assert outcome.allowed is False
+    assert gateway.sent == [], "the switch stopped guarding entries"
+
+
+# --------------------------------------------------------------------------------------------
+# The other two instructions on the same stream
+# --------------------------------------------------------------------------------------------
+
+
+def a_cancel(*, client_id: str = "zone-42", session_id: str = "s-1") -> WireCancel:
+    return WireCancel(client_id=client_id, session_id=session_id)
+
+
+def a_stop_move(*, symbol: str = "EURUSD", stop_loss: str = "1.16500") -> WireModifyStop:
+    return WireModifyStop(
+        client_id="s-1-4",
+        session_id="s-1",
+        symbol=symbol,
+        stop_loss=Decimal(stop_loss),
+        decided_at=NOON,
+    )
+
+
+def test_a_cancel_reaches_the_venue_and_is_reported_as_withdrawn() -> None:
+    gateway = FakeGateway()
+
+    outcome = route(gateway, order=a_cancel())
+
+    assert outcome.allowed is True
+    assert gateway.withdrawn == ["zone-42"]
+    assert gateway.sent == [], "a cancel was sent as an order"
+
+
+def test_a_cancel_passes_a_raised_kill_switch() -> None:
+    """It withdraws an order that has not become a position. It cannot open anything, and a
+    switch that refuses it leaves the order armed at the venue after the handle was pulled."""
+    gateway = FakeGateway()
+
+    outcome = route(gateway, order=a_cancel(), switches=[Switch(True, name="the-handle")])
+
+    assert outcome.allowed is True
+    assert gateway.withdrawn == ["zone-42"], "the handle left the order armed"
+
+
+def test_a_cancel_that_found_nothing_is_still_an_accepted_instruction() -> None:
+    """⚠️ The order may have filled while the cancel was in flight, been cancelled already, or
+    never have reached the venue. In live that is a race, not a fault — and the trail records
+    that it withdrew nothing rather than that something failed."""
+    gateway = FakeGateway(withdraws=False)
+
+    outcome = route(gateway, order=a_cancel())
+
+    assert gateway.withdrawn == ["zone-42"]
+    assert outcome.allowed is True, "this machine refused it; it did not"
+    assert outcome.placement is not None
+    assert outcome.placement.accepted is False, "the venue's answer was overwritten"
+
+
+def a_long(*, stop_loss: str | None = "1.16000", ticket: int = 47_096_513) -> HeldPosition:
+    return HeldPosition(
+        ticket=ticket,
+        symbol="EURUSD",
+        side=Side.LONG,
+        volume=Decimal("0.01"),
+        price_open=Decimal("1.16524"),
+        stop_loss=Decimal(stop_loss) if stop_loss is not None else None,
+    )
+
+
+def test_a_tightening_stop_reaches_the_venue_by_the_ticket_we_established() -> None:
+    """⚠️ The ticket comes from `held()`, which filtered by magic — and it has to.
+
+    `TRADE_ACTION_SLTP` carries no magic and no symbol; measured on 26/08, the terminal echoes
+    back `magic=0, symbol=''`. The position ticket is the entire identity of the instruction, so
+    a ticket that did not come from that filter could belong to a manual trade or to another
+    expert advisor.
+    """
+    gateway = FakeGateway(holding=a_long(stop_loss="1.16000"))
+
+    outcome = route(gateway, order=a_stop_move(stop_loss="1.16200"))
+
+    assert outcome.allowed is True
+    assert gateway.asked_held == ["EURUSD"], "the position was never established as ours"
+    assert gateway.tightened == [(47_096_513, Decimal("1.16200"))]
+
+
+def test_a_loosening_stop_is_refused_here_because_the_venue_will_not_refuse_it() -> None:
+    """⚠️ **The measurement this whole path exists for.**
+
+    On 26/08 a real position on the demo had its stop moved from 1.16214 to 1.15714 — further
+    from price, more risk — and MT5 answered `retcode=10009` and did it. The venue has no opinion
+    about the direction. The position was sized against the stop it already had, so a sign error
+    upstream is one accepted instruction away from risk nobody authorised.
+    """
+    gateway = FakeGateway(holding=a_long(stop_loss="1.16200"))
+
+    outcome = route(gateway, order=a_stop_move(stop_loss="1.16000"))
+
+    assert outcome.allowed is False
+    assert outcome.reason is not None
+    assert "loosens it" in outcome.reason
+    assert gateway.tightened == [], "the loosening reached the venue, which would have done it"
+
+
+def test_a_short_tightens_downwards() -> None:
+    """The mirror, and the one a sign error produces: for a short, *lower* is tighter. A check
+    written for one side only passes every long test in this file and inverts the rule for half
+    the trades the strategy takes."""
+    holding = HeldPosition(
+        ticket=1,
+        symbol="EURUSD",
+        side=Side.SHORT,
+        volume=Decimal("0.01"),
+        price_open=Decimal("1.16524"),
+        stop_loss=Decimal("1.17000"),
+    )
+
+    tighter = route(FakeGateway(holding=holding), order=a_stop_move(stop_loss="1.16800"))
+    looser = route(FakeGateway(holding=holding), order=a_stop_move(stop_loss="1.17200"))
+
+    assert tighter.allowed is True, "a short was refused a tightening"
+    assert looser.allowed is False, "a short was allowed a loosening"
+
+
+def test_the_same_level_is_accepted_rather_than_punished() -> None:
+    """A strategy recomputing the same level every bar is not asking for anything. `>=`, not `>`
+    — the protocol says so, and a `>` would turn an idempotent instruction into a daily refusal
+    an operator has to learn to ignore."""
+    gateway = FakeGateway(holding=a_long(stop_loss="1.16200"))
+
+    assert route(gateway, order=a_stop_move(stop_loss="1.16200")).allowed is True
+
+
+def test_arming_a_stop_where_there_was_none_is_always_a_tightening() -> None:
+    """A position with no protection at all can only be made safer by acquiring some.
+    `Broker.modify_stop` says the same thing from the other end."""
+    gateway = FakeGateway(holding=a_long(stop_loss=None))
+
+    assert route(gateway, order=a_stop_move(stop_loss="1.10000")).allowed is True
+    assert gateway.tightened == [(47_096_513, Decimal("1.10000"))]
+
+
+def test_a_stop_move_with_no_position_of_ours_is_refused() -> None:
+    """The account may well hold something — just not under this executor's magic number. Moving
+    a stop by ticket is the one instruction where that distinction is the whole safety story."""
+    gateway = FakeGateway(holding=None)
+
+    outcome = route(gateway, order=a_stop_move())
+
+    assert outcome.allowed is False
+    assert outcome.reason is not None
+    assert "no position of ours" in outcome.reason
+    assert gateway.tightened == []
+
+
+def test_a_position_that_cannot_be_read_is_a_refusal_not_a_crash() -> None:
+    """⚠️ Distinct from "nothing of ours is open", and the reasons say which. A terminal that is
+    not answering is exactly when an instruction must not be sent — and letting the exception
+    escape would abort the loop and leave the entry unacknowledged, to be retried against the
+    same dead terminal for ever."""
+    gateway = FakeGateway(holding_readable=False)
+
+    outcome = route(gateway, order=a_stop_move())
+
+    assert outcome.allowed is False
+    assert outcome.reason is not None
+    assert "could not be read" in outcome.reason
+    assert gateway.tightened == []

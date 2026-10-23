@@ -1,0 +1,168 @@
+# ADR-0026 — O time frame superior nasce dentro do setup
+
+- **Status**: aceito
+- **Data**: 2026-09-08
+- **Contexto do PR**: PR-205
+
+## Contexto
+
+Ele ditou o primeiro **filtro** das entradas de smart money: *"podemos usar qualquer região do
+time frame superior [...] quando o preço atingir uma região no H4 qualquer que ainda não foi
+mitigada, a partir deste ponto ele libera de fazer uma entrada no 15 minutos, e é somente uma
+entrada por região de H4"*. A entrada continua sendo o CHoCH (ou a continuação) no M15; o que
+muda é **se ela pode ser procurada**.
+
+O `sdd.md` e o `loop.py` foram escritos para **um** fluxo de barras: `Context` carrega uma vela,
+a que acabou de fechar, e essa é a regra anti-lookahead feita estrutura (§5.1 — *"a estratégia
+não é entregue a lista de velas e pedida educadamente para não olhar adiante"*). Um filtro que lê
+o H4 precisa de barras de H4 que **nenhuma** parte da engine fornece hoje.
+
+## Decisão
+
+As barras do time frame superior são **montadas dentro do setup**, a partir das barras que ele já
+recebe (`BarAggregator`), e os detectores dele — `MarketStructure` e `OrderBlockDetector`, os
+mesmos que já são a transcrição do indicador dele — rodam em cima delas dentro de um portão
+(`HigherTimeframeGate`). Uma região de H4 existe a partir do **fechamento** da barra de H4 que a
+revelou, nunca antes. O loop, o `Context`, o broker e o live não mudam uma linha.
+
+## Alternativas consideradas
+
+| Alternativa | Prós | Contras |
+|-------------|------|---------|
+| **(a) Segundo fluxo no loop**: `Context` ganha a barra de H4 corrente e o `run()` recebe duas séries | O agregador some; o H4 vem do venue, alinhado ao relógio do servidor | Muda o contrato do loop, do `Context`, do `iter_run`, do splice do live e do aquecimento para **todos** os setups, por causa de um filtro de dois; duas séries que precisam estar alinhadas no tempo são uma nova classe de bug de lookahead (a barra de H4 "corrente" ainda não fechou) |
+| **(b) A API pré-calcula as regiões de H4** e entrega como dado ao setup | Engine não sabe o que é H4 | A regra (mitigação, rompimento, 2x) passa a viver **fora** da engine, e no live teria que ser recalculada por outro processo — a invariante §5.3 (estratégia única, backtest = live) quebra silenciosamente |
+| **(c) Montar o H4 dentro do setup** a partir do fluxo base | Um fluxo, uma engine, mesmo código em backtest e live; anti-lookahead por construção; os detectores dele reutilizados sem cópia | ~~As barras fecham no relógio **UTC**~~ (resolvido na PR-208, ver a revisão); a estrutura de H4 precisa de aquecimento 16× mais longo em barras de M15 |
+
+## Trade-off aceito
+
+O relógio — **e ele durou um dia**. Ver a revisão abaixo antes de ler este parágrafo como estado
+atual do código.
+
+Um H4 do MetaTrader fecha em 00h/04h/08h **do servidor da corretora**, que pode estar deslocado do
+UTC em horas; o nosso fechava em 00h/04h/08h UTC. A região de H4 que a engine marcava podia diferir
+da que ele vê no gráfico por esse deslocamento. Ficou registrado em `specs/backlog.md` como
+pendência conhecida, com o âncora como candidato a parâmetro *no dia em que a diferença aparecesse
+num backtest real*. O aquecimento não é problema: o live aquece sobre **todo** o histórico (39 mil
+barras na última medição), o que dá mais de 2 mil barras de H4.
+
+## Revisão — 2026-09-09 (PR-208)
+
+⚠️ **O trade-off acima foi recusado por ele no dia seguinte**, antes de qualquer backtest expor a
+diferença: *"sempre levar em consideração o horario do mt5"*. Não era um custo aceitável, era um
+resultado errado esperando para acontecer — o modo de falha é um backtest inteiro com todas as
+regiões deslocadas e nenhum número parecendo errado.
+
+O que mudou: `BarAggregator` recebe `offset`, e conta cada fronteira a partir da meia-noite **no
+relógio do broker**; o documento carrega `htf_offset` (horas à frente do UTC, meias horas
+incluídas) e a semântica **exige** os dois juntos, recusando também o relógio sem `htf`
+(⚠️ *esta segunda metade durou um dia — ver a revisão da PR-213 abaixo*). Não há
+default: zero seria afirmar que o servidor da corretora usa UTC, o que é falso para a maioria
+delas. Barra que atravessa a fronteira de um balde levanta `EngineError` em vez de ser dobrada no
+balde errado — a guarda pega **desalinhamento, não mentira**.
+
+A decisão principal deste ADR — montar as barras de cima **dentro** do setup, em vez de um segundo
+fluxo no loop ou de a API pré-calcular — não mudou, e a alternativa (a) continua recusada pelos
+mesmos motivos. O que a revisão remove é a linha da tabela que dava "as barras fecham no relógio
+UTC" como contra da opção (c): não fecham mais.
+
+O que fica: o offset é **um número fixo** por corrida, então horário de verão desloca metade de um
+backtest longo. O coletor tem a mesma limitação. Está em `specs/backlog.md`.
+
+## Consequências
+
+- `packages/engine/src/tradeforge_engine/higher_timeframe.py`: `BarAggregator` e
+  `HigherTimeframeGate`. O portão guarda o próprio registro de toque na resolução da barra base,
+  porque a mitigação do detector de H4 só é carimbada quando a barra de H4 fecha — até 16 barras
+  de M15 depois do pavio que tocou.
+- `StructureStrategy` ganha `htf` e `timeframe`; o portão é alimentado no topo do `on_bar`, antes
+  do ramo de posição aberta, e recusa no `_may_arm`, o ponto único onde toda regra sobre "esta
+  região pode ser negociada" já passa. A liberação é **gasta ao armar**, não ao preencher, porque
+  a resposta dele foi que ordem cancelada sem preencher gasta a chance.
+- `TIMEFRAME_DELTAS` mudou de `strategy.py` para `domain.py`, porque a fábrica de setups precisa
+  dela e `strategy` importa a fábrica. `build_setup` recebe o timeframe do documento.
+- DSL: `StructureParams.htf: Timeframe | None = None`; a semântica recusa um `htf` que não seja
+  mais grosso que o `timeframe` do documento. Primeiro enum anulável da DSL: a web aprendeu a
+  desenhar "off" em vez de "choose…", e o formulário grava `htf: null` como já gravava `max_bos`.
+- O que fica em aberto (backlog): o âncora do relógio. ~~Desenhar as regiões de H4 no gráfico~~
+  (PR-210); ~~a grade de estudo não sabe variar `htf` incluindo "off"~~ (PR-213, revisão abaixo).
+
+## Revisão — 2026-09-09 (PR-213): a regra ficou assimétrica
+
+⚠️ **Metade da regra que a revisão da PR-208 tinha acabado de escrever foi retirada no mesmo
+dia.** A semântica continua recusando `htf` sem `htf_offset`; deixou de recusar `htf_offset` sem
+`htf`.
+
+O motivo é um uso concreto. A grade de estudo é um **produto cartesiano**: para perguntar "a
+região de cima se paga?" o eixo varia `htf` entre `off` e `H4`, e todo o resto do documento tem
+que ficar parado — inclusive o relógio. Então o ponto sem filtro carrega, necessariamente, um
+relógio que não configura nada. A recusa tornava impossível **pedir** a comparação que justifica
+o filtro, e o ponto que ela barrava é justamente o controle contra o qual os outros são medidos.
+
+A assimetria é o argumento, e não um descuido. Os dois lados têm modos de falha de tamanhos
+diferentes:
+
+| Documento | O que acontece | Veredito |
+|-----------|----------------|----------|
+| `htf` sem `htf_offset` | O portão é montado e as barras de cima fecham no relógio errado: **todas** as regiões deslocadas, backtest inteiro errado, nenhum número parecendo estranho | **recusado** |
+| `htf_offset` sem `htf` | Nenhum portão é montado e o número nunca é lido — `setups.py` só o consulta dentro do `else` de `if htf is None` | **aceito** |
+
+O que se perde: um eixo de estudo sobre `htf_offset` num documento com `htf: null` passa a ser
+aceito e produz N backtests idênticos — um mapa de calor chapado, que é o modo de falha que a
+própria API classifica como o único totalmente silencioso. Está em `specs/backlog.md`, junto com
+o resto da validação semântica que o navegador ainda não faz.
+
+## Revisão — 2026-09-26 (PR-326): sem relógio é UTC
+
+⚠️ **A regra de 09/09 foi revertida por ele**: *"altere o padrão para usar sempre null, não vamos
+fazer o ajuste"*. `htf` sem `htf_offset` deixou de ser recusado; o `null` agora quer dizer
+**UTC**, onde as velas guardadas já estão.
+
+O motivo foi uma varredura real: a grade do "CONTINUATION FULL OTIMIZATION" variava `htf` em sete
+valores sem relógio ao lado, e **todos** os ~435 mil pontos por tempo gráfico eram recusados — o
+botão devolvia 422 ("no combination in this sweep can run"). Nenhuma estratégia salva tinha
+`htf_offset`.
+
+| Documento | O que acontece | Veredito |
+|-----------|----------------|----------|
+| `htf` sem `htf_offset` | Barras de cima cortadas em UTC; regiões deslocadas do gráfico do MT5 pelo offset da corretora | **aceito** (antes: recusado) |
+| `htf` com `htf_offset` | Barras cortadas no relógio do servidor, como antes | aceito |
+
+O que se aceita perder: as regiões do H4/D1 não batem com as do gráfico do MT5 enquanto a
+corretora não estiver em UTC. É uma diferença conhecida e escolhida, não silenciosa: está aqui, no
+docstring de `StructureParams` e na legenda da tela (`empty = UTC`). A palavra-chave
+`requiredWith` do schema ficou sem nenhum campo que a use; o leitor dela no front continua, testado
+por `params.test.ts`.
+
+## Revisão — 2026-09-30: o relógio é do ativo, não da estratégia
+
+⚠️ **Decisão dele**: *"htf offset não vamos usar em nenhum time frame, vamos adotar o horário do
+servidor mt5 como real"*. As barras de cima passam a ser cortadas no relógio do servidor da
+corretora, e esse relógio vem do **ativo** (`instruments.server_offset`, migração 0042;
+`InstrumentSpec.server_offset` no motor), não do documento.
+
+O motivo foi outra varredura real (`87b0efc0`, UKOIL, 29/09): com o corte em UTC, a barra H4 das
+21:00 UTC — a da meia-noite do servidor — atravessa a meia-noite UTC do D1/W1 de cima, o
+`BarAggregator` recusa, e **todos** os 32.832 runs de H4 e D1 falharam.
+
+Medido antes de decidir: todo parquet guardado (UKOIL, EURUSD, AUDUSD, 2009 a 2026) foi gravado
+com o servidor menos **3 h fixas**, no verão e no inverno — o D1 abre sempre às 21:00 UTC. O
+coletor subtrai um número só (`--server-offset` ou o medido na conexão), então o relógio do
+servidor é sempre "hora gravada + esse número", sem ambiguidade de horário de verão.
+
+| Onde | Antes (26/09) | Agora (30/09) |
+|------|---------------|---------------|
+| documento | `htf_offset` número ou `null` (= UTC) | só `null` — um número é recusado pelo schema e pelo motor |
+| ativo | — | `server_offset` (preenchido com 3 h nos existentes; o coletor grava o que usou) |
+| run | o `htf_offset` do documento | o `server_offset` do ativo, guardado em `instrument_spec` |
+| motor | 0.4.0 | **0.5.0** (todo run com `htf` muda de resultado) |
+
+**Por que estreitar em vez de remover o campo:** as 19 estratégias salvas têm `htf_offset: null`;
+removido, o schema recusaria todas (`extra="forbid"`) ou exigiria `schema_version` nova, que o
+motor recusa. Estreitado para `null`, o `schema_version` fica 1.0 — o mesmo caminho de estreitamentos
+anteriores.
+
+**O que se perde:** um mesmo ativo não pode mais ser testado cortado em dois relógios; se um dia
+precisar, é outro ativo (ou outra coleta). **Risco anotado no backlog:** se uma coleta futura medir
+o relógio no inverno (2 h) e gravar por cima de dados gravados com 3 h, o mesmo ativo fica com
+barras deslocadas de dois jeitos — o coletor deveria recusar gravar com um relógio diferente do que
+o ativo já tem.

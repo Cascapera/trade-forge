@@ -29,12 +29,35 @@ SCHEMA_ERRORS = {
     "unknown_operator.json": "greater_than",
     "zero_candle_offset.json": "candle[-0].high",
     "misspelled_param.json": "perod",
+    # An indicator defined over the whole candle, asked for one price series. The refusal is
+    # the same `extra="forbid"` that catches a typo, doing the other half of its job: a field
+    # the engine could not honour is a request the document believes was granted.
+    "atr_with_a_price_source.json": "source",
+    # The floor on a setup's average (his call, 2026-09-10). A narrowing, and worth a fixture of
+    # its own because the engine would run a period of 2 quite happily — measured: it arms
+    # identically to 3. What refuses it is the published grammar, not arithmetic.
+    "average_period_below_the_floor.json": "greater than or equal to 3",
+    # The broker's clock is the instrument's since 30/09: the field survives only as `null`, so
+    # the documents saved with it stay valid, and a number is the schema's to refuse.
+    "htf_offset_stated.json": "htf_offset",
 }
 
 SEMANTIC_ERRORS = {
     "undeclared_indicator.json": "undeclared indicator 'sma_slow'",
     "take_profit_without_stop.json": "no risk to multiply",
     "no_entry_side.json": "at least one side",
+    # The two halves of the component grammar, and both fail the same silent way if unchecked:
+    # the engine opens no channel by that name, resolves it to `None`, and the condition is false
+    # on every bar of every run — a clean backtest of a rule that was never evaluated.
+    "component_of_a_single_valued_indicator.json": "answers with a single value",
+    "multi_output_indicator_without_a_component.json": "has several outputs",
+    # The two timeframes are each fine on their own; only their order is wrong.
+    "htf_finer_than_the_timeframe.json": "coarser than H1",
+    # ⚠️ Here rather than in `invalid-schema/`, and that placement is the finding. `price.clsoe`
+    # became well-formed the moment the grammar gained `id.component`, and the pattern cannot take
+    # it back: Pydantic compiles `pattern=` with Rust's `regex`, which has no look-around, so
+    # "an identifier that is not `price`" is not expressible there. Meaning is this layer's job.
+    "typo_in_a_price_field.json": "is not a price field",
 }
 
 

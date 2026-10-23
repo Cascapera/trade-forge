@@ -11,7 +11,9 @@ the world looks the same as after running it once.
 
 import datetime as dt
 import logging
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
 
@@ -19,14 +21,24 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tradeforge_collector.gaps import Gap, find_gaps
-from tradeforge_collector.source import MarketDataSource
+from tradeforge_collector.source import MarketDataSource, price_step_of
+from tradeforge_collector.splits import Split, adjust, refuse_unless_the_bars_split, straddled
 from tradeforge_collector.storage import write_candles
 from tradeforge_collector.timeframes import step
-from tradeforge_db.instruments import upsert_dataset, upsert_instruments
+from tradeforge_db.instruments import (
+    CatalogueEntry,
+    refuse_a_new_clock,
+    upsert_dataset,
+    upsert_instruments,
+)
 from tradeforge_db.models import Instrument
+from tradeforge_db.splits import splits_of
 from tradeforge_engine.domain import Candle, InstrumentSpec
 
 logger = logging.getLogger(__name__)
+
+_JUST_BEFORE = dt.timedelta(microseconds=1)
+"""A source's range is inclusive at both ends; a bar's span is not at its end."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +52,12 @@ class BackfillReport:
     date_to: dt.datetime
     parquet_path: str
     gaps: list[Gap]
+    # In ticks, and `None` when the source could not say — never zero, which would claim the
+    # instrument is free to trade. Beside the spec rather than inside it, because the engine
+    # prices a move without consulting a spread: costs are plugged into a run (ADR-07).
+    spread_points: Decimal | None = None
+    price_step: Decimal | None = None
+    """The venue's step when the series' tick is finer (`MT5Source.price_step`, 14/10)."""
 
 
 def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real axis of the job
@@ -51,11 +69,25 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
     start: dt.datetime,
     end: dt.datetime,
     session: Session | None = None,
+    before_write: Callable[[InstrumentSpec], None] | None = None,
+    splits: Sequence[Split] | None = None,
 ) -> BackfillReport:
     """Download a symbol's history, store it, catalogue it, and report the holes.
 
     `session` is optional so the data path can be exercised without a database — the
     Parquet is the product, the catalogue is bookkeeping about it.
+
+    ⚠️ **The clock is checked before a bar is written** (01/10). With a `session`, a symbol
+    that already has data on another server clock is refused here (`refuse_a_new_clock`)
+    rather than when it is catalogued — by then the shifted bars would be in its Parquet.
+    `before_write` is the same question for a caller without a session (`collect`), asked of
+    its journal.
+
+    ⚠️ **The bars are written adjusted for the share's recorded splits** (14/10, see
+    `tradeforge_collector.splits`): read from the session when there is one, or handed in by a
+    caller without one. A download is raw, so it gets every split — after checking that the bars
+    really show the gap of each split they straddle, so a broker that starts sending adjusted
+    history is refused rather than divided twice.
     """
     _require_utc(start, "start")
     _require_utc(end, "end")
@@ -63,13 +95,28 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
         raise ValueError(f"end ({end}) is before start ({start})")
 
     spec = source.instrument(symbol)
+    if session is not None:
+        refuse_a_new_clock(session, spec)
+    if before_write is not None:
+        before_write(spec)
     candles = source.candles(symbol, timeframe, start, end)
     if not candles:
         raise LookupError(f"no candles for {symbol} {timeframe} between {start} and {end}")
 
     _assert_ascending(candles, symbol, timeframe)
 
-    parquet_path = write_candles(root, symbol, timeframe, candles)
+    if splits is None:
+        splits = () if session is None else tuple(map(Split.of, splits_of(session, symbol)))
+    refuse_unless_the_bars_split(
+        candles, splits, timeframe=timeframe, where=f"{symbol} {timeframe}"
+    )
+    parquet_path = write_candles(
+        root,
+        symbol,
+        timeframe,
+        adjusted(source, symbol, timeframe, candles, splits),
+        splits=(split.key for split in splits),
+    )
     gaps = find_gaps([candle.time for candle in candles], step(timeframe))
 
     report = BackfillReport(
@@ -80,6 +127,8 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
         date_to=candles[-1].time,
         parquet_path=parquet_path,
         gaps=gaps,
+        spread_points=source.spread_points(symbol),
+        price_step=price_step_of(source, symbol),
     )
 
     if session is not None:
@@ -89,9 +138,29 @@ def backfill(  # noqa: PLR0913 — all keyword-only, and each one names a real a
     return report
 
 
+def adjusted(
+    source: MarketDataSource,
+    symbol: str,
+    timeframe: str,
+    candles: list[Candle],
+    splits: Sequence[Split],
+) -> list[Candle]:
+    """Raw bars as the disk holds them: adjusted for `splits`, a week a split falls inside
+    rebuilt from that week's daily bars, adjusted the same way."""
+    daily = [
+        bar
+        for start_of, end_of in straddled(candles, splits, timeframe)
+        for bar in source.candles(symbol, "D1", start_of, end_of - _JUST_BEFORE)
+    ]
+    return adjust(candles, splits, timeframe=timeframe, daily=adjust(daily, splits, timeframe="D1"))
+
+
 def _catalogue(session: Session, report: BackfillReport) -> None:
     """Record the instrument and the coverage. Both upserts — see `tradeforge_db`."""
-    upsert_instruments(session, (report.instrument,))
+    upsert_instruments(
+        session,
+        (CatalogueEntry(report.instrument, report.spread_points, price_step=report.price_step),),
+    )
 
     instrument_id = session.execute(
         select(Instrument.id).where(Instrument.symbol == report.instrument.symbol)

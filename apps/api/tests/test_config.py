@@ -71,3 +71,19 @@ def test_refuses_an_empty_password(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ValidationError, match="at least 1 character"):
         Settings()
+
+
+def test_one_backtest_worker_unless_told_otherwise(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POSTGRES_PASSWORD", "s3cret")
+    assert Settings().tradeforge_workers == 1
+    monkeypatch.setenv("TRADEFORGE_WORKERS", "12")
+    assert Settings().tradeforge_workers == 12
+
+
+def test_zero_workers_is_refused_rather_than_an_estimate_divided_by_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("POSTGRES_PASSWORD", "s3cret")
+    monkeypatch.setenv("TRADEFORGE_WORKERS", "0")
+    with pytest.raises(ValidationError):
+        Settings()

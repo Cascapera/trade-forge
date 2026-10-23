@@ -32,8 +32,9 @@ fill, because the multiple is measured from an entry price that does not exist u
 
 import datetime as dt
 import logging
+from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import cast
 
@@ -43,19 +44,54 @@ from tradeforge_engine.domain import (
     AccountState,
     Candle,
     ClosedTrade,
+    EntrySnapshot,
     Fill,
     InstrumentSpec,
     Money,
     OrderRequest,
     OrderResult,
     Position,
+    Refusal,
+    RefusedBy,
     Side,
     SignalKind,
+    _require_utc,
 )
+from tradeforge_engine.errors import EngineError
 from tradeforge_engine.portfolio import Portfolio
 from tradeforge_engine.protocols import CostModel
+from tradeforge_engine.swap import SwapRates
 
 logger = logging.getLogger(__name__)
+
+# How long an order may rest and still have its snapshot completed to the bar that filled it.
+#
+# The cap is what keeps the window *contiguous* rather than merely bounded. Past it the
+# decision bar has fallen out of `_seen`, and the bars still held no longer adjoin the arming
+# window the loop attached — splicing them would produce a chart with a hole in the middle
+# and nothing on it to show that. So past the cap the snapshot keeps the arming window alone:
+# a short chart, honest about where it stops. A stop order fills in a bar or three and a zone
+# that goes two hundred bars unvisited is one the strategy has long since withdrawn.
+SNAPSHOT_MAX_REST_BARS = 200
+
+
+def _for_the_record(order: OrderRequest) -> OrderRequest:
+    """The order as kept in `submitted`: everything except the bars it was armed with.
+
+    `submitted` is the only list here that grows with the **length of the run** — every other
+    retainer is bounded by open orders or by trades. A strategy that is flat re-arms on most
+    bars (`swing.py` replaces its resting order as the reference moves), so an entry snapshot
+    left attached would pin a hundred and fifty candles per bar, which pins the whole stream:
+    the exact cost `run()` takes an `Iterable` to avoid, given back through a side door.
+
+    Measured before the strip, on a 3 000-bar run that re-armed every bar: 151 725 candle
+    references held, keeping 100% of the stream alive. Nothing computed a wrong number — the
+    run simply ends in `MemoryError` at a length that used to pass.
+
+    The order that actually fills is untouched; only this inspection copy is stripped, which
+    is why the snapshot still reaches the position, the trade and the database.
+    """
+    return replace(order, snapshot=None) if order.snapshot is not None else order
 
 
 def _survives_the_gap(order: OrderRequest, price: Money) -> bool:
@@ -126,15 +162,26 @@ def _survives_the_slip(order: OrderRequest, price: Money) -> bool:
 class _Protection:
     """The open position's protective levels, armed at the fill and cleared at the exit.
 
-    The three travel together — a stop with no decision instant could not build a lookahead-
-    safe exit — so they live in one object that is either wholly present or wholly `None`,
-    which is also what saves the exit path from asserting the decision instant back into
-    existence. `target` alone is optional: a stop without a take-profit is a valid position.
+    They travel together — a level with no decision instant could not build a lookahead-safe
+    exit — so they live in one object that is either wholly present or wholly `None`, which
+    is also what saves the exit path from asserting the decision instant back into existence.
+    `target` alone is optional: a stop without a take-profit is a valid position.
+
+    **Two decision instants, and collapsing them would be a bug.** `decided_at` is the
+    entry's, and it is what the target still answers to: the take-profit was computed at the
+    fill and has not moved since. `stop_decided_at` starts equal to it and is replaced every
+    time `modify_stop` moves the stop (ADR-0018), because from that moment the stop was
+    decided on a *later* bar than the entry — and `loop._reject_lookahead` compares that
+    stamp against the bar it is filling on. One shared field would have to lie about one of
+    the two levels, and the lie that matters is the cheap-looking one: a moved stop wearing
+    the entry's old stamp is a stop the guard will happily let fill inside the bar that
+    decided it.
     """
 
     stop: Money
     decided_at: dt.datetime
     target: Money | None
+    stop_decided_at: dt.datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +223,8 @@ class BacktestBroker:
         slippage_ticks: Decimal = ZERO,
         take_profit_rr: Decimal | None = None,
         currency: str = "USD",
+        swap: SwapRates | None = None,
+        book_from: dt.datetime | None = None,
     ) -> None:
         if slippage_ticks < ZERO:
             raise ValueError(f"slippage is a magnitude, got {slippage_ticks}")
@@ -183,8 +232,16 @@ class BacktestBroker:
             raise ValueError(f"take-profit R multiple must be positive, got {take_profit_rr}")
 
         self._instrument = instrument
+        # The first instant the account books (ADR-0030): what fills before it is warm-up, traded
+        # and forgotten. Public, and read by `run` — one place states it, so the ledger and the
+        # record of the run cannot disagree about where the window opens.
+        self.book_from = book_from
         self._portfolio = Portfolio(
-            initial_capital=initial_capital, instrument=instrument, currency=currency
+            initial_capital=initial_capital,
+            instrument=instrument,
+            currency=currency,
+            swap=swap,
+            book_from=book_from,
         )
         self._cost_model: CostModel = cost_model if cost_model is not None else NoCostModel()
         # Kept in ticks, converted to a price at fill time. `slippage_ticks * tick_size` in
@@ -194,6 +251,12 @@ class BacktestBroker:
         self._slippage_ticks = slippage_ticks
         self._rr = take_profit_rr
 
+        # The bars this broker has processed, most recent last. Its only job is to complete an
+        # entry's snapshot: the loop attaches the bars up to the decision, and what happened
+        # *between* the decision and the fill is knowledge only the broker has — it is the side
+        # that knows when an order stopped resting. Bounded for the reason `loop.window` is.
+        self._seen: deque[Candle] = deque(maxlen=SNAPSHOT_MAX_REST_BARS + 1)
+
         self._pending: list[OrderRequest] = []
         # Limit orders waiting for the market, in submission order — which is what makes the
         # tie deterministic when two of them are reachable on the same bar. Arrival order is
@@ -202,10 +265,18 @@ class BacktestBroker:
         self._resting: list[_Resting] = []
         # Names that have already filled. See `_reject_resting`.
         self._consumed: set[str] = set()
+        # Every order this broker accepted, for inspection. **Without its snapshot** — see
+        # `_for_the_record`. This is the one retainer here that grows with the length of the
+        # run rather than with the number of open orders or trades.
         self.submitted: list[OrderRequest] = []
 
         # The open position's protective levels, or None when flat or holding an unstopped one.
         self._protection: _Protection | None = None
+
+        # Resting orders the market ended, waiting to be drained by `refusals()`. A list, not a
+        # counter: the strategy matches by `client_id`, and two zones can lose their order to
+        # the same gap. See ADR-0025.
+        self._market_ended: list[Refusal] = []
 
     # ----------------------------------------------------------------------- #
     # Broker protocol                                                          #
@@ -217,7 +288,7 @@ class BacktestBroker:
         level = order.limit_price if order.limit_price is not None else order.stop_price
         if level is None:
             self._pending.append(order)
-            self.submitted.append(order)
+            self.submitted.append(_for_the_record(order))
             return OrderResult(order=order, accepted=True)
 
         rejection = self._reject_resting(order)
@@ -234,7 +305,7 @@ class BacktestBroker:
                 name=cast(str, order.client_id),
             )
         )
-        self.submitted.append(order)
+        self.submitted.append(_for_the_record(order))
         return OrderResult(order=order, accepted=True)
 
     def _reject_resting(self, order: OrderRequest) -> str | None:
@@ -277,8 +348,76 @@ class BacktestBroker:
         """
         return tuple(resting.order for resting in self._resting)
 
+    def modify_stop(self, symbol: str, stop_loss: Money, decided_at: dt.datetime) -> bool:
+        """Move the open position's stop. Tighten only, and stamped with the deciding bar.
+
+        See `Broker.modify_stop` and ADR-0018. Three outcomes, and each says something
+        different:
+
+        * **`False`** — there is no position in `symbol` to protect. A race in live, nothing
+          at all in a backtest, and never an error either way.
+        * **`EngineError`** — the new level would move the stop *away* from price. The lot was
+          sized against the original stop, so this is a request to carry risk nobody
+          authorised, and it is what a sign error in a strategy looks like from here.
+        * **`True`** — the stop is now at `stop_loss`, carrying `decided_at` as its own
+          decision instant. `Position.stop_loss` moves with it, so the strategy reads back the
+          level it will actually exit at; `Position.initial_stop_loss`, the target, and the
+          target's instant are all untouched.
+        """
+        # Every other instant in the engine is validated where it is built (`OrderRequest`
+        # does it in `__post_init__`). This one never becomes an order, so without this line a
+        # naive datetime is accepted here, stored, and raises two bars later from inside the
+        # exit path — a stack trace pointing at the fill instead of at the caller.
+        _require_utc(decided_at, "modify_stop decided_at")
+
+        position = self._portfolio.position
+        if position is None or position.symbol != symbol:
+            return False
+
+        current = self._protection
+        if current is not None:
+            loosening = (
+                stop_loss < current.stop if position.side is Side.LONG else stop_loss > current.stop
+            )
+            if loosening:
+                raise EngineError(
+                    f"a {position.side.value} stop may only tighten: {stop_loss} moves away "
+                    f"from price against the current {current.stop}. The position was sized "
+                    f"against the original stop, so widening it carries risk nobody authorised "
+                    f"(ADR-0018)"
+                )
+            self._protection = replace(current, stop=stop_loss, stop_decided_at=decided_at)
+            # The ledger holds the other copy of this level, and it is the copy the *strategy*
+            # reads back through `Context.position`. Leaving it behind is what turns a moved
+            # stop into two answers to "where is my stop", with the strategy given the stale
+            # one — and then judged against the fresh one by the tightening rule above.
+            self._portfolio.amend_stop(stop_loss)
+            return True
+
+        # An unstopped position — the entry carried no `stop_loss`, so `_arm_protection` left
+        # nothing behind. Arming one now is the only direction this method ever moves risk in,
+        # and refusing it would be the engine declining to make a position safer. No target:
+        # the take-profit is computed from the entry price at the fill, and that moment is gone.
+        #
+        # `decided_at` is dead data on this branch — with `target=None` nothing ever reads it,
+        # because `_check_protective` only consults it for a non-`sl` exit. It is filled in
+        # rather than faked so that the day someone computes a target here, the instant it
+        # would be judged by is already the right one.
+        self._protection = _Protection(
+            stop=stop_loss, decided_at=decided_at, target=None, stop_decided_at=decided_at
+        )
+        # `initial_stop_loss` stays `None`: this position was never sized against a stop, so
+        # it has no R to report. Only the live level exists, and only now.
+        self._portfolio.amend_stop(stop_loss)
+        return True
+
     def on_bar(self, candle: Candle) -> Sequence[Fill]:
         fills: list[Fill] = []
+
+        # Recorded before anything can fill inside it. Every fill below lands on *this* bar, and
+        # a snapshot completed to a bar the buffer had not been told about would stop one short
+        # of the fill — the one bar the whole extension exists to show.
+        self._seen.append(candle)
 
         # 1. A position carried in from an earlier bar: its stop/target is live from this
         #    bar's first tick. Checked before anything fills at the open, because a gap
@@ -294,6 +433,9 @@ class BacktestBroker:
         # construction (give or take slippage, which is a tick or two either side of it), so
         # it never held the market past the first tick and never sets this.
         held_past_open = False
+        # Whether the position standing at the close was born *inside* this bar — by a resting
+        # order that did not fill at the open. Its bar's favourable extreme may predate it.
+        born_inside = False
 
         carried = self._check_protective(candle)
         if carried is not None:
@@ -345,18 +487,34 @@ class BacktestBroker:
                 # tick, and the whole bar belongs to the position. Same test as steps 1 and 3,
                 # for the same reason; hard-coding `True` would deny a position the target its
                 # bar demonstrably reached.
-                same_bar = self._check_protective(
-                    candle, born_this_bar=resting.price != candle.open
-                )
+                born_inside = resting.price != candle.open
+                same_bar = self._check_protective(candle, born_this_bar=born_inside)
                 if same_bar is not None:
                     fills.append(same_bar)
 
-        # 5. Value the account at the close (obligation of the protocol: the loop reads equity
-        #    straight after this, once per bar).
+        # 5. A position still open at the close lived through this bar — all of it, unless it was
+        #    born inside it, in which case the favourable extreme may predate the fill and only
+        #    the adverse one is the position's (`Position.best_price`). Then value the account
+        #    at the close (obligation of the protocol: the loop reads equity straight after
+        #    this, once per bar).
+        self._portfolio.observe_bar(candle, favourable=not born_inside)
+        # The close is the bar's last tick, after any fill in it, so a position standing at the
+        # close traded there even when it was born inside the bar.
+        self._portfolio.observe_price(candle.close)
         self._portfolio.mark_to_market(candle)
 
         fills.sort(key=lambda fill: fill.order.intent is SignalKind.ENTRY)
         return fills
+
+    def idle(self) -> bool:
+        """No position, no order waiting to open, resting, or protecting one — a bar can fill
+        nothing here (ADR-0029, `loop._quiet`)."""
+        return (
+            self._portfolio.position is None
+            and not self._pending
+            and not self._resting
+            and self._protection is None
+        )
 
     def positions(self, symbol: str) -> Sequence[Position]:
         position = self._portfolio.position
@@ -368,9 +526,95 @@ class BacktestBroker:
     def trades(self) -> Sequence[ClosedTrade]:
         return self._portfolio.trades
 
+    def refusals(self) -> Sequence[Refusal]:
+        """The resting orders this broker withdrew because the market left them. ADR-0025.
+
+        ⚠️ **Never a verdict on a `submit`, and that half of the old docstring still holds
+        (ADR-0024).** A refusal reaches a broker out of band only when the answer to an order
+        arrives after `submit` returned, which needs another process; here `submit` inspects
+        the book and answers on the spot. What this returns is the other thing entirely — an
+        order that *was* accepted, rested, and then stopped existing without anybody deciding
+        so. `submit` cannot have said that, because it had not happened yet.
+
+        Drained rather than read, matching `live.broker`: the loop asks once a bar, and news
+        delivered twice would tell a strategy its order was withdrawn on a bar when it holds a
+        perfectly good one (see `iter_run`, which replaces `pending` rather than accumulating).
+        """
+        drained, self._market_ended = self._market_ended, []
+        return tuple(drained)
+
+    def _end_by_market(self, order: OrderRequest, detail: str) -> None:
+        """Record a resting order the market ended, for the next bar's `refusals()`.
+
+        ⚠️ **Until ADR-0025 this was a `logger.debug` and nothing else**, which made the
+        withdrawal invisible to the one component that needed it: the strategy goes on holding
+        the name, offers no other order for that zone, and eventually sends a cancel the book
+        cannot honour. Measured over 2025 on AAPL and EURUSD M15 — 19 orders, `refusals` empty
+        in all twenty runs, and `cancel` missing exactly as often as an order had been dropped.
+
+        The `reason` is the strategy's own name for the order and the `detail` is this broker's
+        account of the market, which is the split `Refusal` documents. `client_id` may be `None`
+        for a strategy that does not name its orders; that is a log line rather than a
+        correlation, and it is honest — see `Refusal`.
+        """
+        logger.debug("resting order %s withdrawn: %s", order.client_id, detail)
+        self._market_ended.append(
+            Refusal(
+                client_id=order.client_id,
+                intent=order.intent,
+                refused_by=RefusedBy.MARKET,
+                reason=order.reason,
+                detail=detail,
+            )
+        )
+
     # ----------------------------------------------------------------------- #
     # Fills                                                                    #
     # ----------------------------------------------------------------------- #
+
+    def _snapshot_through(self, order: OrderRequest, candle: Candle) -> EntrySnapshot | None:
+        """The entry's arming window, carried forward to the bar that filled it.
+
+        The loop's half of the window ends on the decision bar; this adds every bar from there
+        to `candle`, which is the bar the fill is landing on. Together they answer the two
+        questions a human asks of an entry — was it armed in the right place, and did price
+        come to it the way the method says — and the second one cannot be answered by the loop,
+        which does not know that this is the bar the waiting ended.
+
+        No lookahead is possible here: every bar added has already been processed by `on_bar`,
+        and the last of them is the one currently executing. There is no bar in this window the
+        market had not already printed.
+
+        Returns the arming window unchanged when the decision has aged out of `_seen` — see
+        `SNAPSHOT_MAX_REST_BARS`. Membership is the whole test: `_seen` holds an unbroken run of
+        the most recent bars, so if the decision bar is still in it, so is every bar since.
+        """
+        armed = order.snapshot
+        if armed is None:
+            # A hand-built order, which is most of the broker's own tests. Nothing to complete.
+            return None
+        if not any(bar.time == armed.decided_at for bar in self._seen):
+            logger.debug(
+                "order %s rested past the %d-bar snapshot window; keeping the arming window",
+                order.client_id,
+                SNAPSHOT_MAX_REST_BARS,
+            )
+            return armed
+        since = tuple(bar for bar in self._seen if armed.decided_at < bar.time <= candle.time)
+        # Regions and series come through untouched. They are the strategy's — dropping them
+        # here would erase the zone and the average from exactly the trades that filled.
+        #
+        # The series is *not* extended alongside the bars, and cannot be: only the strategy
+        # knows what its average read on the bars this order spent resting, and it stopped
+        # contributing when it emitted the signal. So a curve can stop short of the window's
+        # right edge. That is the arming window's true extent, drawn honestly.
+        return EntrySnapshot(
+            bars=armed.bars + since,
+            decided_at=armed.decided_at,
+            regions=armed.regions,
+            series=armed.series,
+            levels=armed.levels,
+        )
 
     def _fill_at_open(self, order: OrderRequest, candle: Candle) -> Fill | None:
         if order.intent is SignalKind.EXIT:
@@ -383,9 +627,9 @@ class BacktestBroker:
             # only enters while flat. Refuse rather than let the ledger raise mid-bar.
             return None
         price = self._entry_price(order.side, candle)
-        cost = self._cost_model.entry_cost(order, self._instrument, price)
+        cost = self._cost_model.entry_cost(order, self._instrument, price, candle)
         fill = Fill(order=order, time=candle.time, price=price, volume=order.volume, costs=cost)
-        self._portfolio.apply(fill)
+        self._portfolio.apply(fill, snapshot=self._snapshot_through(order, candle))
         self._arm_protection(order, price)
         return fill
 
@@ -395,8 +639,11 @@ class BacktestBroker:
             # Already stopped out this bar (step 1), so the strategy's exit has nothing to do.
             return None
         price = self._exit_price(position.side, candle)
-        cost = self._cost_model.exit_cost(order, self._instrument, price)
+        cost = self._cost_model.exit_cost(order, self._instrument, price, candle)
         fill = Fill(order=order, time=candle.time, price=price, volume=position.volume, costs=cost)
+        # The strategy's exit leaves at the open: of this bar the position saw one price, and
+        # the rest of the range was traded by nobody's position.
+        self._portfolio.observe_price(price)
         self._portfolio.apply(fill)
         self._disarm_protection()
         return fill
@@ -438,11 +685,9 @@ class BacktestBroker:
                 # because this order losing its reason to exist says nothing about the next
                 # one in the queue.
                 self._resting.remove(resting)
-                logger.debug(
-                    "resting order %s dropped: %s gapped past its stop %s",
-                    resting.name,
-                    price,
-                    resting.order.stop_loss,
+                self._end_by_market(
+                    resting.order,
+                    f"{price} gapped past its stop {resting.order.stop_loss}",
                 )
                 continue
             if not _survives_the_slip(resting.order, price):
@@ -451,20 +696,18 @@ class BacktestBroker:
                 # on the same terms as the gap above — the level is behind the market, so the
                 # order is gone rather than waiting, and the bar goes on to the next in the queue.
                 self._resting.remove(resting)
-                logger.debug(
-                    "resting order %s dropped: %s is too far past its trigger %s",
-                    resting.name,
-                    price,
-                    resting.order.stop_price,
+                self._end_by_market(
+                    resting.order,
+                    f"{price} is too far past its trigger {resting.order.stop_price}",
                 )
                 continue
 
             self._resting.remove(resting)
             order = resting.order
             self._consumed.add(resting.name)
-            cost = self._cost_model.entry_cost(order, self._instrument, price)
+            cost = self._cost_model.entry_cost(order, self._instrument, price, candle)
             fill = Fill(order=order, time=candle.time, price=price, volume=order.volume, costs=cost)
-            self._portfolio.apply(fill)
+            self._portfolio.apply(fill, snapshot=self._snapshot_through(order, candle))
             self._arm_protection(order, price)
             return fill
 
@@ -537,13 +780,25 @@ class BacktestBroker:
             side=position.side,
             intent=SignalKind.EXIT,
             volume=position.volume,
-            decided_at=protection.decided_at,
+            # The stamp of the level that was actually touched. They differ only after a
+            # `modify_stop`, and that is exactly when using the wrong one would hide a
+            # lookahead: a stop moved on this bar's close must not be able to exit inside it,
+            # and `loop._reject_lookahead` can only say so if it is told when the stop was
+            # decided (ADR-0018).
+            decided_at=(protection.stop_decided_at if reason == "sl" else protection.decided_at),
             reason=reason,
         )
-        cost = self._cost_model.exit_cost(exit_order, self._instrument, price)
+        cost = self._cost_model.exit_cost(exit_order, self._instrument, price, candle)
         fill = Fill(
             order=exit_order, time=candle.time, price=price, volume=position.volume, costs=cost
         )
+        # The bar that ended the position, read against the trade like every ambiguous bar here
+        # (`Position.best_price`). Out at the stop: the high may have come after the exit, so
+        # the only price the bar vouches for is the fill. Out at the target: the target was
+        # reached, and the low may have come before it, so the whole adverse side counts.
+        if reason == "tp":
+            self._portfolio.observe_bar(candle, favourable=False)
+        self._portfolio.observe_price(price)
         self._portfolio.apply(fill)
         self._disarm_protection()
         return fill
@@ -681,8 +936,15 @@ class BacktestBroker:
             risk = abs(entry_price - order.stop_loss)
             sign = 1 if order.side is Side.LONG else -1
             target = entry_price + sign * self._rr * risk
+            # On the position too, so the trade says it had one (`Portfolio.record_target`).
+            self._portfolio.record_target(target)
         self._protection = _Protection(
-            stop=order.stop_loss, decided_at=order.decided_at, target=target
+            stop=order.stop_loss,
+            decided_at=order.decided_at,
+            target=target,
+            # At the fill the two instants are the same fact stated twice: nothing has moved
+            # the stop yet. They diverge the first time `modify_stop` is called.
+            stop_decided_at=order.decided_at,
         )
 
     def _disarm_protection(self) -> None:

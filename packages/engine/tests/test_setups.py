@@ -11,28 +11,52 @@ example: a demand zone of [90, 100], bought at 100 with the stop at 89.
 
 import datetime as dt
 from dataclasses import dataclass, field
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
+from decimal import Decimal, localcontext
 
 import pytest
 
+from tradeforge_engine import setups
 from tradeforge_engine.backtest_broker import BacktestBroker
+from tradeforge_engine.bar_setups import (
+    GiftStop,
+    GiftTrigger,
+    IgnoredBarTrigger,
+    is_force_bar,
+    is_hammer,
+)
+from tradeforge_engine.costs import NoCostModel
 from tradeforge_engine.domain import (
+    AccountState,
     Candle,
     Context,
     Fill,
     OrderRequest,
+    OrderResult,
     Position,
+    Refusal,
+    RefusedBy,
     Side,
     Signal,
     SignalKind,
 )
-from tradeforge_engine.loop import ENGINE_CONTEXT, run
+from tradeforge_engine.errors import EngineError
+from tradeforge_engine.loop import ENGINE_CONTEXT, iter_run, run
+from tradeforge_engine.risk import PercentRiskManager
+from tradeforge_engine.setup_factory import build_setup
 from tradeforge_engine.setups import (
+    DEFAULT_MIN_BARS_TO_TOUCH,
+    MAX_ARMING_ATTEMPTS,
+    BotinhaActivation,
     ChochQualifier,
     ContinuationQualifier,
+    FffdActivation,
+    ForceFollowActivation,
+    HammerBreakActivation,
+    HammerForceActivation,
     SetupContext,
     StructureStrategy,
-    _to_tick,
+    ZoneEntry,
+    ZoneEntryPoint,
 )
 from tradeforge_engine.structure import (
     OrderBlock,
@@ -41,14 +65,36 @@ from tradeforge_engine.structure import (
     TrackedZone,
     Trend,
     ZoneKind,
+    ZoneView,
 )
-from tradeforge_engine.testing import AAPL, HOUR, START, FixedRisk, ImmediateFillBroker, bar
+from tradeforge_engine.testing import (
+    AAPL,
+    BULLISH_START,
+    EURUSD,
+    HOUR,
+    START,
+    FixedRisk,
+    ImmediateFillBroker,
+    ageless_structure,
+    arms_a_resting_limit,
+    bar,
+)
 
 _ACCOUNT = ImmediateFillBroker(instrument=AAPL).account()
 
 
 def _at(index: int) -> dt.datetime:
     return START + index * HOUR
+
+
+def _index_of(candle: Candle) -> int:
+    """The bar number `bar()` stamped into this candle — negative for anything before bar 0.
+
+    The stub qualifiers below count bars with this rather than with a call counter of their own,
+    so that `at=9` means bar 9 and keeps meaning it when a scenario is run behind
+    `_BULLISH_START`. A call counter would silently be off by the length of the prefix.
+    """
+    return round((candle.time - START) / HOUR)
 
 
 # The order-block golden's impulse, with bar 3 dug down to 90 so the zone it marks is the
@@ -63,7 +109,7 @@ _IMPULSE = [
     bar(5, open_="108", close="108", high="110", low="102"),  # gap A: 100 < 102
     bar(6, open_="113", close="113", high="115", low="107"),  # gap B
     bar(7, open_="112", close="112", high="117", low="110"),  # pause
-    bar(8, open_="116", close="116", high="118", low="112"),  # pause
+    bar(8, open_="116", close="118", high="119", low="112"),  # pause; closes clear of 117
     bar(9, open_="124", close="124", high="125", low="120"),  # gap C, and close 124 > 123 -> BOS
 ]
 
@@ -132,13 +178,11 @@ class _OnBar:
 
     at: int
     block: OrderBlock | None = None
-    index: int = -1
 
     def qualify(self, context: SetupContext) -> OrderBlock | None:
-        self.index += 1
         if context.marked:
             self.block = context.marked[0]
-        return self.block if self.index == self.at else None
+        return self.block if _index_of(context.candle) == self.at else None
 
 
 @dataclass
@@ -166,13 +210,11 @@ class _Remembers:
 
     at: int
     block: OrderBlock | None = None
-    index: int = -1
 
     def qualify(self, context: SetupContext) -> OrderBlock | None:
-        self.index += 1
         if self.block is None and context.marked:
             self.block = context.marked[0]
-        return self.block if self.index == self.at else None
+        return self.block if _index_of(context.candle) == self.at else None
 
 
 @dataclass
@@ -200,13 +242,11 @@ class _StickyFrom:
 
     at: int
     block: OrderBlock | None = None
-    index: int = -1
 
     def qualify(self, context: SetupContext) -> OrderBlock | None:
-        self.index += 1
         if self.block is None and context.marked:
             self.block = context.marked[0]
-        return self.block if self.index >= self.at else None
+        return self.block if _index_of(context.candle) >= self.at else None
 
 
 @dataclass
@@ -230,13 +270,11 @@ class _Script:
     still names the first one again. `picks` maps a bar index to an index into every zone seen."""
 
     picks: dict[int, int]
-    index: int = -1
     seen: list[OrderBlock] = field(default_factory=list)
 
     def qualify(self, context: SetupContext) -> OrderBlock | None:
-        self.index += 1
         self.seen.extend(context.marked)
-        pick = self.picks.get(self.index)
+        pick = self.picks.get(_index_of(context.candle))
         return self.seen[pick] if pick is not None else None
 
 
@@ -245,6 +283,8 @@ def _drive(
     candles: list[Candle],
     *,
     position_on: frozenset[int] = frozenset(),
+    held: Position | None = None,
+    held_by_bar: dict[int, Position] | None = None,
 ) -> list[list[Signal]]:
     """Feed candles one at a time and collect the signals each bar produced.
 
@@ -252,13 +292,24 @@ def _drive(
     filled the order — the strategy reads `context.position`, not the fill. Given as a set of bars
     rather than "from here on" because the interesting case is a trade that *ends*: the machinery
     has to still be right on the bars after the stop closed it.
+
+    `held` is for conduction: those scenarios need a fixed entry price and known stops, because
+    what the strategy computes is measured *from* them. Without it the position is a placeholder
+    whose only job is to exist. `held_by_bar` is the same thing per bar, for the scenarios that
+    need **two different trades** — which is the only way to see state leak from one to the next.
     """
+    by_bar = held_by_bar or {}
     out: list[list[Signal]] = []
     with localcontext(ENGINE_CONTEXT):
-        for index, candle in enumerate(candles):
+        for candle in candles:
+            # By bar number, not by position in the list: a scenario run behind `_BULLISH_START`
+            # must still find its position on the bar the test named.
+            index = _index_of(candle)
             position = None
-            if index in position_on:
-                position = Position(
+            if index in by_bar:
+                position = by_bar[index]
+            elif index in position_on:
+                position = held or Position(
                     symbol=AAPL.symbol,
                     side=Side.LONG,
                     volume=Decimal(1),
@@ -268,6 +319,36 @@ def _drive(
             context = Context(candle=candle, instrument=AAPL, account=_ACCOUNT, position=position)
             out.append(list(strategy.on_bar(context)))
     return out
+
+
+def _drive_from_bullish(
+    strategy: StructureStrategy,
+    candles: list[Candle],
+    **kwargs: object,
+) -> list[list[Signal]]:
+    """`_drive`, on a machine already in an uptrend, returning only the scenario's own bars.
+
+    A fresh `MarketStructure` starts at the indicator's `DIR = -1`, so a scenario that rises from
+    bar 0 confirms nothing and the setup under test is never given anything to qualify. The prefix
+    supplies the uptrend; its own bars are dropped from the result, so the lists these tests index
+    into still line up with the bars they name. See `_BULLISH_START`.
+    """
+    everything = _drive(strategy, [*BULLISH_START, *candles], **kwargs)  # type: ignore[arg-type]
+    return everything[len(BULLISH_START) :]
+
+
+def _drive_from_bearish(
+    strategy: StructureStrategy,
+    candles: list[Candle],
+    **kwargs: object,
+) -> list[list[Signal]]:
+    """`_drive_from_bullish`'s mirror: on a machine already in a downtrend (05/10).
+
+    A fresh machine starts as the Pascal does, its first bar turning the bias up, so a scenario
+    that falls from bar 0 opens with a CHoCH — not the BOS a bearish scenario is about."""
+    prefix = _mirror(BULLISH_START)
+    everything = _drive(strategy, [*prefix, *candles], **kwargs)  # type: ignore[arg-type]
+    return everything[len(prefix) :]
 
 
 # --------------------------------------------------------------------------- #
@@ -282,8 +363,8 @@ def test_the_authors_geometry_a_demand_zone_is_bought_at_its_top() -> None:
     The stop clears the far edge by a tenth of the zone's width — the region is where price is
     expected to turn, and a stop level *on* the edge is taken out by the turn itself.
     """
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
-    signals = _drive(strategy, _IMPULSE)
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
+    signals = _drive_from_bullish(strategy, _IMPULSE)
 
     assert [len(bar_signals) for bar_signals in signals] == [0] * 9 + [1]
     [signal] = signals[9]
@@ -295,13 +376,158 @@ def test_the_authors_geometry_a_demand_zone_is_bought_at_its_top() -> None:
     assert signal.client_id is not None  # it has to be nameable to be withdrawable
 
 
+def test_the_stop_buffer_moves_the_stop_on_a_limit_entry_too() -> None:
+    """The knob, exercised where it was only ever assumed: the near-edge entry.
+
+    Region [90, 100], so the default tenth puts the stop at 89 and a half puts it at 85. The
+    order itself does not move — the buffer is a rule about the stop's clearance, not about where
+    the entry waits.
+
+    ⚠️ **It went unasserted for a reason worth remembering.** Every `EDGE` and `MIDPOINT` scenario
+    in this file runs on the default buffer; only the return-pass ones vary it. While all three
+    entry points read one `self._stop_buffer` inside one method, that was enough — a mutant
+    ignoring the knob broke the return-pass scenarios and died. Giving each activation its own
+    copy of the number is what made the buy-side knob independently observable, and the mutation
+    run is what noticed that nothing observed it.
+    """
+    strategy = ageless_structure(qualifier=_Marked(), stop_buffer=Decimal("0.5"))
+    signals = _drive_from_bullish(strategy, _IMPULSE)
+
+    [signal] = signals[9]
+    assert signal.limit_price == Decimal("100")  # unchanged: the buffer is not about the entry
+    assert signal.stop_loss == Decimal("85")  # 90 - 0.5 * 10, against the default's 89
+
+
+def test_the_stop_buffer_moves_the_midpoint_entry_stop_as_well() -> None:
+    """The twin of the test above, and it exists because the first one alone was not enough.
+
+    `EDGE` and `MIDPOINT` read the same number through two objects now, so a knob honoured by
+    one and ignored by the other is two lines apart and invisible: the mutation run killed the
+    edge mutant on the test above and the midpoint one survived it. The entry moves to 95 and
+    the stop to 85 — the buffer widens the stop without touching where the order waits, on both.
+    """
+    strategy = ageless_structure(
+        qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT, stop_buffer=Decimal("0.5")
+    )
+    signals = _drive_from_bullish(strategy, _IMPULSE)
+
+    [signal] = signals[9]
+    assert signal.limit_price == Decimal("95")
+    assert signal.stop_loss == Decimal("85")
+
+
+def test_the_entry_records_the_region_it_is_waiting_at() -> None:
+    """This setup enters *at the edge of a zone*, not at a price the decision bar names.
+
+    So the two edges are the entry's justification, and neither survives anywhere else: the
+    order carries the near edge as its limit and a stop derived from the far one, which is not
+    the same as knowing where the region was. A chart missing them shows an order resting in
+    mid-air.
+
+    The author's own zone: demand [90, 100], bought at its top.
+    """
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
+    [signal] = _drive_from_bullish(strategy, _IMPULSE)[9]
+
+    assert signal.context == {"zone_top": Decimal("100"), "zone_bottom": Decimal("90")}
+    # The limit rests on the near edge — the side price has to come back to. Asserted against
+    # the recorded edge rather than the literal, so a zone that moved would move both.
+    assert signal.limit_price == signal.context["zone_top"]
+
+
+def test_the_region_is_a_rectangle_starting_on_the_candle_before_the_gap() -> None:
+    """The author draws a zone the way he trades it: a rectangle over the marking candle's
+    range, from that candle, extended right until price comes back into it.
+
+    So the region needs a **left edge in time**, and it has to be `OrderBlock.time` — the candle
+    before the gap — rather than `confirmed_at`, the later bar whose break revealed the zone.
+    Starting the rectangle at the confirmation would draw the zone as younger than it is and
+    hide the impulse that made it, which is the part that says the zone is worth anything.
+
+    Measured on the author's impulse: candle 3 runs 90 to 100, candle 4 opens at a low of 103 —
+    the gap — so candle 3 is the marking candle and the rectangle is [90, 100] from candle 3.
+    """
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
+    [signal] = _drive_from_bullish(strategy, _IMPULSE)[9]
+
+    (region,) = signal.regions
+    assert region.label == "zone"
+    assert (region.top, region.bottom) == (Decimal("100"), Decimal("90"))
+    assert region.from_time == _IMPULSE[3].time
+
+    # The two facts that make candle 3 the marking candle, asserted rather than asserted-about:
+    # the rectangle is that candle's own range, and the candle after it gaps clear of its high.
+    assert (region.top, region.bottom) == (_IMPULSE[3].high, _IMPULSE[3].low)
+    assert _IMPULSE[4].low > _IMPULSE[3].high
+
+    # The rectangle and the scalars describe one zone. They are written a line apart from the
+    # same block, and this is what would catch them drifting.
+    assert signal.context == {"zone_top": region.top, "zone_bottom": region.bottom}
+
+
+def test_the_entry_records_the_structure_that_broke() -> None:
+    """The event that made the zone worth entering, drawn as the line the author draws by hand.
+
+    A zone on its own justifies nothing: it is a stretch of price like any other until a break
+    of structure reveals it. Without the broken level in the record, a chart of this entry shows
+    price crossing a price, with nothing saying which price mattered — and a reader trying to
+    judge whether the entry was right is looking at the wrong half of the setup.
+
+    The segment is bounded at **both** ends, unlike the zone rectangle: a zone is still in force
+    after the entry so it runs rightward, but a level is over the moment it is crossed, and
+    drawing it onward would show a structure still standing that is not.
+
+    Measured on the author's impulse: the level is 123, the high of bar 0, and bar 9 closes 124
+    through it. Nine bars is how long that structure held.
+    """
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
+    [signal] = _drive_from_bullish(strategy, _IMPULSE)[9]
+
+    (level,) = signal.levels
+    assert level.label == "bos"
+    assert level.price == Decimal("123")
+    assert (level.from_time, level.to_time) == (_IMPULSE[0].time, _IMPULSE[9].time)
+
+    # The two facts that make this the broken level, asserted rather than asserted-about: the
+    # price is bar 0's high, and bar 9 is the bar whose *close* went through it.
+    assert level.price == _IMPULSE[0].high
+    assert _IMPULSE[9].close > level.price
+
+
+def test_the_structural_level_ends_where_it_broke_not_at_the_entry() -> None:
+    """The right edge is the break, and the entry can be much later.
+
+    Conflating the two would draw every structure as having held right up to the trade, which is
+    the opposite of what a reader is checking: how long ago the break was is exactly the thing
+    that says whether this entry is still trading that break or a stale memory of one.
+    """
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
+    [signal] = _drive_from_bullish(strategy, _IMPULSE)[9]
+
+    (level,) = signal.levels
+    # The signal is emitted on bar 9, which is also the break here — so the claim is made
+    # against the region instead, whose own left edge is bar 3, well after the level was set.
+    (region,) = signal.regions
+    assert level.from_time < region.from_time <= level.to_time
+
+
+def test_the_recorded_region_mirrors_for_a_supply_zone() -> None:
+    """Reflected about 200: supply [100, 110], sold at its bottom. `top` stays the higher price
+    — it names the edge, not the entry side — so a short's limit sits at `zone_bottom`."""
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
+    [signal] = _drive(strategy, _mirror(_IMPULSE))[9]
+
+    assert signal.context == {"zone_top": Decimal("110"), "zone_bottom": Decimal("100")}
+    assert signal.limit_price == signal.context["zone_bottom"]
+
+
 def test_the_geometry_mirrors_for_a_supply_zone() -> None:
     """The same impulse reflected about 200: supply [100, 110], sold at 100 with the stop at 111.
 
     Sold at the *bottom* — a supply zone is approached from below, so its near edge is its low.
     Getting this backwards is the sign error `Signal` refuses, and it would be easy to write.
     """
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
     signals = _drive(strategy, _mirror(_IMPULSE))
 
     [signal] = signals[9]
@@ -320,29 +546,17 @@ def test_the_stop_is_rounded_onto_the_tick_grid_away_from_the_entry() -> None:
     """
     candles = [*_IMPULSE]
     candles[3] = bar(3, open_="99", close="99", high="100.05", low="90")
-    strategy = StructureStrategy(qualifier=_Marked(), name="test")
+    strategy = ageless_structure(qualifier=_Marked(), name="test")
 
-    [signal] = _drive(strategy, candles)[9]
+    [signal] = _drive_from_bullish(strategy, candles)[9]
     assert signal.limit_price == Decimal("100.05")
     assert signal.stop_loss == Decimal("88.99")  # not 89.00, which is nearer the zone
 
-    [short_signal] = _drive(StructureStrategy(qualifier=_Marked(), name="test"), _mirror(candles))[
+    [short_signal] = _drive(ageless_structure(qualifier=_Marked(), name="test"), _mirror(candles))[
         9
     ]
     assert short_signal.limit_price == Decimal("99.95")
     assert short_signal.stop_loss == Decimal("111.01")  # not 111.00
-
-
-def test_to_tick_rounds_in_the_direction_it_is_told() -> None:
-    """The helper on its own, both directions, so the two callers above cannot both be wrong in
-    the same way and still agree with each other."""
-    with localcontext(ENGINE_CONTEXT):
-        tick = Decimal("0.01")
-        assert _to_tick(Decimal("88.995"), tick, ROUND_FLOOR) == Decimal("88.99")
-        assert _to_tick(Decimal("111.005"), tick, ROUND_CEILING) == Decimal("111.01")
-        # already on the grid: rounding must not move it in either direction
-        assert _to_tick(Decimal("89"), tick, ROUND_FLOOR) == Decimal("89")
-        assert _to_tick(Decimal("89"), tick, ROUND_CEILING) == Decimal("89")
 
 
 # --------------------------------------------------------------------------- #
@@ -350,22 +564,32 @@ def test_to_tick_rounds_in_the_direction_it_is_told() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _seen_at(contexts: list[SetupContext], index: int) -> SetupContext:
+    """The context the qualifier was handed on bar `index`.
+
+    By bar number rather than by position in the list: the qualifier is called on every bar it is
+    driven over, `_BULLISH_START` included, so counting calls would land eight bars early.
+    """
+    (context,) = [c for c in contexts if _index_of(c.candle) == index]
+    return context
+
+
 def test_only_the_primary_zone_reaches_the_qualifier_by_default() -> None:
     """The impulse marks two zones. By default a setup is offered only the primary — the first
     gap event of the move — and the secondary is not its business to refuse."""
     qualifier = _Marked()
-    _drive(StructureStrategy(qualifier=qualifier), _IMPULSE)
+    _drive_from_bullish(ageless_structure(qualifier=qualifier), _IMPULSE)
 
-    marked = qualifier.seen[9].marked
+    marked = _seen_at(qualifier.seen, 9).marked
     assert [(zone.time, zone.primary) for zone in marked] == [(_at(3), True)]
 
 
 def test_allow_secondary_offers_both_zones() -> None:
     """Turned on, the same impulse offers both, primary first — the flag the author asked for."""
     qualifier = _Marked()
-    _drive(StructureStrategy(qualifier=qualifier, allow_secondary=True), _IMPULSE)
+    _drive_from_bullish(ageless_structure(qualifier=qualifier, allow_secondary=True), _IMPULSE)
 
-    marked = qualifier.seen[9].marked
+    marked = _seen_at(qualifier.seen, 9).marked
     assert [(zone.time, zone.primary) for zone in marked] == [
         (_at(3), True),
         (_at(7), False),
@@ -380,7 +604,7 @@ def test_a_newly_qualified_zone_withdraws_the_order_resting_on_the_old_one() -> 
     would be decided by arrival order in a list.
     """
     qualifier = _Marked()
-    strategy = StructureStrategy(qualifier=qualifier, name="test")
+    strategy = ageless_structure(qualifier=qualifier, name="test")
     # A second impulse after the first, marking a second zone the qualifier will name.
     second = [
         bar(10, open_="124", close="118", high="125", low="117"),  # correction 1
@@ -389,7 +613,7 @@ def test_a_newly_qualified_zone_withdraws_the_order_resting_on_the_old_one() -> 
         bar(13, open_="121", close="121", high="122", low="120"),  # gap: 116 < 120
         bar(14, open_="128", close="128", high="129", low="126"),  # close past the 125 top -> BOS
     ]
-    signals = _drive(strategy, [*_IMPULSE, *second])
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *second])
 
     first_id = signals[9][0].client_id
     kinds = [(s.kind, s.client_id) for s in signals[14]]
@@ -399,7 +623,14 @@ def test_a_newly_qualified_zone_withdraws_the_order_resting_on_the_old_one() -> 
 
 
 def test_naming_the_same_zone_again_does_not_churn_the_order() -> None:
-    """A qualifier that keeps pointing at the zone it already qualified is not a new setup.
+    """The repeat guard, and now the only test of it.
+
+    A sibling used to cover the other window — a zone qualified but whose order had not reached
+    the book yet, because price was still inside the region. His mitigation rule removed that
+    window (see `test_a_region_price_is_inside_is_already_gone`), so this is where the guard is
+    held.
+
+    A qualifier that keeps pointing at the zone it already qualified is not a new setup.
 
     Acting on the repeat would withdraw a resting order and put an identical one back a bar later,
     every bar — and the fill would land on whichever bar the qualifier last repeated itself
@@ -414,36 +645,12 @@ def test_naming_the_same_zone_again_does_not_churn_the_order() -> None:
         bar(11, open_="122", close="120", high="123", low="119"),
         bar(12, open_="120", close="121", high="122", low="119"),
     ]
-    signals = _drive(StructureStrategy(qualifier=_Sticky()), [*_IMPULSE, *quiet])
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Sticky()), [*_IMPULSE, *quiet])
 
     assert len(signals[9]) == 1  # armed once
     assert signals[9][0].kind is SignalKind.ENTRY
     # and the three bars of the qualifier saying the same thing again produce nothing at all
     assert (signals[10], signals[11], signals[12]) == ([], [], [])
-
-
-def test_repeating_a_zone_armed_but_not_yet_placed_emits_nothing() -> None:
-    """The repeat guard in the window before the order reaches the book.
-
-    An unfilled zone is never in `_traded` — only a fill puts it there — so the armed-zone guard
-    is what refuses a qualifier repeating itself, in both windows. This test pins the earlier
-    one: between qualifying a zone and placing its order there is a real gap — price is still
-    inside the region, so no order can rest there yet. A qualifier repeating itself there would
-    withdraw an order that was never placed and re-arm under a fresh name, every bar, until
-    price finally cleared the zone.
-
-    Bars 10 and 11 both close inside [90, 100] with the setup naming the zone on each; bar 12
-    closes clear and the order finally goes out — once, at the level it always would have.
-    """
-    inside = [
-        bar(10, open_="124", close="96", high="125", low="95"),  # qualified here, inside the zone
-        bar(11, open_="96", close="97", high="98", low="95"),  # still inside: the repeat
-        bar(12, open_="97", close="103", high="104", low="96"),  # clear of it at last
-    ]
-    signals = _drive(StructureStrategy(qualifier=_StickyFrom(at=10)), [*_IMPULSE, *inside])
-
-    assert (signals[10], signals[11]) == ([], [])  # nothing while price is inside the zone
-    assert [s.kind for s in signals[12]] == [SignalKind.ENTRY]  # and exactly one order after
 
 
 # --------------------------------------------------------------------------- #
@@ -461,7 +668,7 @@ def test_the_order_is_withdrawn_when_its_zone_is_spent() -> None:
         bar(10, open_="124", close="110", high="125", low="108"),
         bar(11, open_="110", close="89", high="111", low="88"),  # closes under the zone
     ]
-    signals = _drive(StructureStrategy(qualifier=_Once()), [*_IMPULSE, *through])
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Once()), [*_IMPULSE, *through])
 
     entry_id = signals[9][0].client_id
     assert [(s.kind, s.client_id) for s in signals[11]] == [(SignalKind.CANCEL, entry_id)]
@@ -477,64 +684,65 @@ def test_a_live_zone_keeps_its_order_resting() -> None:
         bar(10, open_="124", close="120", high="125", low="119"),
         bar(11, open_="120", close="115", high="121", low="114"),
     ]
-    signals = _drive(StructureStrategy(qualifier=_Marked()), [*_IMPULSE, *quiet])
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Marked()), [*_IMPULSE, *quiet])
 
     assert signals[10] == []
     assert signals[11] == []
 
 
 def test_nothing_is_armed_while_a_position_is_open() -> None:
-    """This phase holds one position at a time, and the trade is the broker's to end.
+    """This phase holds one position at a time, and the trade is the broker's to *end*.
 
     A position open means our order filled. Arming another zone would submit an entry the broker
     refuses, and withdrawing the filled order would be a cancel for something that no longer
     rests — noise either way.
+
+    The stop is the exception, and the only one: the strategy may move it. Bar 9 of this impulse
+    confirms a bullish BOS, which is the open long's first break in favour, so it asks for
+    breakeven — the entry price, 124. What no bar may produce is an entry or a cancel.
     """
-    signals = _drive(StructureStrategy(qualifier=_Marked()), _IMPULSE, position_on=frozenset({9}))
-
-    assert all(bar_signals == [] for bar_signals in signals)
-
-
-def test_an_order_waits_for_price_to_clear_the_zone_before_it_is_placed() -> None:
-    """A buy limit has to rest below the market. While price is still inside the region the level
-    is above it, and `Signal` refuses that as the sign error it usually is (ADR-0014).
-
-    Nothing is lost by waiting: the zone stays armed and the order goes out on the first bar that
-    closes clear of it. Here the setup qualifies on bar 10, which closes at 96 — inside [90, 100]
-    — and the entry appears on bar 11, at the same level it always would have rested at.
-    """
-    inside = [
-        bar(10, open_="124", close="96", high="125", low="95"),  # closes inside the zone
-        bar(11, open_="96", close="101", high="102", low="95"),  # closes clear of it again
-    ]
-    signals = _drive(StructureStrategy(qualifier=_OnBar(at=10), name="test"), [*_IMPULSE, *inside])
-
-    assert signals[9] == []  # the qualifier said nothing on the bar that marked the zone
-    assert signals[10] == []  # qualified, but price is inside it — no order can rest there yet
-    [signal] = signals[11]
-    assert signal.kind is SignalKind.ENTRY
-    assert (signal.limit_price, signal.stop_loss) == (Decimal("100"), Decimal("89"))
-
-
-def test_the_wait_mirrors_for_a_sell_limit() -> None:
-    """The short side of the same rule, and it is not symmetric by accident: a sell limit rests
-    *above* the market, so what defers it is price still being **below** the zone's bottom edge.
-
-    The mirrored scenario reflects to supply [100, 110]. Bar 10 closes at 104, inside it, so no
-    order can rest there yet; bar 11 closes at 99, clear below, and the order goes out at 100.
-    """
-    inside = [
-        bar(10, open_="124", close="96", high="125", low="95"),
-        bar(11, open_="96", close="101", high="102", low="95"),
-    ]
-    signals = _drive(
-        StructureStrategy(qualifier=_OnBar(at=10), name="test"), _mirror([*_IMPULSE, *inside])
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked()), _IMPULSE, position_on=frozenset({9})
     )
 
-    assert signals[10] == []
-    [signal] = signals[11]
-    assert signal.side is Side.SHORT
-    assert (signal.limit_price, signal.stop_loss) == (Decimal("100"), Decimal("111"))
+    kinds = {signal.kind for bar_signals in signals for signal in bar_signals}
+    assert kinds <= {SignalKind.MODIFY_STOP}
+    assert [(index, s.stop_loss) for index, b in enumerate(signals) for s in b] == [
+        (9, Decimal("124"))
+    ]
+
+
+def test_a_region_price_is_inside_is_already_gone() -> None:
+    """The invariant that replaced the wait, asserted on the shape that used to exercise it.
+
+    The machinery used to hold an order back while price sat inside the region: a buy limit rests
+    *below* the market, so with price inside, the level is above it and `Signal` refuses that as a
+    sign error (ADR-0014). Two tests asserted that wait, and a third asserted the repeat that
+    happened while it lasted.
+
+    His mitigation rule removes the state they described. Price being inside a demand region means
+    `close < top`, which forces `low <= top` — and `low <= top` is exactly what retires it. So by
+    the time anything could ask for an order, the region has been marked and its order withdrawn.
+
+    Bar 10 closes at 96, inside [90, 100]. Under the old rule the setup qualified there and the
+    entry appeared on bar 11 at 100. Now bar 10 takes the region instead, and bar 11 has nothing
+    left to place — which is the correct reading of his method: price came back to the region and
+    the region is where it was traded, once.
+    """
+    inside = [
+        bar(10, open_="124", close="96", high="125", low="95"),  # reaches into the region
+        bar(11, open_="96", close="101", high="102", low="95"),  # too late; it is spent
+    ]
+    strategy = ageless_structure(qualifier=_OnBar(at=10), name="test")
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *inside])
+
+    assert signals[11] == []
+    (region,) = [z for z in strategy._blocks.zones if z.block.time == _at(3)]
+    assert region.mitigated
+    assert not region.usable
+
+    # And no order was ever placed on it — not withdrawn later, never sent.
+    assert not [s for per_bar in signals for s in per_bar if s.kind is SignalKind.ENTRY]
 
 
 def test_a_zone_the_tracker_no_longer_holds_is_never_armed() -> None:
@@ -560,7 +768,7 @@ def test_a_zone_the_tracker_no_longer_holds_is_never_armed() -> None:
         primary=True,
     )
     quiet = [bar(10, open_="124", close="120", high="125", low="119")]
-    signals = _drive(StructureStrategy(qualifier=_Fixed(foreign)), [*_IMPULSE, *quiet])
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Fixed(foreign)), [*_IMPULSE, *quiet])
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -584,7 +792,9 @@ def test_a_zone_spent_before_the_setup_names_it_is_never_armed() -> None:
         bar(11, open_="105", close="112", high="113", low="104"),  # driven off: 112 > 110
         bar(12, open_="112", close="114", high="115", low="111"),  # the setup names it here
     ]
-    signals = _drive(StructureStrategy(qualifier=_Remembers(at=12)), [*_IMPULSE, *spent])
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Remembers(at=12)), [*_IMPULSE, *spent]
+    )
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -608,12 +818,18 @@ def test_a_zone_that_gave_a_trade_is_never_armed_again() -> None:
         bar(11, open_="103", close="101", high="104", low="88"),  # stopped at 89
         bar(12, open_="101", close="104", high="105", low="100"),
     ]
-    strategy = StructureStrategy(qualifier=_Sticky())
-    signals = _drive(strategy, [*_IMPULSE, *after], position_on=frozenset({10}))
+    strategy = ageless_structure(qualifier=_Sticky())
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *after], position_on=frozenset({10}))
 
     assert signals[9][0].kind is SignalKind.ENTRY  # armed once, on the qualifying bar
     assert (signals[11], signals[12]) == ([], [])  # and never again, though the zone still stands
-    assert strategy._blocks.zones[0].usable  # the zone really did survive the trade
+    # The fill *is* the mitigation now: price reaching the near edge is both the entry and what
+    # retires the region, so the two reasons to refuse it have become the same event. `_traded`
+    # is kept as defence in depth rather than removed — re-arming a spent region is the failure
+    # this guard exists to make impossible, and it costs a set lookup.
+    (region,) = [z for z in strategy._blocks.zones if z.block.time == _at(3)]
+    assert not region.usable
+    assert region.block in strategy._traded
 
 
 def test_a_trade_that_opened_and_died_inside_one_bar_still_spends_its_zone() -> None:
@@ -629,12 +845,12 @@ def test_a_trade_that_opened_and_died_inside_one_bar_still_spends_its_zone() -> 
     fill observation forgets the armed name, so nothing later tries to withdraw an order the
     trade already used up.
     """
-    strategy = StructureStrategy(qualifier=_Sticky())
+    strategy = ageless_structure(qualifier=_Sticky())
     descent = [
         bar(10, open_="124", close="115", high="125", low="114"),
         bar(11, open_="115", close="105", high="116", low="104"),
     ]
-    signals = _drive(strategy, [*_IMPULSE, *descent])
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *descent])
     [entry] = signals[9]
 
     wick_out = bar(12, open_="105", close="101", high="106", low="88")  # entry and stop, one bar
@@ -662,43 +878,55 @@ def test_a_trade_that_opened_and_died_inside_one_bar_still_spends_its_zone() -> 
         after = strategy.on_bar(Context(candle=named_again, instrument=AAPL, account=_ACCOUNT))
 
     assert (during, after) == ((), ())  # no re-arm, and no cancel for the consumed order
-    assert strategy._blocks.zones[0].usable  # refused as traded, not as dead
+    # Spent and recorded: under his rule the fill retires the region, so "refused as traded" and
+    # "refused as dead" now name one event. See the note in the sibling test above.
+    (region,) = [z for z in strategy._blocks.zones if z.block.time == _at(3)]
+    assert not region.usable
+    assert region.block in strategy._traded
 
 
-def test_an_invisible_fill_does_not_leave_a_phantom_armed_order() -> None:
-    """The discriminator for the fill observation itself, on a *different* zone qualifying next.
+def test_a_fill_spends_the_region_it_traded_and_no_other() -> None:
+    """A trade retires **its own** region. Every other region the impulse left stays tradeable.
 
-    The sibling test above re-names the traded zone, and that cannot tell the observation apart
-    from its absence: an unobserved fill leaves `_armed` pointing at the zone with `placed=True`,
-    and the repeat guard refuses the re-arm with the same silence `_traded` would — right answer,
-    wrong reason. The difference only shows when another zone qualifies after the invisible fill:
+    The two siblings above both end in silence, so neither can tell "the fill spent one region"
+    apart from "the fill ended the machine". Nor is the difference academic: the impulse leaves a
+    primary and a secondary, and a rule that let one trade retire the pair would quietly halve the
+    regions the method offers — the same class of loss as the mitigation bug this PR fixed, and
+    just as invisible in the totals.
 
-    * observed (correct): the armed name was forgotten with the fill, so zone B arms with
-      **exactly one ENTRY and no CANCEL** — nothing rests to withdraw;
-    * unobserved: the phantom is withdrawn first (a cancel for an order the trade consumed), and
-      worse, the traded zone A never entered `_traded` — so when the setup names A again, it
-      re-arms and the martingale is back through the supersession door.
+    Geometry, and it is the reverse of what this scenario used to do. The traded region has to be
+    the **upper** one, because a fill is a touch of the near edge and price cannot reach a lower
+    region's edge without first passing through a higher one's. So the secondary at [110, 117] is
+    the one bought — limit 117, stop 109.3, a tenth of the zone's own width under the floor — and
+    the flash bar's low of 109 takes entry and stop together without ever reaching 100. The
+    primary [90, 100] is left untouched, alive, and free to arm on the next bar that names it.
 
-    Geometry, chosen so zone A is still alive to answer step (b): the marking candle is dug to 80,
-    making A [80, 100] — twenty wide, so mitigation needs a close at 120 and the closes here stay
-    under it — and zone B is the same impulse's secondary at [110, 117], reachable while A lives.
-    The stop sits at 78, so the one-bar round trip needs a low of 77: a flash-crash bar, which is
-    what it takes for entry and stop to die together while both regions survive on the close.
+    Two honest notes on what this does *not* own, so nobody has to rediscover them. The bar-12
+    silence is the sibling's claim, not this one: under his mitigation rule an unobserved fill
+    leaves `_armed` on a region the same bar just retired, so the phantom withdrawal fires on bar
+    12 there too. And the mutants this kills — the fill forgetting to clear `_armed`, forgetting
+    to record `_traded`, spending the whole tracker — each die in some sibling as well; measured,
+    and the file's coverage of `setups.py` is unchanged without it. It is kept because it is the
+    only scenario here whose *subject* is a fill's blast radius, and the only one that reaches it
+    through a hand-delivered `Context.fills` (ADR-0015) rather than through a broker.
+
+    What no test in this file kills is the `_traded` **guard** in `_may_arm` — deleting it leaves
+    the suite green. That is not an oversight to fix here; the guard is unreachable by
+    construction under his mitigation rule and is kept on purpose. `StructureStrategy`'s docstring
+    carries the argument and the measurement.
     """
-    candles = [*_IMPULSE]
-    candles[3] = bar(3, open_="99", close="99", high="100", low="80")  # zone A becomes [80, 100]
-    strategy = StructureStrategy(
-        qualifier=_Script(picks={9: 0, 13: 1, 14: 0}), allow_secondary=True
+    strategy = ageless_structure(
+        qualifier=_Script(picks={9: 1, 13: 0, 14: 1}), allow_secondary=True
     )
-    descent = [
-        bar(10, open_="124", close="118", high="125", low="116"),
-        bar(11, open_="118", close="112", high="119", low="111"),
+    descent = [  # down off the break, but clear of 117: the secondary must survive to be filled
+        bar(10, open_="124", close="120", high="125", low="119"),
+        bar(11, open_="120", close="119", high="121", low="118"),
     ]
-    signals = _drive(strategy, [*candles, *descent])
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *descent])
     [entry] = signals[9]
-    assert (entry.limit_price, entry.stop_loss) == (Decimal("100"), Decimal("78"))
+    assert (entry.limit_price, entry.stop_loss) == (Decimal("117"), Decimal("109.3"))
 
-    wick_out = bar(12, open_="112", close="112", high="113", low="77")  # fills 100, stops 78
+    wick_out = bar(12, open_="118", close="118", high="119", low="109")  # fills 117, stops 109.3
     fill = Fill(
         order=OrderRequest(
             symbol=AAPL.symbol,
@@ -711,7 +939,7 @@ def test_an_invisible_fill_does_not_leave_a_phantom_armed_order() -> None:
             client_id=entry.client_id,
         ),
         time=_at(12),
-        price=Decimal("100"),
+        price=Decimal("117"),
         volume=Decimal(1),
         costs=Decimal(0),
     )
@@ -719,17 +947,26 @@ def test_an_invisible_fill_does_not_leave_a_phantom_armed_order() -> None:
         during = strategy.on_bar(
             Context(candle=wick_out, instrument=AAPL, account=_ACCOUNT, fills=(fill,))
         )
-        b_bar = bar(13, open_="112", close="118", high="119", low="111")  # zone B is named
-        b_signals = strategy.on_bar(Context(candle=b_bar, instrument=AAPL, account=_ACCOUNT))
-        a_again = bar(14, open_="118", close="119", high="120", low="117")  # zone A named again
-        a_signals = strategy.on_bar(Context(candle=a_again, instrument=AAPL, account=_ACCOUNT))
+        primary_bar = bar(13, open_="118", close="119", high="120", low="117")  # names [90, 100]
+        primary_signals = strategy.on_bar(
+            Context(candle=primary_bar, instrument=AAPL, account=_ACCOUNT)
+        )
+        traded_again = bar(14, open_="119", close="120", high="121", low="118")  # names the spent
+        again_signals = strategy.on_bar(
+            Context(candle=traded_again, instrument=AAPL, account=_ACCOUNT)
+        )
 
-    assert during == ()
-    [b_entry] = b_signals  # exactly one signal: no cancel for the consumed phantom
-    assert b_entry.kind is SignalKind.ENTRY
-    assert b_entry.limit_price == Decimal("117")  # the secondary zone's top
-    assert a_signals == ()  # the traded zone is spent; zone B's order stays where it is
-    assert strategy._blocks.zones[0].usable  # and A was refused as traded, not as dead
+    assert during == ()  # nothing to withdraw: the fill took the name with it
+    [primary_entry] = primary_signals  # exactly one signal, and no cancel in front of it
+    assert primary_entry.kind is SignalKind.ENTRY
+    assert primary_entry.limit_price == Decimal("100")  # the primary region, untouched and alive
+    assert again_signals == ()  # the traded region is spent; the new order stays where it is
+
+    primary, secondary = strategy._blocks.zones
+    assert primary.usable  # untouched by the trade that happened above it
+    assert primary.block not in strategy._traded
+    assert not secondary.usable  # the fill was the touch of its edge
+    assert secondary.block in strategy._traded
 
 
 def test_a_zone_withdrawn_unfilled_may_be_offered_again() -> None:
@@ -746,8 +983,8 @@ def test_a_zone_withdrawn_unfilled_may_be_offered_again() -> None:
         bar(14, open_="128", close="128", high="129", low="126"),  # BOS -> zone two supersedes
         bar(15, open_="128", close="127", high="129", low="126"),  # zone one is named again
     ]
-    signals = _drive(
-        StructureStrategy(qualifier=_Script(picks={9: 0, 14: 1, 15: 0})), [*_IMPULSE, *second]
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Script(picks={9: 0, 14: 1, 15: 0})), [*_IMPULSE, *second]
     )
 
     [first_entry] = signals[9]
@@ -774,8 +1011,8 @@ def test_a_filled_order_is_not_withdrawn_when_a_later_zone_qualifies() -> None:
         bar(13, open_="121", close="121", high="122", low="120"),  # gap: 116 < 120
         bar(14, open_="128", close="128", high="129", low="126"),  # BOS -> a second zone
     ]
-    signals = _drive(
-        StructureStrategy(qualifier=_Marked()), [*_IMPULSE, *after], position_on=frozenset({10})
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked()), [*_IMPULSE, *after], position_on=frozenset({10})
     )
 
     assert [s.kind for s in signals[14]] == [SignalKind.ENTRY]  # no cancel for the filled order
@@ -791,10 +1028,12 @@ def test_a_secondary_zone_the_qualifier_read_from_the_tracker_is_refused() -> No
     qualifier reaches past `marked` into the tracker and names the secondary zone; with the flag
     off, nothing is armed.
     """
-    off = _drive(StructureStrategy(qualifier=_FromTracker(index=1)), _IMPULSE)
+    off = _drive_from_bullish(ageless_structure(qualifier=_FromTracker(index=1)), _IMPULSE)
     assert all(bar_signals == [] for bar_signals in off)
 
-    on = _drive(StructureStrategy(qualifier=_FromTracker(index=1), allow_secondary=True), _IMPULSE)
+    on = _drive_from_bullish(
+        ageless_structure(qualifier=_FromTracker(index=1), allow_secondary=True), _IMPULSE
+    )
     [signal] = on[9]
     assert signal.limit_price == Decimal("117")  # the secondary zone's top
 
@@ -806,7 +1045,7 @@ def test_a_secondary_zone_the_qualifier_read_from_the_tracker_is_refused() -> No
 
 def test_a_negative_stop_buffer_is_refused() -> None:
     with pytest.raises(ValueError, match="fraction of the zone width"):
-        StructureStrategy(qualifier=_Marked(), stop_buffer=Decimal("-0.1"))
+        ageless_structure(qualifier=_Marked(), stop_buffer=Decimal("-0.1"))
 
 
 def test_a_stop_that_would_land_at_or_below_zero_arms_nothing() -> None:
@@ -819,7 +1058,7 @@ def test_a_stop_that_would_land_at_or_below_zero_arms_nothing() -> None:
     """
     candles = [*_IMPULSE]
     candles[3] = bar(3, open_="99", close="99", high="100", low="1")  # zone [1, 100]
-    signals = _drive(StructureStrategy(qualifier=_Marked()), candles)
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Marked()), candles)
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -830,7 +1069,31 @@ def test_a_zone_with_no_width_arms_nothing() -> None:
     candles = [*_IMPULSE]
     # A marking candle with no range: high == low, so top == bottom.
     candles[3] = bar(3, open_="100", close="100", high="100", low="100")
-    signals = _drive(StructureStrategy(qualifier=_Marked()), candles)
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Marked()), candles)
+
+    assert all(bar_signals == [] for bar_signals in signals)
+
+
+def test_a_return_pass_zone_with_no_width_arms_nothing_either() -> None:
+    """The degenerate region, on the entry point that never had its own test for it.
+
+    Both edges at one price: the stop lands on the entry and the trade carries no risk at all,
+    which is a division by zero in sizing rather than a free trade. `EDGE` has refused that since
+    the guard was written, and `MIDPOINT` and `RETURN_PASS` were assumed to — but the assumption
+    was never asserted.
+
+    ⚠️ **It went untested because coverage could not see it.** All three entry points shared one
+    `if` inside one method, so the single `EDGE` scenario above lit that line for all of them and
+    the file read 99%. Splitting the three into their own activations is what separated the paths
+    and made the hole visible: same code, same behaviour, one fewer place to be wrong without
+    anyone noticing.
+    """
+    candles = [*_IMPULSE]
+    # A marking candle with no range: high == low, so top == bottom.
+    candles[3] = bar(3, open_="100", close="100", high="100", low="100")
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.RETURN_PASS), candles
+    )
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -854,10 +1117,10 @@ def test_the_order_fills_at_the_zone_edge_when_price_comes_back() -> None:
         bar(12, open_="105", close="99", high="106", low="98"),  # reaches the 100 edge
     ]
     result = run(
-        candles=[*_IMPULSE, *pullback],
+        candles=[*BULLISH_START, *_IMPULSE, *pullback],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=_Marked()),
+        strategy=ageless_structure(qualifier=_Marked()),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -866,6 +1129,201 @@ def test_the_order_fills_at_the_zone_edge_when_price_comes_back() -> None:
     assert fill.time == _at(12)
     assert fill.price == Decimal("100")  # the zone's edge, not bar 12's open of 105
     assert fill.order.stop_loss == Decimal("89")
+
+
+# --------------------------------------------------------------------------- #
+# Where the order rests inside the region — his book, 11.4                     #
+# --------------------------------------------------------------------------- #
+
+# The region `_IMPULSE` marks is [90, 100] — the author's own example numbers. Midpoint 95,
+# stop 89, and the level a visited region is abandoned at is 100 + 10 = 110.
+_PULLBACK_TO_98 = [
+    bar(10, open_="124", close="115", high="125", low="114"),
+    bar(11, open_="115", close="105", high="116", low="104"),
+    bar(12, open_="105", close="99", high="106", low="98"),  # takes the 100 edge, stops at 98
+]
+
+
+def test_the_midpoint_entry_rests_at_half_the_region_with_the_same_stop() -> None:
+    """His model 3: the order at 50%, the stop still past the far edge.
+
+    The stop is the point. Both models put it at 89, so the midpoint entry buys the *same* zone
+    with 6 of risk instead of 11 — which is his whole argument for preferring it: "um stop 50%
+    menor... permite aumentar a quantidade de contratos, mantendo o mesmo valor de risco".
+    """
+    [edge] = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.EDGE), _IMPULSE
+    )[9]
+    [midpoint] = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _IMPULSE
+    )[9]
+
+    assert (edge.limit_price, edge.stop_loss) == (Decimal("100"), Decimal("89"))
+    assert (midpoint.limit_price, midpoint.stop_loss) == (Decimal("95"), Decimal("89"))
+
+
+def test_the_midpoint_is_rounded_so_the_tick_never_flatters_the_entry() -> None:
+    """A region whose half lands between ticks, on both sides of the book.
+
+    [90.01, 100] is 9.99 wide, so the true midpoint is 95.005 and AAPL's grid is a cent. A buy
+    rounds **up** to 95.01 and the mirrored sell rounds **down** to 104.99: in both directions the
+    order is placed at a price no better than the midpoint really is. Rounding to nearest would
+    hand half of all odd-width regions an entry the method never offered — the same reasoning that
+    already rounds the stop away from the zone rather than onto it.
+    """
+    odd = list(_IMPULSE)
+    odd[3] = bar(3, open_="99", close="99", high="100", low="90.01")  # region [90.01, 100]
+
+    [long_] = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), odd
+    )[9]
+    [short] = _drive(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _mirror(odd)
+    )[9]
+
+    assert long_.limit_price == Decimal("95.01")  # up, away from a better buy
+    assert short.limit_price == Decimal("104.99")  # down, away from a better sell
+
+
+def test_the_pullback_that_fills_on_the_edge_leaves_the_midpoint_on_the_stone() -> None:
+    """The same three bars, the two models, opposite outcomes — through the real broker.
+
+    Price dips to 98. That is through the 100 edge and nowhere near 95, so the edge model is in a
+    trade and the midpoint model is not. His own words for the second half: "muitas vezes o preço
+    não chega aos 50% e acaba indo em direção ao nosso alvo sem nos ativar, deixando-nos na
+    pedra". It is the cost of the smaller stop, and it is a real cost.
+    """
+
+    def entries(entry_point: ZoneEntryPoint) -> list[Fill]:
+        result = run(
+            candles=[*BULLISH_START, *_IMPULSE, *_PULLBACK_TO_98],
+            timeframe=HOUR,
+            instrument=AAPL,
+            strategy=ageless_structure(qualifier=_Marked(), entry_point=entry_point),
+            broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+            risk=FixedRisk(volume=Decimal(1)),
+        )
+        return [f for f in result.fills if f.order.intent is SignalKind.ENTRY]
+
+    [filled] = entries(ZoneEntryPoint.EDGE)
+    assert (filled.time, filled.price) == (_at(12), Decimal("100"))
+    assert entries(ZoneEntryPoint.MIDPOINT) == []
+
+
+def test_the_midpoint_order_outlives_the_touch_that_retires_its_region() -> None:
+    """⚠️ **The rule this whole entry point depends on**, and the one a mutant kills silently.
+
+    Bar 12 wicks to 98, which takes the region's 100 edge: under his indicator the region is
+    *mitigated* there, and it is never offered again. Until now that same touch also withdrew the
+    order, because on the edge the two were one event. An order at 95 has not been reached by it.
+
+    Bar 13 goes to 94 and the order fills at 95 — one bar after the region was retired. Restore
+    "mitigation withdraws the order" and this is a scenario with no trade in it at all, which is
+    what `ZoneEntryPoint.MIDPOINT` would be worth.
+    """
+    result = run(
+        candles=[
+            *BULLISH_START,
+            *_IMPULSE,
+            *_PULLBACK_TO_98,
+            bar(13, open_="99", close="95", high="100", low="94"),  # reaches the 95 midpoint
+        ],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT),
+        broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    [fill] = [f for f in result.fills if f.order.intent is SignalKind.ENTRY]
+    assert fill.time == _at(13)  # a bar *after* the region was mitigated
+    assert fill.price == Decimal("95")
+    assert fill.order.stop_loss == Decimal("89")
+
+
+def test_an_order_is_abandoned_once_price_leaves_a_region_it_visited() -> None:
+    """His second event: the region was visited, the order was not reached, the market left.
+
+    Bar 12 takes the 100 edge and turns at 98. Bar 14 reaches 110 — one region height above the
+    edge — and the order is withdrawn there. "Quando o preço atingir 110 a ordem deve ser retirada
+    e a entrada neste ponto deve ser abortada."
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
+        [
+            *_IMPULSE,
+            *_PULLBACK_TO_98,
+            bar(13, open_="99", close="105", high="106", low="99"),
+            bar(14, open_="105", close="109", high="110", low="104"),  # 110: one height clear
+        ],
+    )
+
+    [armed] = signals[9]
+    assert (armed.kind, armed.limit_price) == (SignalKind.ENTRY, Decimal("95"))
+    assert signals[13] == []  # 106 is not yet a height clear of the edge
+    [cancel] = signals[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, armed.client_id)
+
+
+def test_the_sell_side_abandons_below_the_region_it_visited() -> None:
+    """The same rule mirrored — and it is a separate test because the sign is a separate line.
+
+    ⚠️ Written after a review found that **nothing here exercised the sell branch of
+    `_ran_away`**. Two plausible mutants survived the whole suite: flipping `bottom - clearance`
+    to `bottom + clearance`, and pasting the buy branch's `candle.high >=` over it. Either one
+    withdraws the order on the bar the region is *mitigated* — reinstating, on the sell side only,
+    the exact behaviour this entry point exists to remove. `MIDPOINT` would then be a setting that
+    cannot produce a short trade, in a backtest that runs clean and reports a number.
+
+    Mirrored about 200: the supply region is [100, 110], the order rests at 105 with its stop at
+    111, and abandonment is one height *below* the near edge — 90. Bar 12 wicks to 94 and takes
+    the 100 edge; bar 13 goes no lower than 94; bar 14 reaches 90.
+    """
+    signals = _drive(
+        ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
+        _mirror(
+            [
+                *_IMPULSE,
+                *_PULLBACK_TO_98,
+                bar(13, open_="99", close="105", high="106", low="99"),
+                bar(14, open_="105", close="109", high="110", low="104"),
+            ]
+        ),
+    )
+
+    [armed] = signals[9]
+    assert (armed.side, armed.limit_price, armed.stop_loss) == (
+        Side.SHORT,
+        Decimal("105"),
+        Decimal("111"),
+    )
+    assert signals[12] == []  # the bar that mitigates the region does not take the order
+    assert signals[13] == []  # 94 is not yet a height clear of the 100 edge
+    [cancel] = signals[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, armed.client_id)
+
+
+def test_an_order_is_not_abandoned_while_price_has_never_come_back() -> None:
+    """⚠️ **The clock starts at the visit, not at the arming** — and getting this backwards is not
+    a corner case, it retires every order the setup ever places.
+
+    A demand region is *left behind* by an upward impulse, so at the moment it is marked price is
+    already walking away from it: `_IMPULSE` itself trades 110, 115 and 125 while the region sits
+    at [90, 100]. Bar 10 here goes to 131. Measured against the first version of this rule, which
+    counted clearance from the arming bar: 9 of this file's tests failed, all of them orders
+    abandoned before price had any chance to return.
+
+    Nothing is emitted after the entry. The order is still waiting for exactly the event it was
+    placed for.
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT),
+        [*_IMPULSE, bar(10, open_="124", close="130", high="131", low="123")],  # never near 100
+    )
+
+    [armed] = signals[9]
+    assert armed.kind is SignalKind.ENTRY
+    assert signals[10] == []
 
 
 def test_a_one_bar_round_trip_through_the_real_broker_spends_the_zone() -> None:
@@ -886,10 +1344,10 @@ def test_a_one_bar_round_trip_through_the_real_broker_spends_the_zone() -> None:
         bar(13, open_="101", close="104", high="105", low="99"),  # back through the level
     ]
     result = run(
-        candles=[*_IMPULSE, *pullback],
+        candles=[*BULLISH_START, *_IMPULSE, *pullback],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=_Sticky()),
+        strategy=ageless_structure(qualifier=_Sticky()),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -898,6 +1356,413 @@ def test_a_one_bar_round_trip_through_the_real_broker_spends_the_zone() -> None:
     assert [(f.time, f.price) for f in entries] == [(_at(12), Decimal("100"))]  # once, not twice
     [trade] = result.trades
     assert (trade.entry_price, trade.exit_price) == (Decimal("100"), Decimal("89"))
+
+
+# --------------------------------------------------------------------------- #
+# The return pass — his book, 11.5                                             #
+# --------------------------------------------------------------------------- #
+
+# The same [90, 100] region, read the other way round. Nothing is placed when the zone is armed;
+# price coming back to the 50% at 95 is what places a **stop** at 101, one buffer above the near
+# edge, and the order fills only if price then passes back out through the region. It is cancelled
+# at 89 — the level its own stop would have occupied.
+_RETURN_TO_95 = bar(13, open_="99", close="97", high="100", low="95")
+
+
+def _return_pass() -> StructureStrategy:
+    """A return-pass setup on the first zone the detector marks, and nothing after it.
+
+    `_Once` rather than `_Marked` because these scenarios drive price back through the region and
+    out again, which is decisive enough to mark zones of its own — and a qualifier that took one
+    would leave the test asserting two setups at once.
+    """
+    return ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.RETURN_PASS)
+
+
+def test_the_return_pass_waits_for_the_fifty_percent_before_placing_anything() -> None:
+    """His model 11.5 against his 11.4, on the *same bars*, which is the whole contrast.
+
+    `MIDPOINT` places on bar 9, the bar its zone is armed on, and waits inside the region for
+    price to come down to it. `RETURN_PASS` places nothing there — the book stays empty for four
+    bars — and the order appears on bar 13, the bar price finally reaches the 50%. The level that
+    was the *entry* for one model is the *trigger* for the other, which is his own sentence:
+    "atinge o 50% onde o gatilho anterior ativaria o trade".
+
+    ⚠️ The two assertions on bar 9 are not decoration. Without the empty one, every claim here
+    also passes for an implementation that places at arming and merely computes a different
+    price — which is the likeliest wrong version of this feature.
+    """
+    bars = [*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95]
+
+    midpoint = _drive_from_bullish(
+        ageless_structure(qualifier=_Once(), entry_point=ZoneEntryPoint.MIDPOINT), bars
+    )
+    return_pass = _drive_from_bullish(_return_pass(), bars)
+
+    [resting] = midpoint[9]
+    assert (resting.limit_price, resting.stop_loss) == (Decimal("95"), Decimal("89"))
+    assert return_pass[9] == []  # nothing is placed when the zone is armed
+    assert return_pass[10] == return_pass[11] == return_pass[12] == []
+    [placed] = return_pass[13]
+    assert placed.kind is SignalKind.ENTRY
+
+
+def test_the_return_pass_order_is_a_stop_above_the_region_not_a_limit_inside_it() -> None:
+    """The order shape, and it is the reason this entry point could not be a third price.
+
+    A demand [90, 100] triggers at 101 — the near edge plus the same buffer that puts the stop at
+    89 — and it is a `stop_price`, not a `limit_price` (ADR-0016). The distinction is not
+    bookkeeping: a limit at 101 with the market at 97 rests on the wrong side and `Signal` refuses
+    it, and a limit that *were* accepted there would fill instantly at the next open instead of
+    waiting for price to break back out of the region, which is the entire event this model is
+    named after.
+
+    Its cost is visible in the same numbers: risk 12, against the edge's 11 and the midpoint's 6.
+    That is what it pays for not needing price to turn while sitting inside the region.
+    """
+    [placed] = _drive_from_bullish(_return_pass(), [*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95])[13]
+
+    assert placed.limit_price is None
+    assert (placed.side, placed.stop_price, placed.stop_loss) == (
+        Side.LONG,
+        Decimal("101"),
+        Decimal("89"),
+    )
+
+
+def test_the_sell_side_of_the_return_pass_places_its_stop_below_the_region() -> None:
+    """The mirror, and a separate test because every one of these signs is a separate line.
+
+    ⚠️ Written up front rather than after a review asked for it: the last entry point shipped six
+    tests, all of them long, and two plausible mutants lived in the mute half. Mirrored about 200
+    the supply region is [100, 110], price comes back up to the 50% at 105, and the sell stop
+    goes one buffer *below* the near edge at 99 with its stop at 111.
+    """
+    [placed] = _drive(_return_pass(), _mirror([*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95]))[13]
+
+    assert placed.limit_price is None
+    assert (placed.side, placed.stop_price, placed.stop_loss) == (
+        Side.SHORT,
+        Decimal("99"),
+        Decimal("111"),
+    )
+
+
+def test_the_trigger_is_the_same_fifty_percent_the_midpoint_entry_rests_at() -> None:
+    """Both models read one function, and this is the zone where reading two would show.
+
+    ⚠️ **On [90, 100] the midpoint is 95 and every plausible rounding agrees**, so the ordinary
+    fixture cannot tell a shared level from two coincidentally-equal ones. Widened by a single
+    tick to [90, 100.01], half falls at 95.005 — off the grid — and the direction of the rounding
+    becomes observable: `MIDPOINT` rests at 95.01, and the return pass arms on a bar whose low
+    reaches 95.01 but not on one that stops at 95.02.
+
+    A `ROUND_FLOOR` trigger would put the level at 95.00 and let the 95.01 bar pass untouched,
+    with nothing else in the suite disagreeing.
+    """
+    odd = list(_IMPULSE)
+    odd[3] = bar(3, open_="99", close="99", high="100.01", low="90")
+
+    [resting] = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), odd
+    )[9]
+    assert resting.limit_price == Decimal("95.01")
+
+    def armed_on(low: str) -> list[Signal]:
+        stops_at = bar(13, open_="99", close="97", high="100", low=low)
+        return _drive_from_bullish(_return_pass(), [*odd, *_PULLBACK_TO_98, stops_at])[13]
+
+    assert armed_on("95.02") == []  # a tick short of the level, and it is a tick that counts
+    [placed] = armed_on("95.01")
+    assert placed.kind is SignalKind.ENTRY
+    # ⚠️ The trigger is off the grid on this zone too — 100.01 + 1.001 = 101.011 — so the
+    # direction of *its* rounding is observable here and nowhere else in the suite. Rounded down
+    # it would sit at 101.01: a tick nearer the market, filling on bars that should not reach it,
+    # and sizing the trade against a risk of 12.02 rather than the 12.03 the region asks for.
+    assert (placed.stop_price, placed.stop_loss) == (Decimal("101.02"), Decimal("88.99"))
+
+
+def test_the_sell_trigger_is_the_same_fifty_percent_its_midpoint_entry_rests_at() -> None:
+    """The identity mirrored, on the zone where the direction of the rounding is observable.
+
+    ⚠️ **This is the half the previous entry point shipped without.** Its sell tests all used
+    regions whose midpoint lands on the grid, where both roundings agree — so a mutant reading
+    half with the *buy's* rounding lived in the mute side of the mirror, and only the sell was
+    wrong. The reflection of [90, 100.01] is supply [99.99, 110]: half falls at 104.995, a sell
+    is rounded down, and `MIDPOINT` rests at 104.99. Rounded up the level would be 105.00, the
+    return pass would arm a bar later than the model it is defined against, and nothing
+    downstream would say so.
+
+    The trigger's own rounding is here for the same reason: 99.99 - 1.001 = 98.989 is off the
+    grid, and rounded up it would be 98.99 — a tick nearer the market, on the side where nearer
+    means easier to trigger.
+    """
+    odd = list(_IMPULSE)
+    odd[3] = bar(3, open_="99", close="99", high="100.01", low="90")
+
+    [resting] = _drive(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MIDPOINT), _mirror(odd)
+    )[9]
+    assert resting.limit_price == Decimal("104.99")
+
+    def armed_on(low: str) -> list[Signal]:
+        # Parametrised on the pre-mirror *low*, as the other mirrored scenarios are: reflection
+        # turns a low of 95.01 into the high of 104.99 that this test is actually about.
+        stops_at = bar(13, open_="99", close="97", high="100", low=low)
+        return _drive(_return_pass(), _mirror([*odd, *_PULLBACK_TO_98, stops_at]))[13]
+
+    assert armed_on("95.02") == []  # mirrors to a high of 104.98, a tick short of the level
+    [placed] = armed_on("95.01")
+    assert placed.kind is SignalKind.ENTRY
+    assert (placed.stop_price, placed.stop_loss) == (Decimal("98.98"), Decimal("111.01"))
+
+
+def test_the_return_pass_order_is_cancelled_where_its_own_stop_would_have_been() -> None:
+    """His cancel rule: reach 89 and the order is taken back rather than left to fill.
+
+    The setup never opens a trade that is already stopped — which is what a fill at 101 would be
+    on a bar that had traded 89 first. `_ran_away`, the rule that ends the other two entry points,
+    cannot serve here: it fires when price *leaves* the region upward, and leaving upward is this
+    order's fill.
+
+    The paired bar is what makes it a rule rather than a coincidence — a low of 90 leaves the
+    order standing, and only 89 takes it back.
+    """
+
+    def after(low: str) -> list[list[Signal]]:
+        return _drive_from_bullish(
+            _return_pass(),
+            [
+                *_IMPULSE,
+                *_PULLBACK_TO_98,
+                _RETURN_TO_95,
+                bar(14, open_="97", close="92", high="98", low=low),
+            ],
+        )
+
+    standing = after("90")
+    assert standing[14] == []  # one above the level, and the order is still there
+
+    cancelled = after("89")
+    [placed] = cancelled[13]
+    [cancel] = cancelled[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, placed.client_id)
+
+
+def test_the_sell_side_is_cancelled_above_its_region() -> None:
+    """The cancel rule mirrored — the sign of the comparison is its own line, so it is its own
+    test. Supply [100, 110]: the order rests at 99 and is taken back when price reaches 111."""
+
+    def after(low: str) -> list[list[Signal]]:
+        # Parametrised on the *low*, because reflection swaps the extremes: a pre-mirror low of 89
+        # is the mirrored bar's high of 111. Naming the level we care about directly would build a
+        # candle that does not contain its own body, which `Candle` refuses.
+        return _drive(
+            _return_pass(),
+            _mirror(
+                [
+                    *_IMPULSE,
+                    *_PULLBACK_TO_98,
+                    _RETURN_TO_95,
+                    bar(14, open_="97", close="92", high="98", low=low),
+                ]
+            ),
+        )
+
+    assert after("90")[14] == []  # mirrors to a high of 110, one short of the level
+    cancelled = after("89")  # mirrors to 111
+    [placed] = cancelled[13]
+    [cancel] = cancelled[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, placed.client_id)
+
+
+def test_the_cancel_level_is_the_orders_own_stop_on_a_zone_that_falls_between_ticks() -> None:
+    """One level, asserted against the order that carries it — not two that happen to agree.
+
+    ⚠️ **On [90, 100] the buffer lands on the grid**: 90 - 1 is 89 whichever way it is rounded,
+    so the ordinary fixture cannot tell a shared call from two expressions written separately.
+    Widened by a tick to [90, 100.01] the buffer is 1.001, the level falls at 88.999, and the
+    rounding becomes visible — the order's stop is 88.99 and so is the level that takes it back.
+
+    Rounded the other way the cancel would sit at 89.00 and retire the order on a bar whose low
+    was 89.00: a bar that never touched the stop, and that could go on to break 101.02 for a
+    legitimate trade. That trade would disappear from every backtest, filed as a cancellation,
+    with no test failing and nothing to say a level had drifted a tick.
+    """
+    odd = list(_IMPULSE)
+    odd[3] = bar(3, open_="99", close="99", high="100.01", low="90")
+
+    def after(low: str) -> list[list[Signal]]:
+        return _drive_from_bullish(
+            _return_pass(),
+            [
+                *odd,
+                *_PULLBACK_TO_98,
+                _RETURN_TO_95,  # a low of 95 still reaches this zone's 50%, which is 95.01
+                bar(14, open_="97", close="92", high="98", low=low),
+            ],
+        )
+
+    standing = after("89.00")
+    [placed] = standing[13]
+    assert placed.stop_loss == Decimal("88.99")
+    assert standing[14] == []  # one tick above its own stop, and the order is still there
+
+    cancelled = after("88.99")  # the stop's own level, to the tick
+    [cancel] = cancelled[14]
+    assert (cancel.kind, cancel.client_id) == (SignalKind.CANCEL, placed.client_id)
+
+
+def test_a_bar_that_reaches_the_cancel_level_and_the_trigger_fills_and_is_stopped() -> None:
+    """⚠️ The one bar where the cancel rule and the fill rule both apply, and the engine chooses.
+
+    Bar 14 opens at 98, wicks down to 89 — the level that takes the order back — and then trades
+    107, through the 101 trigger. Two rules answer on the same bar and only one thing can happen.
+    His rule says reaching 89 cancels; the engine fills and stops, for -12.
+
+    It is not lookahead, and it is the **pessimistic** of the two readings — cancelling would end
+    the bar at zero — so it is the safe way to be wrong, and it is what a real venue would do
+    with an order that was working when the market traded through it. But it is a precedence
+    nothing states, in a path whose own documentation says the opposite, so the number is nailed
+    down here rather than left to be rediscovered as a surprise in a backtest.
+    """
+    result = run(
+        candles=[
+            *BULLISH_START,
+            *_IMPULSE,
+            *_PULLBACK_TO_98,
+            _RETURN_TO_95,  # places the stop at 101; its cancel level is 89
+            bar(14, open_="98", close="103", high="107", low="89"),
+        ],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=_return_pass(),
+        broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    [trade] = result.trades
+    assert (trade.entry_price, trade.exit_price, trade.net_pnl) == (
+        Decimal("101"),
+        Decimal("89"),
+        Decimal("-12"),
+    )
+
+
+def test_the_return_pass_is_not_abandoned_by_the_rule_that_ends_the_other_two() -> None:
+    """The third of the three rules this model announces, and the one that had no test.
+
+    `_ran_away` retires `EDGE` and `MIDPOINT` when price leaves the region by a full height —
+    for an order waiting *inside* the zone, leaving is the trade going away. For `RETURN_PASS`
+    leaving upward is the **fill**, so the rule cannot serve, and wiring it back in survives
+    every other scenario in this file.
+
+    The bars that separate them: 12 touches the 100 edge and mitigates the region, 13 clears it
+    by a full height to 110 *without ever reaching the 50%*, and 14 comes back for 95.
+    `_ran_away` would have given the name up on bar 13, and the return the whole model exists to
+    wait for would arrive to find nothing armed.
+    """
+    out = _drive_from_bullish(
+        _return_pass(),
+        [
+            *_IMPULSE,
+            bar(10, open_="124", close="115", high="125", low="114"),
+            bar(11, open_="115", close="105", high="116", low="104"),
+            bar(12, open_="105", close="101", high="106", low="100"),  # first touch: mitigated
+            bar(13, open_="101", close="109", high="110", low="100"),  # a full height clear
+            bar(14, open_="101", close="97", high="101", low="95"),  # back for the 50%
+        ],
+    )
+
+    assert (out[12], out[13]) == ([], [])  # nothing placed on the way out, and nothing retired
+    [placed] = out[14]
+    assert (placed.kind, placed.stop_price, placed.stop_loss) == (
+        SignalKind.ENTRY,
+        Decimal("101"),
+        Decimal("89"),
+    )
+
+
+def test_a_bar_that_closes_past_the_trigger_gives_the_zone_up_instead_of_placing() -> None:
+    """⚠️ The bar that does the whole move by itself, and the one place this could fill a trade
+    the method never took.
+
+    A bar can wick to the 50% and close back out above 101. The order cannot be placed there: a
+    buy stop at 101 with the market at 103 reaches the book already triggered, so it becomes a
+    market order at the next open — sized against a level price never had to break. ADR-0016 says
+    exactly this about a stop on the wrong side, and `Signal` would raise.
+
+    The zone is given up rather than kept waiting, because keeping it would place the order on
+    some later dip to the 50% and enter on a break of a level price has already broken.
+
+    Three closes, one boundary: 100 places, 101 does not, 103 does not. The first is what makes
+    the other two mean something — the machine is speaking on these bars, and choosing silence.
+    """
+
+    def closing_at(close: str, high: str) -> list[Signal]:
+        wick = bar(13, open_="99", close=close, high=high, low="95")
+        return _drive_from_bullish(_return_pass(), [*_IMPULSE, *_PULLBACK_TO_98, wick])[13]
+
+    [placed] = closing_at("100", "100")
+    assert placed.stop_price == Decimal("101")
+    assert closing_at("101", "102") == []  # closed *at* the trigger: already through it
+    assert closing_at("103", "104") == []
+
+
+def test_a_sell_trigger_the_buffer_drives_to_zero_or_below_arms_nothing() -> None:
+    """⚠️ A guard this entry point needs and the other two do not, because it inverts which side
+    of the region carries the order.
+
+    For a limit entry only a *demand* zone can push a level through zero — its stop is the one
+    below the region — and `_entry_for` has refused that for as long as it has existed. A return
+    pass puts the **order** on the low side of a supply zone, so it is the supply mirror that
+    breaks: here the stop is a healthy 310 and the trigger is -100.
+
+    That asymmetry is the test. Both sides go quiet under an absurd buffer, but for different
+    reasons — the buy on the old stop guard, the sell on the new trigger one — so the sell side
+    is the only one that says anything about the line this test exists for. Without the guard the
+    order is not merely wrong, it raises: `Signal` refuses a non-positive stop price outright.
+    """
+    absurd = ageless_structure(
+        qualifier=_Once(), entry_point=ZoneEntryPoint.RETURN_PASS, stop_buffer=Decimal(20)
+    )
+    bars = [*_IMPULSE, *_PULLBACK_TO_98, _RETURN_TO_95]
+
+    assert _drive(absurd, _mirror(bars))[13] == []
+    # And the same bars at the real buffer do place, so the silence above is a refusal rather
+    # than a scenario that never reached the trigger.
+    [placed] = _drive(_return_pass(), _mirror(bars))[13]
+    assert placed.stop_price == Decimal("99")
+
+
+def test_a_zone_given_up_before_its_order_reached_the_book_sends_no_cancel() -> None:
+    """A cancel for an order the venue never received is noise, and 11.5 would make it routine.
+
+    Under the two limit entries an armed zone has an order on the book within the same bar, so
+    withdrawing an unplaced one was a rarity the broker's tolerant `False` covered. A return-pass
+    zone is armed with nothing on the book for as many bars as price takes to come back, and most
+    never get an order at all.
+
+    Both halves are asserted here, because silence only means something if the machine had a
+    chance to speak: the zone that never placed goes quietly, and the one that did sends its
+    cancel by name.
+    """
+    never_placed = _drive_from_bullish(
+        _return_pass(),
+        [*_IMPULSE, *_PULLBACK_TO_98, bar(13, open_="99", close="92", high="100", low="89")],
+    )
+    assert never_placed[13] == []  # it reached the 50% and the cancel level on one bar
+
+    placed_then_cancelled = _drive_from_bullish(
+        _return_pass(),
+        [
+            *_IMPULSE,
+            *_PULLBACK_TO_98,
+            _RETURN_TO_95,
+            bar(14, open_="97", close="92", high="98", low="89"),
+        ],
+    )
+    assert [s.kind for s in placed_then_cancelled[14]] == [SignalKind.CANCEL]
 
 
 # --------------------------------------------------------------------------- #
@@ -940,6 +1805,9 @@ _CHOCH_DOWN = StructureBreak(
     trend=Trend.BEARISH,
     level=Decimal("90"),
     time=_at(15),
+    # The qualifier never reads this; the bar the broken low came from is bar 9, the same
+    # place the impulse started, which is what an anchor and an origin coinciding looks like.
+    level_time=_at(9),
     origin=Decimal("125"),
     origin_time=_at(9),
 )
@@ -984,8 +1852,8 @@ def test_choch_arms_the_zone_its_break_marked() -> None:
     Every bar before the choch is silence, and that includes bar 9: the BOS marks two demand
     zones, and this setup is not interested in a continuation's leavings.
     """
-    strategy = StructureStrategy(qualifier=ChochQualifier(), name="choch")
-    signals = _drive(strategy, [*_IMPULSE, *_CHOCH_LEG])
+    strategy = ageless_structure(qualifier=ChochQualifier(), name="choch")
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *_CHOCH_LEG])
 
     assert all(bar_signals == [] for bar_signals in signals[:13])
     [signal] = signals[13]
@@ -999,7 +1867,9 @@ def test_a_choch_without_inefficiency_offers_no_trade() -> None:
     """The author's rule verbatim: "sem ineficiência não tem trade". The same fall through the
     same anchor, but every three-bar window overlaps — no gap, no zone, and the change of
     character goes untraded rather than inventing a region to sell from."""
-    signals = _drive(StructureStrategy(qualifier=ChochQualifier()), [*_IMPULSE, *_GAPLESS_LEG])
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=ChochQualifier()), [*_IMPULSE, *_GAPLESS_LEG]
+    )
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -1014,10 +1884,10 @@ def test_the_choch_order_fills_on_the_pullback() -> None:
         bar(16, open_="112", close="116", high="121", low="111"),  # reaches the 120 edge
     ]
     result = run(
-        candles=[*_IMPULSE, *_CHOCH_LEG, *pullback],
+        candles=[*BULLISH_START, *_IMPULSE, *_CHOCH_LEG, *pullback],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=ChochQualifier()),
+        strategy=ageless_structure(qualifier=ChochQualifier()),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -1032,14 +1902,16 @@ def test_the_ladder_starts_at_the_zone_nearest_to_price() -> None:
     """With `allow_secondary` on and a leg that left two zones, the single live order hangs on
     the secondary — the pullback reaches it first; an order at the primary could only fill after
     price traversed the secondary whole. With the flag off the ladder is the primary alone."""
-    on = _drive(
-        StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+    on = _drive_from_bullish(
+        ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
         [*_IMPULSE, *_TWO_ZONE_LEG],
     )
     [signal] = on[15]
     assert (signal.limit_price, signal.stop_loss) == (Decimal("103"), Decimal("109.60"))
 
-    off = _drive(StructureStrategy(qualifier=ChochQualifier()), [*_IMPULSE, *_TWO_ZONE_LEG])
+    off = _drive_from_bullish(
+        ageless_structure(qualifier=ChochQualifier()), [*_IMPULSE, *_TWO_ZONE_LEG]
+    )
     [signal] = off[15]
     assert (signal.limit_price, signal.stop_loss) == (Decimal("120"), Decimal("125.50"))
 
@@ -1065,10 +1937,10 @@ def test_a_stopped_rung_hands_the_order_to_the_primary() -> None:
         bar(18, open_="112", close="116", high="121", low="111"),  # fills the primary at 120
     ]
     result = run(
-        candles=[*_IMPULSE, *_TWO_ZONE_LEG, *after],
+        candles=[*BULLISH_START, *_IMPULSE, *_TWO_ZONE_LEG, *after],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        strategy=ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -1097,10 +1969,10 @@ def test_a_winning_trade_leaves_no_order_on_the_primary() -> None:
         bar(18, open_="112", close="116", high="121", low="111"),  # 120 is reached; no order
     ]
     result = run(
-        candles=[*_IMPULSE, *_TWO_ZONE_LEG, *after],
+        candles=[*BULLISH_START, *_IMPULSE, *_TWO_ZONE_LEG, *after],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        strategy=ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
         broker=BacktestBroker(
             instrument=AAPL, initial_capital=Decimal(10_000), take_profit_rr=Decimal(1)
         ),
@@ -1208,7 +2080,7 @@ def test_a_rung_that_died_without_a_trade_passes_to_the_next() -> None:
     )
     spent = (
         TrackedZone(block=primary),
-        TrackedZone(block=secondary, touched=True, mitigated=True),
+        TrackedZone(block=secondary, mitigated=True),
     )
     assert qualifier.qualify(_ctx(zones=spent)) is primary
 
@@ -1227,10 +2099,10 @@ def test_the_ladder_survives_an_order_the_gap_discarded() -> None:
         bar(17, open_="112", close="116", high="121", low="111"),  # reaches the primary at 120
     ]
     result = run(
-        candles=[*_IMPULSE, *_TWO_ZONE_LEG, *gap],
+        candles=[*BULLISH_START, *_IMPULSE, *_TWO_ZONE_LEG, *gap],
         timeframe=HOUR,
         instrument=AAPL,
-        strategy=StructureStrategy(qualifier=ChochQualifier(), allow_secondary=True),
+        strategy=ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
         broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
         risk=FixedRisk(volume=Decimal(1)),
     )
@@ -1263,6 +2135,7 @@ def test_a_new_choch_replaces_the_ladder() -> None:
         trend=Trend.BULLISH,
         level=Decimal("125"),
         time=_at(19),
+        level_time=_at(9),
         origin=Decimal("87"),
         origin_time=_at(17),
     )
@@ -1278,6 +2151,41 @@ def test_a_new_choch_replaces_the_ladder() -> None:
     # An empty-handed choch also replaces: the old rung must not survive the turn of trend.
     empty = qualifier.qualify(_ctx(break_=contrary, marked=(), zones=(TrackedZone(block=primary),)))
     assert empty is None
+
+
+def test_a_bos_in_the_same_direction_also_empties_the_ladder() -> None:
+    """His rule 4, and the half that used to leak. Stated by him on 05/08/2026:
+
+        "um choch de baixa cria a zona, se depois ele fizer um bos de baixa, a entrada de choch
+        morre. mesma coisa um bos de baixa, se ele faz um segundo bos a entrada do 1 morreu e só
+        pode entrar pelo segundo. e assim vai"
+
+    Only the regions of the **most recent** break are live. The continuation setup always worked
+    this way — a new BOS replaces its whole ladder — but this qualifier only ever reacted to
+    another CHoCH, so any number of BOS could confirm while an order still rested on a region the
+    structure had left behind. Measured over 3480 AAPL H1 candles: 21 of 34 changes of character
+    were followed by at least one BOS before the next one, 53 breaks in all, up to 7 stacked on a
+    single choch.
+
+    The region here is handed back **alive and present** in `context.zones`, which is the whole
+    difference between this test and a vacuous one. The ladder walk already skips a rung it
+    cannot find or that is no longer usable, so a scenario that withheld the zone would return
+    `None` whether the ladder was emptied or not — right answer, wrong reason, and the rule would
+    still be deletable. Here the only thing that can silence the qualifier is the BOS itself.
+
+    A BOS leaves regions of its own, but they belong to the continuation setup, not to this one.
+    That is why the ladder empties rather than refills.
+    """
+    primary = _supply("120", "125", 9, primary=True)
+    alive = (TrackedZone(block=primary),)
+    qualifier = ChochQualifier()
+    assert qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(primary,), zones=alive)) is primary
+
+    # The structure moves on in the same direction. Nothing happened to the region itself.
+    assert alive[0].usable
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(), zones=alive)) is None
+    # And it stays dead to this setup on later bars, not just on the bar the BOS confirmed.
+    assert qualifier.qualify(_ctx(zones=alive)) is None
 
 
 def test_an_outcome_and_a_new_choch_on_one_bar_settle_in_order() -> None:
@@ -1299,6 +2207,7 @@ def test_an_outcome_and_a_new_choch_on_one_bar_settle_in_order() -> None:
         trend=Trend.BULLISH,
         level=Decimal("125"),
         time=_at(19),
+        level_time=_at(9),
         origin=Decimal("87"),
         origin_time=_at(17),
     )
@@ -1339,6 +2248,7 @@ _BOS_DOWN = StructureBreak(
     trend=Trend.BEARISH,
     level=Decimal("87"),
     time=_at(17),
+    level_time=_at(15),
     origin=Decimal("100"),
     origin_time=_at(15),
 )
@@ -1358,15 +2268,47 @@ def _bos_zone(bottom: str, top: str, index: int, *, primary: bool) -> OrderBlock
 
 
 def test_continuation_arms_the_bos_zone_after_a_change_of_character() -> None:
-    """The setup end to end on the real detectors. Two earlier breaks are pointedly ignored — the
-    bootstrap BOS on bar 9 (a trend with no reversal behind it) and the change of character on bar
-    13 (whose region is the choch setup's) — and the sell goes on only when a break *in the new
-    trend's favour* confirms on bar 17, resting on the [96, 100] its leg left, stop a tenth of the
-    width past the top."""
-    strategy = StructureStrategy(qualifier=ContinuationQualifier(), name="continuation")
-    signals = _drive(strategy, [*_IMPULSE, *_CHOCH_LEG, *_CONT_LEG])
+    """The setup end to end on the real detectors: arm, drop on the turn, re-arm the other way.
 
-    assert all(bar_signals == [] for bar_signals in signals[:17])
+    The scenario reads differently than it used to, and the difference is the transcription being
+    honest. Bar 9 used to be dismissed as "a bootstrap BOS — a trend with no reversal behind it",
+    but a trend with nothing behind it is precisely what a fresh machine can no longer produce:
+    the uptrend bar 9 continues was opened by a change of character on bar -1, so continuation is
+    eligible and **must** arm there. Refusing would be the bug.
+
+    So the sequence has three acts, and each is a rule of the setup:
+
+    * **bar 9** — a break in favour of the standing uptrend arms the long on the demand zone
+      [90, 100] its leg left, stop at 89;
+    * **bar 13** — the change of character turns the bias, and a turn drops the standing ladder,
+      so the resting order is withdrawn. The choch's own region belongs to the choch setup, not
+      to this one, so nothing is armed to replace it;
+    * **bar 17** — a break in favour of the *new* trend arms the sell on [96, 100], stop a tenth
+      of the width past the top.
+
+    That last line is the one this test was written for and it is unchanged: 96 and 100.40.
+    """
+    strategy = ageless_structure(qualifier=ContinuationQualifier(), name="continuation")
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *_CHOCH_LEG, *_CONT_LEG])
+
+    [armed] = signals[9]
+    assert armed.kind is SignalKind.ENTRY
+    assert armed.side is Side.LONG
+    assert (armed.limit_price, armed.stop_loss) == (Decimal("100"), Decimal("89"))
+
+    # The order comes back on bar 11, and under his rule for a different reason than it used to:
+    # bar 11 dips to 98, through the region's top of 100, so price *took* the region — this is
+    # where a broker would have filled the order. The turn on bar 13 then has nothing left to
+    # drop. That the turn drops a ladder still standing is its own scenario,
+    # `test_a_turn_drops_the_standing_continuation_ladder`, where price stays clear of the region.
+    [dropped] = signals[11]
+    assert dropped.kind is SignalKind.CANCEL
+    assert dropped.client_id == armed.client_id  # the very order bar 9 placed
+
+    # And nothing from there to the break that confirms the new trend: the choch's own region is
+    # not continuation's to trade.
+    assert all(bar_signals == [] for bar_signals in signals[12:17])
+
     [signal] = signals[17]
     assert signal.kind is SignalKind.ENTRY
     assert signal.side is Side.SHORT
@@ -1375,9 +2317,23 @@ def test_continuation_arms_the_bos_zone_after_a_change_of_character() -> None:
 
 
 def test_continuation_ignores_a_break_with_no_change_of_character_behind_it() -> None:
-    """The impulse alone is a bootstrap BOS up — a trend appearing from nothing. Continuation
-    needs the turn first, so it stays silent through a break that a choch never opened."""
-    signals = _drive(StructureStrategy(qualifier=ContinuationQualifier()), _IMPULSE)
+    """Continuation needs the turn first, so it stays silent through a break no choch opened.
+
+    The scenario had to be rebuilt, and the rebuild is the more honest one. It used to run the
+    bullish impulse on a fresh machine and call that "a bootstrap BOS up — a trend appearing from
+    nothing". The transcription makes that shape impossible: a fresh machine starts at the
+    indicator's `DIR = -1`, so a rising impulse confirms nothing at all, and the test would have
+    passed on a scenario where continuation was never offered anything to refuse.
+
+    The mirrored impulse is the real instance of the case, and there is exactly one: the **first
+    bearish BOS of a fresh series** is the only break that can have no change of character behind
+    it, because every later break is downstream of one.
+
+    And the silence is continuation *declining*, not the machinery having nothing to offer:
+    `test_the_geometry_mirrors_for_a_supply_zone` drives this very stream on a fresh machine under
+    `_Marked` and gets an entry on bar 9. The zones are there; this qualifier refuses them.
+    """
+    signals = _drive(ageless_structure(qualifier=ContinuationQualifier()), _mirror(_IMPULSE))
 
     assert all(bar_signals == [] for bar_signals in signals)
 
@@ -1487,8 +2443,9 @@ def test_a_winning_continuation_rung_ends_the_ladder() -> None:
 
 def test_max_bos_one_trades_only_the_first_break_after_a_turn() -> None:
     """`max_bos=1` is the strict reading — the one BOS that confirms the new trend, nothing after
-    it until the trend turns again. The second favourable break is ignored and the first leg's
-    ladder is left standing."""
+    it until the trend turns again. ⚠️ The second favourable break opens no trade **and ends the
+    first leg's ladder** (his rule, 29/09): this used to leave that ladder standing, and a region
+    below a structure that had already moved on filled hours later."""
     qualifier = ContinuationQualifier(max_bos=1)
     qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
 
@@ -1502,7 +2459,23 @@ def test_max_bos_one_trades_only_the_first_break_after_a_turn() -> None:
     )
 
     both = (TrackedZone(block=first), TrackedZone(block=second))
-    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both)) is first
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both)) is None
+    # And nothing comes back on the quiet bars after it.
+    assert qualifier.qualify(_ctx(zones=both)) is None
+
+
+def test_a_zoneless_break_ends_the_ladder_before_it() -> None:
+    """His rule (29/09): a new BOS the same way ends the entries of the one before, and a BOS
+    that left no inefficiency is a new BOS all the same — it opens nothing, and it ends the old
+    ladder rather than leaving it resting."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+    first = _bos_zone("96", "100", 15, primary=True)
+    alive = (TrackedZone(block=first),)
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(first,), zones=alive)) is first
+
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(), zones=alive)) is None
+    assert not qualifier.holds_rungs
 
 
 def test_by_default_every_favourable_break_re_arms() -> None:
@@ -1639,3 +2612,3186 @@ def test_max_bos_below_one_is_refused() -> None:
     almost always a mistake, so it is refused rather than silently armed to never fire."""
     with pytest.raises(ValueError, match="count of breaks"):
         ContinuationQualifier(max_bos=0)
+
+
+# --------------------------------------------------------------------------- #
+# The conduction: structure moves the stop, and none of it is an exit           #
+# --------------------------------------------------------------------------- #
+
+
+def _held(*, entry: str, stop: str, side: Side = Side.LONG) -> Position:
+    """An open position with known levels, so what the conduction computes can be measured."""
+    return Position(
+        symbol=AAPL.symbol,
+        side=side,
+        volume=Decimal(1),
+        entry_price=Decimal(entry),
+        entry_time=_at(0),
+        stop_loss=Decimal(stop),
+        initial_stop_loss=Decimal(stop),
+    )
+
+
+def _trails(signals: list[list[Signal]]) -> list[list[Decimal | None]]:
+    """The stop levels asked for on each bar. `None` is kept rather than filtered: a
+    `MODIFY_STOP` carrying no level is a bug that must not read as "no signal"."""
+    return [
+        [s.stop_loss for s in per_bar if s.kind is SignalKind.MODIFY_STOP] for per_bar in signals
+    ]
+
+
+# Two more bars of trend after the impulse: a pair of corrections, then a close above the 125 top.
+# `MarketStructure` confirms a second bullish BOS on bar 12, whose origin is bar 11's low of 117.
+_SECOND_LEG = [
+    bar(10, open_="123", close="123", high="124", low="119"),  # correction 1
+    bar(11, open_="121", close="121", high="122", low="117"),  # correction 2 -> armed
+    bar(12, open_="127", close="127", high="128", low="122"),  # close 127 > 125 -> BOS up
+]
+
+
+def test_the_first_break_in_favour_brings_the_stop_to_the_entry_price() -> None:
+    """The author's rule, first half: breakeven at the first break of structure in our favour.
+
+    Bar 9 closes 124 above the 123 top and confirms a bullish BOS — the open long's first break.
+    The stop goes to 100, the entry. The multiple-of-risk rule stays out of it on purpose: risk
+    is 15, so its line is at 130 and bar 9's high of 125 does not reach it. One rule at a time.
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked()),
+        _IMPULSE,
+        position_on=frozenset({9}),
+        held=_held(entry="100", stop="85"),
+    )
+
+    assert _trails(signals)[9] == [Decimal("100")]
+
+
+def test_every_break_after_the_first_puts_the_stop_at_the_leg_origin() -> None:
+    """The second half, and the reason `origin` is the field that matters.
+
+    Bar 12 confirms a second bullish BOS. Its `level` is 125 — the price the move went *through* —
+    and its `origin` is 117, the low the move came *from*. The stop goes to 117: behind the
+    structure being ridden, at the price whose loss would turn the trend, rather than inside the
+    move where an ordinary pullback would take it out.
+
+    Bars 10 and 11 are the corrections that armed the break, and they ask for nothing. Between
+    breaks the stop does not move — there is no bar-by-bar trailing in this method either.
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked()),
+        [*_IMPULSE, *_SECOND_LEG],
+        position_on=frozenset({9, 10, 11, 12}),
+        held=_held(entry="100", stop="85"),
+    )
+
+    assert _trails(signals)[9] == [Decimal("100")]
+    assert _trails(signals)[10] == []
+    assert _trails(signals)[11] == []
+    assert _trails(signals)[12] == [Decimal("117")]
+
+
+def test_a_break_against_the_open_trade_moves_nothing() -> None:
+    """Only breaks in the trade's own direction conduct it. Bar 9's BOS is bullish and this
+    position is short, so it is not this trade's news. Its risk line is out of reach too — entry
+    100 against a stop of 115 puts twice the risk at 70, and the bar's low is 120."""
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked()),
+        _IMPULSE,
+        position_on=frozenset({9}),
+        held=_held(entry="100", stop="115", side=Side.SHORT),
+    )
+
+    assert _trails(signals)[9] == []
+
+
+def test_touching_the_multiple_of_risk_brings_the_stop_to_the_entry_price() -> None:
+    """The rule that does not need structure at all, and the exact boundary of its trigger.
+
+    Entry 100 against a stop of 91 risks 9, so twice the risk sits at **118** — bar 8's high,
+    exactly. Reaching the line is reaching it. Bar 8 confirms no break of structure, so the level
+    asked for here can only have come from the risk rule.
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked()),
+        _IMPULSE,
+        position_on=frozenset({8}),
+        held=_held(entry="100", stop="91"),
+    )
+
+    assert _trails(signals)[8] == [Decimal("100")]
+
+
+def test_switching_breakeven_off_leaves_structure_conducting_alone() -> None:
+    """`None` is a setting, not a missing value: the risk rule is gone and structure is not.
+
+    The same bar 8 that reached twice the risk above now asks for nothing, while bar 9's break
+    still moves the stop. Being able to run the method without the risk rule is what makes "does
+    taking this trade to breakeven early pay for itself" a question a backtest can answer.
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), breakeven_at_r=None),
+        _IMPULSE,
+        position_on=frozenset({8, 9}),
+        held=_held(entry="100", stop="91"),
+    )
+
+    assert _trails(signals)[8] == []
+    assert _trails(signals)[9] == [Decimal("100")]
+
+
+def test_the_bar_that_filled_does_not_credit_its_own_excursion() -> None:
+    """A limit fills in the middle of a bar the trade did not live through, and the favourable
+    extreme of that bar is usually **before** the fill.
+
+    The ladder scenario is the measurement. The sell fills at 103 on bar 16, whose low is 87 —
+    past its own twice-the-risk line of 89.80 (entry 103, stop 109.60). The order rests where
+    price has to come *back* to, so the market fell to 87 while the account was flat and only
+    then rose through 103 to fill. Crediting that print would arm breakeven on the fill bar, and
+    bar 17 would take the trade out at 103 instead of 109.60 — a full-R loser turned into a
+    scratch, in a backtest where no number looks wrong and nothing reads the future.
+
+    So the trade must still lose its full R. A regression test with a price attached.
+    """
+    after = [
+        bar(16, open_="88", close="96", high="104", low="87"),  # fills at 103; its low is pre-fill
+        bar(17, open_="96", close="112", high="113", low="95"),  # takes the untouched stop
+        bar(18, open_="112", close="116", high="121", low="111"),
+    ]
+    result = run(
+        candles=[*BULLISH_START, *_IMPULSE, *_TWO_ZONE_LEG, *after],
+        timeframe=HOUR,
+        instrument=AAPL,
+        strategy=ageless_structure(qualifier=ChochQualifier(), allow_secondary=True),
+        broker=BacktestBroker(instrument=AAPL, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(volume=Decimal(1)),
+    )
+
+    [first] = result.trades
+    assert (first.entry_price, first.exit_price) == (Decimal("103"), Decimal("109.60"))
+    assert first.r_multiple == Decimal(-1)
+
+
+def test_a_short_is_conducted_by_the_mirror_of_the_same_rules() -> None:
+    """The bearish mirror of the impulse: bar 9 confirms a bearish BOS, and the open short's
+    first break in favour brings its stop to the entry price."""
+    signals = _drive_from_bearish(
+        ageless_structure(qualifier=_Marked()),
+        _mirror(_IMPULSE),
+        position_on=frozenset({9}),
+        held=_held(entry="100", stop="115", side=Side.SHORT),
+    )
+
+    assert _trails(signals)[9] == [Decimal("100")]
+
+
+def test_the_breakeven_multiple_must_be_positive() -> None:
+    """Zero is refused rather than read as "off" — `None` is how the rule is switched off. A
+    multiple of zero would put the trigger on the entry price itself, arming breakeven on the
+    very bar that opened the trade."""
+    with pytest.raises(ValueError, match="breakeven R multiple"):
+        ageless_structure(qualifier=_Marked(), breakeven_at_r=Decimal(0))
+
+
+# A third leg after `_SECOND_LEG`, so one instance can see a break of structure, then a *second*
+# trade, then another break. Bar 12's gap over bar 10's high is what makes it a leg with an
+# inefficiency; bar 15 breaks the 131 top it left, and its origin is 123.
+_THIRD_LEG = [
+    bar(13, open_="129", close="129", high="130", low="125"),  # correction 1
+    bar(14, open_="127", close="127", high="128", low="123"),  # correction 2
+    bar(15, open_="133", close="133", high="134", low="132"),  # close 133 > 131 -> BOS up
+]
+
+_GAPPED_SECOND_LEG = [
+    bar(10, open_="123", close="123", high="124", low="119"),  # correction 1
+    bar(11, open_="121", close="121", high="122", low="117"),  # correction 2
+    bar(12, open_="128", close="130", high="131", low="126"),  # gaps over 124 -> BOS up
+]
+
+
+def test_the_count_of_breaks_belongs_to_the_trade_not_to_the_strategy() -> None:
+    """A second trade's first break is *its* first, and it gets breakeven — not the origin.
+
+    Bar 9 breaks structure with one trade open, so that trade has had its first. Bar 15 breaks
+    structure again with a **different** trade open, and it must be read as that trade's first:
+    the stop goes to 100, its entry. A count that survived the change of trade would send bar 15
+    down the second-break branch and put the stop at the leg's origin, **123** — and on a long
+    entered at 100 that is not merely a different number, it is a stop the trade has already
+    passed, so `tighten` accepts it and the position goes on carrying risk the method says was
+    given up two bars ago.
+
+    The two trades are told apart by `entry_time`, which is why this cannot depend on the fill
+    ever having been announced. Twice the risk stays out of it: the stop is 80, so that line sits
+    at 140 and nothing in this stream reaches it.
+    """
+    stream = [*_IMPULSE, *_GAPPED_SECOND_LEG, *_THIRD_LEG]
+    first = _held(entry="100", stop="80")
+    second = Position(
+        symbol=AAPL.symbol,
+        side=Side.LONG,
+        volume=Decimal(1),
+        entry_price=Decimal(100),
+        entry_time=stream[13].time,  # a different trade: same levels, later entry
+        stop_loss=Decimal(80),
+        initial_stop_loss=Decimal(80),
+    )
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked()),
+        stream,
+        held_by_bar={9: first, 13: second, 14: second, 15: second},
+    )
+
+    assert _trails(signals)[9] == [Decimal("100")]  # trade one's first break
+    assert _trails(signals)[13] == []
+    assert _trails(signals)[14] == []
+    assert _trails(signals)[15] == [Decimal("100")]  # trade two's first break, not the origin
+
+
+# The mirrored impulse breaks structure downward on bar 9; price then climbs back through the
+# anchor that break left, which confirms a bullish CHoCH on bar 11 (level 110).
+_CLIMB_BACK = [
+    bar(10, open_="80", close="95", high="98", low="78"),
+    bar(11, open_="95", close="115", high="118", low="94"),
+]
+
+
+def test_a_change_of_character_in_our_favour_is_not_a_break_in_our_favour() -> None:
+    """The author's rule names the **BOS**, and reading it literally is a decision with teeth.
+
+    Bar 11 confirms a bullish CHoCH while a long is open — structurally good news, pointing our
+    way. It moves nothing. A version that counted it would not merely act one event early: it
+    would spend the *first break* slot on the change of character, so the BOS that actually
+    follows would take the second-break branch and hand the stop a leg origin instead of the
+    entry price. Every rung of that trade's stop after it would be one step wrong.
+
+    Twice the risk is out of reach here as well (entry 100 against a stop of 85 puts it at 130,
+    and the bar's high is 118), so silence is the only correct answer.
+    """
+    signals = _drive(
+        ageless_structure(qualifier=_Marked()),
+        [*_mirror(_IMPULSE), *_CLIMB_BACK],
+        position_on=frozenset({10, 11}),
+        held=_held(entry="100", stop="85"),
+    )
+
+    assert _trails(signals)[11] == []
+
+
+# --------------------------------------------------------------------------- #
+# An order that never reached the book                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _drive_with_a_refusal(refused_bar: int) -> list[list[Signal]]:
+    """The measured EURUSD window, with the entry armed on `refused_bar` refused by the broker.
+
+    ⚠️ **The refusal is delivered on the bar *after* it happened**, because that is the only
+    place the loop can put it (`Context.refusals`) — the context for a bar is built before the
+    strategy speaks, and there is nothing to refuse until it has. Reproducing that here rather
+    than handing the refusal to its own bar is the difference between testing the rule and
+    testing a convenience.
+
+    ⚠️ **The real window, not a synthetic one.** Probed at all fifteen cuts of the golden
+    `ma_cross` document, that strategy arms nothing at all — it enters at market — so a scenario
+    built on it could not distinguish an implementation that re-offered from one that did not.
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    out: list[list[Signal]] = []
+    pending: tuple[Refusal, ...] = ()
+
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(arms_a_resting_limit()):
+            signals = list(
+                phase.on_bar(
+                    Context(
+                        candle=candle,
+                        instrument=EURUSD,
+                        account=account,
+                        refusals=pending,
+                    )
+                )
+            )
+            out.append(signals)
+            pending = ()
+            if index == refused_bar:
+                pending = tuple(
+                    Refusal(
+                        client_id=signal.client_id,
+                        intent=signal.kind,
+                        refused_by=RefusedBy.BROKER,
+                        reason=signal.reason,
+                        detail="the venue would not take it",
+                    )
+                    for signal in signals
+                    if signal.kind is SignalKind.ENTRY
+                )
+    return out
+
+
+def test_a_zone_whose_order_was_refused_may_be_offered_again() -> None:
+    """**The ghost's third door, closed.** A refused order is not resting anywhere, so the zone
+    it was waiting at was never traded — and the author's rule draws the line at the fill.
+
+    Measured on `arms_a_resting_limit` (`scratchpad/probe_reoffer.py`): the phase arms
+    `demand-20240103T0200-1` on bar 61, and with the refusal observed it arms the same region
+    again on bar 62 under `-2`.
+
+    ⚠️ **The new name is the load-bearing half.** Re-offering under the old one would be refused
+    a second time as a duplicate — by a broker answering an entirely different question — and
+    the retry would never converge. The name changes because the region goes back through
+    `_may_arm`, which is the same door a withdrawal leaves it at.
+    """
+    signals = _drive_with_a_refusal(refused_bar=61)
+
+    [armed] = signals[61]
+    [re_armed] = signals[62]
+
+    assert armed.kind is SignalKind.ENTRY
+    assert armed.client_id == "demand-20240103T0200-1"
+    assert re_armed.kind is SignalKind.ENTRY, "the refused zone was never offered again"
+    assert re_armed.client_id == "demand-20240103T0200-2", "it was re-offered under the old name"
+    assert re_armed.limit_price == armed.limit_price, "a different level; this is another trade"
+
+
+def test_a_refused_order_is_forgotten_rather_than_withdrawn() -> None:
+    """⚠️ **A refusal is not a cancellation, and emitting one is the bug seen from the far side.**
+    `_withdraw` takes back an order that is resting; a refused order never reached a book, so a
+    cancel for it is a round trip the venue can only answer "no" to — under a name it has never
+    heard of.
+
+    Measured on the same window: today the phase carries the refused name from bar 61 to bar
+    109 and then sends exactly that phantom cancel. With the refusal observed, bar 62 emits an
+    entry and **nothing else**, and the cancel on 109 names the order that actually exists.
+    """
+    signals = _drive_with_a_refusal(refused_bar=61)
+
+    kinds = [signal.kind for signal in signals[62]]
+    assert SignalKind.CANCEL not in kinds, "a cancel was sent for an order the venue never accepted"
+
+    [cancel] = signals[109]
+    assert cancel.kind is SignalKind.CANCEL
+    assert cancel.client_id == "demand-20240103T0200-2", (
+        "the withdrawal still names the refused order rather than the one that replaced it"
+    )
+
+
+def test_a_refusal_naming_an_order_it_no_longer_holds_is_ignored() -> None:
+    """⚠️ **Written because the obvious implementation passed every other test here.** A version
+    that forgot its armed order on *any* refusal — rather than on one naming that order —
+    survived the two above, because in both of them the only refusal in flight is the one for
+    the order being held. The scenario could not tell the two apart, so it proved neither.
+
+    A refusal for a name the phase is no longer holding is not news: it has already been acted
+    upon, and the order the phase *is* holding is a different one that may be resting perfectly
+    well. Forgetting it would place a second limit on the same zone — under a third name — while
+    the second one sits in the book.
+
+    The stale refusal here names `-1`, the order refused on bar 61, and is delivered on bar 63,
+    by which time bar 62 has already re-armed the region as `-2`.
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    stale = Refusal(
+        client_id="demand-20240103T0200-1",
+        intent=SignalKind.ENTRY,
+        refused_by=RefusedBy.BROKER,
+        reason="entry.choch",
+        detail="a refusal for an order that was dealt with two bars ago",
+    )
+
+    out: list[list[Signal]] = []
+    pending: tuple[Refusal, ...] = ()
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(arms_a_resting_limit()):
+            out.append(
+                list(
+                    phase.on_bar(
+                        Context(
+                            candle=candle,
+                            instrument=EURUSD,
+                            account=account,
+                            refusals=pending,
+                        )
+                    )
+                )
+            )
+            # Bar 61's order is refused; bar 63 is handed that same refusal a second time.
+            pending = (stale,) if index in (61, 62) else ()
+
+    assert out[62], "the fixture is broken: bar 62 did not re-arm, so bar 63 protects nothing"
+    assert out[62][0].client_id == "demand-20240103T0200-2", "bar 62 armed something unexpected"
+    assert out[63] == [], (
+        "the stale refusal forgot an order that was resting; the zone would now carry two limits"
+    )
+
+
+def test_a_refusal_born_in_the_loop_reaches_the_setup_that_armed_the_order() -> None:
+    """**The seam, end to end, with nothing fabricated.**
+
+    ⚠️ **Written because the two tests above cannot prove this and looked like they could.**
+    They build the `Refusal` by hand from the signal, so they exercise `_observe_refusal`
+    against a refusal the test itself named — which is true of the object and says nothing about
+    the loop that has to produce it. Measured: setting `client_id=None` at all four gates in
+    `loop.py` left every test in this file and in `test_loop.py` green, and put the ghost back
+    in full — the phase carried the dead name for 48 bars and sent a cancel for an order the
+    venue never accepted.
+
+    So here the loop is real, the strategy is real, the broker refuses for real, and the only
+    thing standing in for anything is *which* order gets refused.
+
+    The market is EURUSD, 2024-01-03: a bullish CHoCH confirms and a demand zone is armed at
+    1.03053. The venue will not take it — the shape of AutoTrading being off, which is the case
+    the transport in PR-304-B-D-2 makes reachable.
+    """
+
+    class RefusesTheFirstOrder(BacktestBroker):
+        """A real broker that declines exactly once, then behaves.
+
+        Subclassed rather than faked: the refusal has to travel the same path a real one does,
+        through `_step`, and a double large enough to do that would be a second broker.
+        """
+
+        def __init__(self) -> None:
+            super().__init__(instrument=EURUSD, initial_capital=Decimal("10000"))
+            self.refused: list[str | None] = []
+
+        def submit(self, order: OrderRequest) -> OrderResult:
+            if not self.refused:
+                self.refused.append(order.client_id)
+                return OrderResult(order=order, accepted=False, reason="the venue would not")
+            return super().submit(order)
+
+    broker = RefusesTheFirstOrder()
+    for _outcome in iter_run(
+        candles=iter(arms_a_resting_limit()),
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=build_setup({"type": "structure_choch"}),
+        broker=broker,
+        risk=PercentRiskManager(percent=Decimal("1")),
+    ):
+        pass
+
+    assert broker.refused == ["demand-20240103T0200-1"], (
+        "the broker refused something other than the armed limit; the scenario has drifted"
+    )
+    submitted = [order.client_id for order in broker.submitted]
+    assert "demand-20240103T0200-2" in submitted, (
+        "the refused zone was never offered again — the refusal did not reach the setup, or "
+        "reached it without the name of the order it refused"
+    )
+    assert "demand-20240103T0200-1" not in submitted, "the refused order counted as submitted"
+
+
+def test_a_refused_order_does_not_spend_its_zone_because_a_position_is_open() -> None:
+    """⚠️ **The one state where the order of the two observers decides the answer**, and it is
+    not reachable in a backtest — a position there can only come from an order that was
+    submitted. In live it is the case `_observe_fill`'s own docstring names: a reconnect that
+    swallows the fill, or a position opened outside this session.
+
+    Both are true at once here: the armed order was refused *and* a position is open. If the
+    fill is read first its fallback wins, and a zone whose order the venue never accepted is
+    marked traded — spent for ever, on a trade that does not exist. Reading the refusal first
+    forgets the name, and the fill observer correctly finds nothing of its own to claim.
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    candles = arms_a_resting_limit()
+
+    armed: Signal | None = None
+    re_armed: list[str | None] = []
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(candles[:70]):
+            refusals: tuple[Refusal, ...] = ()
+            position = None
+            if index == 62 and armed is not None:
+                refusals = (
+                    Refusal(
+                        client_id=armed.client_id,
+                        intent=SignalKind.ENTRY,
+                        refused_by=RefusedBy.BROKER,
+                        reason=armed.reason,
+                        detail="the venue would not take it",
+                    ),
+                )
+                position = Position(
+                    symbol=EURUSD.symbol,
+                    side=Side.LONG,
+                    volume=Decimal(1),
+                    entry_price=candle.open,
+                    entry_time=candle.time,
+                )
+            signals = list(
+                phase.on_bar(
+                    Context(
+                        candle=candle,
+                        instrument=EURUSD,
+                        account=account,
+                        position=position,
+                        refusals=refusals,
+                    )
+                )
+            )
+            for signal in signals:
+                if signal.kind is SignalKind.ENTRY:
+                    if index > 62:
+                        re_armed.append(signal.client_id)
+                    else:
+                        armed = signal
+
+    assert armed is not None, "the fixture is broken: nothing was ever armed"
+    assert armed.client_id == "demand-20240103T0200-1", "the scenario has drifted"
+
+    # ⚠️ **Asked of the machinery, not of `_traded`.** "The zone was spent" is only observable
+    # as "it is never offered again" — reaching into the private set would let the assertion
+    # pass against a phase that recorded the right thing and acted on the wrong one.
+    assert re_armed, (
+        "the zone was never offered again: a refused order was counted as the trade that "
+        "spends a region, because a position happened to be open on the same bar"
+    )
+    assert re_armed[0] == "demand-20240103T0200-2", "it was re-offered under an unexpected name"
+
+
+# --------------------------------------------------------------------------- #
+# The cap on how many times one zone may be offered (PR-304-B-D-2c)             #
+# --------------------------------------------------------------------------- #
+
+
+class _RefusesEverything(BacktestBroker):
+    """A permanent refusal, through the `BROKER` gate — which exists in a backtest too.
+
+    ⚠️ That is the point of using this gate rather than a live one: the cap is a rule about the
+    method, so the scenario that measures it must not need a venue.
+    """
+
+    def submit(self, order: OrderRequest) -> OrderResult:
+        return OrderResult(order=order, accepted=False, reason="permanently no")
+
+
+def _refusals_per_zone(broker: BacktestBroker) -> dict[str, int]:
+    counted: dict[str, int] = {}
+    for outcome in iter_run(
+        candles=arms_a_resting_limit(),
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=build_setup({"type": "structure_choch"}),
+        broker=broker,
+        risk=PercentRiskManager(percent=Decimal(1)),
+    ):
+        for refusal in outcome.refusals:
+            if refusal.client_id is None:
+                continue
+            zone = refusal.client_id.rsplit("-", 1)[0]
+            counted[zone] = counted.get(zone, 0) + 1
+    return counted
+
+
+def test_a_zone_stops_being_offered_after_three_refusals() -> None:
+    """The measured loop, capped. ⚠️ **Both zones are asserted, and that is what separates a cap
+    per zone from a cap per run.**
+
+    Measured on `arms_a_resting_limit` against a permanent refusal *without* the cap: the demand
+    zone is re-armed on every bar it stands — **48** in a row, bars 61 to 108 — and the supply
+    zone twice, 50 in all. A single counter for the whole strategy would come back as three
+    refusals total and satisfy any assertion made about one zone alone.
+
+    The supply zone at **2** is the other half: it is under the cap, so it is untouched. A cap
+    that fired early would show it at 1, and a test that only looked at the capped zone would not
+    notice.
+    """
+    counted = _refusals_per_zone(
+        _RefusesEverything(
+            instrument=EURUSD, initial_capital=Decimal(10_000), cost_model=NoCostModel()
+        )
+    )
+
+    # ⚠️ **The literal three, not `MAX_ARMING_ATTEMPTS`.** Written against the constant, this
+    # assertion follows the rule wherever it goes: a mutant raising the cap to four changes the
+    # code and the expectation together and survives — measured. The number is Guilherme's
+    # decision (see the constant's docstring), so changing it has to be a deliberate act that
+    # edits a test, not a one-character edit nothing notices.
+    assert counted == {
+        "demand-20240103T0200": 3,
+        "supply-20240104T1600": 2,
+    }, f"the cap did not bite per zone: {counted}"
+    assert MAX_ARMING_ATTEMPTS == 3, "the constant and the measured behaviour disagree"
+
+
+def test_the_cap_is_what_stops_it_and_not_the_market(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ **The vacuity check, and the test above is worth little without it.**
+
+    Three refusals could just as easily be a window where the zone stopped standing on its own —
+    and that reading would go on passing with the cap deleted. Lifting the cap out of reach
+    restores the measured **48**, so the number above is the rule doing something rather than the
+    market running out of bars.
+    """
+    monkeypatch.setattr(setups, "MAX_ARMING_ATTEMPTS", 10_000)
+
+    lifted = _refusals_per_zone(
+        _RefusesEverything(
+            instrument=EURUSD, initial_capital=Decimal(10_000), cost_model=NoCostModel()
+        )
+    )
+
+    assert lifted["demand-20240103T0200"] == 48, (
+        "the zone stopped being armed for a reason other than the cap; the golden above proves "
+        "nothing about the rule"
+    )
+    assert sum(lifted.values()) == 50
+
+
+def _entries_when_refused_on(
+    bars: set[int], refused_by: RefusedBy = RefusedBy.EXECUTOR
+) -> list[tuple[int, str | None]]:
+    """Every entry the phase emits when the name it is *currently holding* is refused on `bars`.
+
+    ⚠️ **Refuses the held name, not the one emitted on that bar**, which is the ADR-0024 path and
+    the only one that can produce refusals with healthy gaps between them: `submit` already
+    answered `accepted`, and the verdict arrives later from another process. `_drive_with_a_refusal`
+    refuses on the bar of the arming, so every refusal it makes is consecutive with the last —
+    a scenario in which "three in a row" and "three ever" cannot be told apart.
+
+    `refused_by` is a parameter so that the *only* thing separating the market tests below from
+    the cap tests above is that field. Same bars, same series, same phase: whatever they report
+    differently is the branch in `_observe_refusal` and nothing else (ADR-0025).
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    entries: list[tuple[int, str | None]] = []
+    pending: tuple[Refusal, ...] = ()
+    held: str | None = None
+
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(arms_a_resting_limit()):
+            signals = list(
+                phase.on_bar(
+                    Context(candle=candle, instrument=EURUSD, account=account, refusals=pending)
+                )
+            )
+            for signal in signals:
+                if signal.kind is SignalKind.ENTRY:
+                    entries.append((index, signal.client_id))
+                    held = signal.client_id
+            pending = ()
+            if index in bars and held is not None:
+                pending = (
+                    Refusal(
+                        client_id=held,
+                        intent=SignalKind.ENTRY,
+                        refused_by=refused_by,
+                        reason="entry.choch",
+                        detail="volume 0.11 is above the cap of 0.10",
+                    ),
+                )
+    return entries
+
+
+def test_refusals_with_healthy_resting_between_them_do_not_retire_a_zone() -> None:
+    """⚠️ **The cap is on refusals *in a row*, and this is the only test that says so.**
+
+    Counted cumulatively — which is what the first version of this rule did — three one-minute
+    hiccups spread across thirty-nine hours retire a setup exactly as a forty-five-minute outage
+    would. That is not the rule that was chosen, and it is not the cost that was quoted for it.
+
+    Measured on `arms_a_resting_limit`, refusing the held name on bars 61, 80 and 100 — the order
+    rests untouched for eighteen and nineteen bars in between:
+
+    * consecutive reading (this one): armed again as `-2`, `-3`, `-4`; the zone survives
+    * cumulative reading: the third refusal retires it and `-4` never exists
+
+    ⚠️ The mutant that restores the cumulative reading is one line, and it **survived all 806
+    engine tests** before this existed — the golden below refuses on every bar, and in that
+    scenario the two rules are the same rule.
+    """
+    scattered = _entries_when_refused_on({61, 80, 100})
+
+    names = [name for _bar, name in scattered if name and name.startswith("demand-")]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+        "demand-20240103T0200-4",
+    ], f"a zone that rested healthily between refusals was retired anyway: {names}"
+
+
+def test_three_refusals_in_a_row_do_retire_it() -> None:
+    """The other arm of the same fixture, and it is what makes the one above mean something.
+
+    Refused on 61, 62 and 63 — nothing rests in between — the zone stops being offered. Without
+    this, "the zone survived" could be read as a cap that never fires at all.
+    """
+    consecutive = _entries_when_refused_on({61, 62, 63})
+
+    names = [name for _bar, name in consecutive if name and name.startswith("demand-")]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+    ], f"the cap did not retire a zone refused three times running: {names}"
+
+
+def test_three_market_withdrawals_in_a_row_do_not_retire_a_zone() -> None:
+    """ADR-0025, and the separating half of the test directly above it.
+
+    **Identical bars, identical series, identical phase — one field differs.** The test above
+    refuses on 61, 62 and 63 with `EXECUTOR` and the zone is retired after the third; this one
+    refuses on the same three bars with `MARKET` and it is not. So whatever produces the
+    difference is the branch in `_observe_refusal` and can be nothing else, which is what a
+    scenario built separately could never claim.
+
+    The rule it pins: a gap is evidence about the market, not about the order or the account.
+    A cap exists to stop retrying something that will keep being turned away; retrying is not
+    what happened here, and counting it would retire a setup for having had an order open on a
+    Monday morning.
+
+    ⚠️ It also pins that the phase **stops holding the name**: the run re-arms as `-2`, `-3` and
+    `-4`. A branch that spared the cap but left `_armed` in place would emit `-1` and then go
+    quiet for ever, and the list would be one name long.
+    """
+    withdrawn = _entries_when_refused_on({61, 62, 63}, RefusedBy.MARKET)
+
+    names = [name for _bar, name in withdrawn if name and name.startswith("demand-")]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+        "demand-20240103T0200-4",
+    ], f"the market ending an order three times retired the zone: {names}"
+
+
+def test_a_market_withdrawal_between_two_refusals_breaks_the_streak() -> None:
+    """The reason the branch **pops** the count rather than merely skipping it.
+
+    ⚠️ **Three bars could not tell the two apart, and the first version of this test used
+    three.** Refused on 61 and 63 by a gate with the market ending the order on 62: popping
+    counts 1, gone, 1; skipping counts 1, 1, 2. Both stay under a cap of 3, both keep the zone,
+    both emit four names — and the mutant that deletes the `pop` survived the whole of
+    `test_setups.py`. A fourth gate refusal on 64 is what separates them: skipping reaches 3
+    there and retires the zone at four names, popping reaches 2 and arms a fifth.
+
+    The rule being pinned: what breaks a streak is an order that **reached the book**, and a
+    withdrawn order did reach it. That is the same evidence as an order that simply rested,
+    which the consecutive rule already treats as a reset.
+
+    ⚠️ Honest about its own standing: driven through the real loop, `pop` and skip are
+    equivalent, because a `MARKET` refusal for an order armed on N is delivered on N+2 at the
+    earliest, and `_observe_refusal` has already popped the count on N+1 by falling through the
+    `not gated` branch. This pins the intention where a `Context` built by hand can reach it —
+    the day delivery moves to the same bar (backlog), it stops being unreachable.
+    """
+    phase = build_setup({"type": "structure_choch"})
+    account = AccountState(balance=Decimal("10000"), equity=Decimal("10000"))
+    entries: list[str | None] = []
+    pending: tuple[Refusal, ...] = ()
+    held: str | None = None
+    by = {
+        61: RefusedBy.EXECUTOR,
+        62: RefusedBy.MARKET,
+        63: RefusedBy.EXECUTOR,
+        64: RefusedBy.EXECUTOR,
+    }
+
+    with localcontext(ENGINE_CONTEXT):
+        for index, candle in enumerate(arms_a_resting_limit()):
+            for signal in phase.on_bar(
+                Context(candle=candle, instrument=EURUSD, account=account, refusals=pending)
+            ):
+                if signal.kind is SignalKind.ENTRY:
+                    entries.append(signal.client_id)
+                    held = signal.client_id
+            pending = ()
+            if index in by and held is not None:
+                pending = (
+                    Refusal(
+                        client_id=held,
+                        intent=SignalKind.ENTRY,
+                        refused_by=by[index],
+                        reason="entry.choch",
+                        detail="",
+                    ),
+                )
+
+    names = [name for name in entries if name and name.startswith("demand-")]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+        "demand-20240103T0200-4",
+        "demand-20240103T0200-5",
+    ], f"a withdrawal between gate refusals did not reset the streak: {names}"
+
+
+def test_four_gate_refusals_in_a_row_retire_the_zone_the_same_fixture_keeps() -> None:
+    """The control for the test above, on the same four bars with the market taken out.
+
+    Without it, "five names" could be read as a cap that stopped firing at four refusals rather
+    than as the withdrawal resetting the count. Refused by a gate on 61, 62, 63 and 64: the zone
+    is retired after the third and only three names exist.
+    """
+    names = [
+        name
+        for _bar, name in _entries_when_refused_on({61, 62, 63, 64})
+        if name and name.startswith("demand-")
+    ]
+    assert names == [
+        "demand-20240103T0200-1",
+        "demand-20240103T0200-2",
+        "demand-20240103T0200-3",
+    ], f"four gate refusals in a row did not retire the zone: {names}"
+
+
+# --------------------------------------------------------------------------- #
+# The botinha activation — his chapter 11.2, through the whole machine          #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _LateMarked:
+    """Holds the first zone the detector marks and offers it only from a later bar.
+
+    Every other qualifier here names a zone the moment it is marked, which is *before* price has
+    come back to it — so whether a mitigated region may still be armed never comes up. Naming it
+    late is what makes that question reachable, and a qualifier reading a zone out of the past is
+    not a contrivance: it is how the continuation setup works.
+    """
+
+    after: int = 0
+    held: OrderBlock | None = None
+    bars: int = 0
+
+    def qualify(self, context: SetupContext) -> OrderBlock | None:
+        self.bars += 1
+        if self.held is None and context.marked:
+            self.held = context.marked[0]
+        return self.held if self.held is not None and self.bars >= self.after else None
+
+
+# Price comes back into the [90, 100] region his impulse marks, reacts down to 95, and turns.
+# ⚠️ **Every bar carries volume, and that is not decoration.** `AnchoredVWAP` skips a bar with
+# none, so the same bars without it produce no lines, no order and no trade — which is the pair
+# asserted below, and the reason a silence here would otherwise prove nothing.
+_REACTION_IN_THE_REGION = [
+    bar(10, open_="124", close="115", high="125", low="114", tick_volume=1000),
+    bar(11, open_="115", close="105", high="116", low="104", tick_volume=1000),
+    bar(12, open_="105", close="99", high="106", low="98", tick_volume=1000),  # takes the 100 edge
+    bar(13, open_="99", close="96", high="99.5", low="95", tick_volume=1500),  # down, low 95
+    bar(14, open_="96", close="97.5", high="98", low="95.5", tick_volume=1200),  # up: confirms
+]
+
+_DRIFTS_UP = [
+    bar(15, open_="97.5", close="97", high="98", low="96.5", tick_volume=900),
+    bar(16, open_="97", close="96.8", high="97.2", low="96.2", tick_volume=1100),
+]
+
+_QUIET = [
+    bar(15 + offset, open_="97.5", close="97.6", high="97.8", low="97.2", tick_volume=900)
+    for offset in range(8)
+]
+
+
+def _without_volume(candles: list[Candle]) -> list[Candle]:
+    return [
+        bar(
+            candle.time.hour,
+            open_=str(candle.open),
+            close=str(candle.close),
+            high=str(candle.high),
+            low=str(candle.low),
+        )
+        for candle in candles
+    ]
+
+
+def test_the_botinha_order_chases_its_band_bar_by_bar() -> None:
+    """The first activation whose resting order is re-priced, and this is what that looks like.
+
+    Bar 14 closes up and confirms the anchor, so the order goes on at 95.40 with its stop at
+    93.71. Every close after it moves both averages, so every bar withdraws what is resting and
+    places the new level — 95.69, then 95.82 — each under a name of its own, because the broker
+    refuses a `client_id` that is already resting.
+
+    ⚠️ **The risk shrinks while the entry climbs**: 1.69, 1.44, 1.23. `d` is a volume-weighted
+    mean of the bars' own shape, so quiet bars dilute the big one the anchor sits on. Nothing
+    about price *level* does that, which is why the two move in opposite directions.
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION, *_DRIFTS_UP],
+    )
+
+    [placed] = signals[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.side is Side.LONG
+    assert placed.limit_price == Decimal("95.40")
+    assert placed.stop_loss == Decimal("93.71")
+    assert placed.client_id == "demand-20240101T0300-1"
+
+    withdrawn, replaced = signals[15]
+    assert withdrawn.kind is SignalKind.CANCEL
+    assert withdrawn.client_id == "demand-20240101T0300-1"
+    assert replaced.limit_price == Decimal("95.69")
+    assert replaced.stop_loss == Decimal("94.25")
+    assert replaced.client_id == "demand-20240101T0300-1-r1"
+
+    withdrawn, replaced = signals[16]
+    assert withdrawn.client_id == "demand-20240101T0300-1-r1"
+    assert replaced.limit_price == Decimal("95.82")
+    assert replaced.stop_loss == Decimal("94.59")
+    # ⚠️ The revision is a number on a stem, not a suffix on a suffix: seven bars of chasing would
+    # otherwise mint `...-r1-r2-r3-r4-r5-r6`.
+    assert replaced.client_id == "demand-20240101T0300-1-r2"
+
+
+def test_the_botinha_window_running_out_takes_the_order_back_for_good() -> None:
+    """Seven bars after the confirmation, and then the name is given up rather than re-priced.
+
+    The order is placed on bar 14 and chased through six more; bar 21 is the seventh bar of the
+    window, and it produces a withdrawal with nothing behind it. His rule: the window running out
+    does not merely retire the order, it spends the **region** — so nothing is armed again after.
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION, *_QUIET],
+    )
+
+    assert [len(bar_signals) for bar_signals in signals[14:22]] == [1, 2, 2, 2, 2, 2, 2, 1]
+    [last] = signals[21]
+    assert last.kind is SignalKind.CANCEL
+    assert last.client_id == "demand-20240101T0300-1-r6"
+    assert all(bar_signals == [] for bar_signals in signals[22:])
+
+
+def test_the_same_bars_without_volume_place_no_botinha_order() -> None:
+    """The obligatory pair, and the whole reason the test helper knows about volume.
+
+    `AnchoredVWAP` skips a bar with no volume rather than dividing by zero, so a series without
+    it produces no lines for ever — no error, no order, and a report reading zero trades. The
+    same bars with volume place an order three bars in; the same bars without it place nothing at
+    all, and an assertion of silence that could not tell those two apart would pass for the wrong
+    reason.
+    """
+    with_volume = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION],
+    )
+    assert len(with_volume[14]) == 1
+
+    mute = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_without_volume(_REACTION_IN_THE_REGION)],
+    )
+    assert all(bar_signals == [] for bar_signals in mute)
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    [ZoneEntryPoint.EDGE, ZoneEntryPoint.MIDPOINT, ZoneEntryPoint.RETURN_PASS],
+)
+def test_an_older_entry_point_is_never_re_priced(entry_point: ZoneEntryPoint) -> None:
+    """The three region-arithmetic activations answer the same level on every bar, so the chase
+    never fires for them and nothing they do changes.
+
+    That is the whole reason the strategy may now ask every bar instead of once: the comparison
+    is what makes re-pricing opt-in, rather than a flag somebody has to remember to set. Driven
+    over the same bars that make the botinha replace its order five times, the midpoint entry
+    places once and is never withdrawn.
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=entry_point),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION, *_DRIFTS_UP],
+    )
+
+    entries = [s for bar_signals in signals for s in bar_signals if s.kind is SignalKind.ENTRY]
+    cancels = [s for bar_signals in signals for s in bar_signals if s.kind is SignalKind.CANCEL]
+    # Exactly one, not "at most": all three place on this fixture, and a `<=` would let a path
+    # that quietly placed nothing pass as a path that placed once and was never withdrawn.
+    assert len(entries) == 1
+    assert cancels == []
+
+
+def test_a_touched_region_is_refused_by_a_limit_entry_and_taken_by_the_botinha() -> None:
+    """The mitigation rule is the activation's, and this is the bar where the two answers differ.
+
+    The zone is offered late — after bar 12 has already taken its 100 edge — so it is mitigated
+    by the time anyone asks. For an order that waits *on* the region that touch was the event it
+    was placed for, and the zone is spent: the midpoint entry places nothing, ever. For a
+    formation the same touch is where the setup **begins**, so refusing there would refuse every
+    botinha that could ever exist.
+
+    Same bars, same qualifier, same region: only the activation differs, and one trades.
+    """
+    bars = [*_IMPULSE, *_REACTION_IN_THE_REGION, _DRIFTS_UP[0]]
+
+    limit = _drive_from_bullish(
+        ageless_structure(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.MIDPOINT),
+        bars,
+    )
+    assert all(bar_signals == [] for bar_signals in limit)
+
+    formation = _drive_from_bullish(
+        ageless_structure(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.BOTINHA),
+        bars,
+    )
+    [placed] = formation[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.limit_price == Decimal("95.40")
+
+
+def test_a_region_the_window_ran_out_on_is_never_offered_again() -> None:
+    """His rule, and it is the second way a zone can die.
+
+    Only a *fill* spends a region for the three older activations — an order withdrawn untouched
+    leaves it free to be named again (ADR-0015). The VWAP triggers add the other: a formation
+    whose seven bars ran out takes its region with it, and he said so in as many words when he
+    described the botinha.
+
+    Reaching it takes a qualifier that keeps offering the same zone, because every other one here
+    names a region once and would make the refusal unobservable. After bar 21 gives the order up,
+    the zone is offered on every remaining bar and armed on none of them.
+    """
+    signals = _drive_from_bullish(
+        ageless_structure(qualifier=_LateMarked(after=0), entry_point=ZoneEntryPoint.BOTINHA),
+        [*_IMPULSE, *_REACTION_IN_THE_REGION, *_QUIET],
+    )
+
+    [given_up] = signals[21]
+    assert given_up.kind is SignalKind.CANCEL
+    # The qualifier is still naming the region on every one of these bars; the chokepoint is what
+    # says no. Without it the setup would re-arm and start a fresh seven-bar window for ever.
+    assert all(bar_signals == [] for bar_signals in signals[22:])
+
+
+def test_the_hand_over_bar_reaches_the_new_regions_formation() -> None:
+    """A zone named while another is armed is observed twice on the same bar, and the second call
+    has to get through.
+
+    The strategy folds the bar into the activation before asking whether the resting order has
+    expired, and again after arming — because a zone named on this very bar has had no `observe`
+    at the first of those points. The guard that makes the pair idempotent is keyed to the bar's
+    time, so the reset when a *new* zone starts its formation is the only thing that lets the
+    second call past it.
+
+    ⚠️ **Without the reset the suite stays green and the numbers move.** The new region's
+    formation never sees the bar it was armed on. If that bar is one price is already inside — the
+    ordinary case, since a break that names a zone often happens while price is working in it —
+    then it is the anchor candidate, and losing it hands the anchor to the next low instead. A
+    different anchor is a different band, a different entry and a different stop, with nothing
+    anywhere to say so.
+
+    Asserted through the public surface: the hand-over bar enters the new region *and* closes up,
+    so it anchors that formation by itself, and his own arithmetic follows — the band is 100 to 90,
+    so the order is 91 and the stop 81. Formation blind to the bar, no lines, no order at all.
+    """
+    given_up = _zone_at("210", "200", hour=1)
+    named_now = _zone_at("100", "90", hour=2)
+    hand_over = bar(5, open_="91", high="110", low="90", close="100", tick_volume=1000)
+    context = Context(candle=hand_over, instrument=AAPL, account=_ACCOUNT)
+
+    activation = BotinhaActivation()
+    with localcontext(ENGINE_CONTEXT):
+        activation.observe(given_up, context=context)  # the zone being released
+        activation.observe(named_now, context=context)  # the hand-over
+        entry = activation.entry_for(named_now, context=context)
+
+    assert entry is not None
+    assert entry.limit_price == Decimal("91.00")
+    assert entry.stop_loss == Decimal("81.00")
+
+
+def _zone_at(top: str, bottom: str, *, hour: int) -> OrderBlock:
+    """A demand region with a time of its own, so two of them are different keys."""
+    marked = START.replace(hour=hour)
+    return OrderBlock(
+        kind=ZoneKind.DEMAND,
+        top=Decimal(top),
+        bottom=Decimal(bottom),
+        time=marked,
+        confirmed_at=marked,
+        break_kind=StructureKind.BOS,
+        primary=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The FFFD activation — his other entry of chapter 11.2, through the machine    #
+# --------------------------------------------------------------------------- #
+
+# Price comes back to the [90, 100] region, reacts down to 95, turns, and the market retakes
+# upward — which is the state his rule is written for. Bar 17 is the seller's push failing: it
+# trades to 99.60, above the central line at 97.70, and closes at 97.00, below it.
+_UP_TO_THE_PUSH = [
+    bar(10, open_="124", close="115", high="125", low="114", tick_volume=1000),
+    bar(11, open_="115", close="105", high="116", low="104", tick_volume=1000),
+    bar(12, open_="105", close="99", high="106", low="98", tick_volume=1000),
+    bar(13, open_="99", close="96", high="99.5", low="95", tick_volume=1500),
+    bar(14, open_="96", close="97.5", high="98", low="95.5", tick_volume=1200),
+    bar(15, open_="97.5", close="98.6", high="98.8", low="97.3", tick_volume=1000),
+    bar(16, open_="98.6", close="99.2", high="99.5", low="98.4", tick_volume=1100),
+    bar(17, open_="99.2", close="97.00", high="99.60", low="96.80", tick_volume=1400),
+]
+
+# Two quiet bars: neither breaks 99.61, and neither loses 96.80.
+_LAPSES = [
+    bar(18, open_="97.1", close="97.4", high="97.9", low="96.9", tick_volume=900),
+    bar(19, open_="97.4", close="97.6", high="98.2", low="97.1", tick_volume=900),
+]
+
+# One bar that gives up the trigger bar's own low.
+_LOSES_THE_LOW = [
+    bar(18, open_="97.1", close="96.60", high="97.3", low="96.50", tick_volume=900),
+    bar(19, open_="96.6", close="96.9", high="97.2", low="96.4", tick_volume=900),
+]
+
+# A complete second configuration: a reaction down, a bar closing up to anchor it, the market
+# retaking, and another push that fails. Appended to both scenarios above, unchanged.
+_CONFIGURES_AGAIN = [
+    bar(20, open_="97.6", close="96.0", high="97.8", low="95.8", tick_volume=1200),
+    bar(21, open_="96.0", close="96.8", high="97.0", low="95.9", tick_volume=1200),
+    bar(22, open_="96.8", close="97.5", high="97.6", low="96.7", tick_volume=1000),
+    bar(23, open_="97.5", close="96.2", high="98.0", low="96.0", tick_volume=1300),
+]
+
+
+def _fffd(candles: list[Candle]) -> list[list[Signal]]:
+    return _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD), candles
+    )
+
+
+def test_the_fffd_waits_above_the_trigger_bar_rather_than_below_the_market() -> None:
+    """The push fails, and the order goes on the *other* side of the market from the botinha's.
+
+    A stop at 99.61 — one tick over the bar's high — with the stop three ticks under its low at
+    96.77. `limit_price` is empty on purpose: this entry is bought on the way back *up* through a
+    level, where the botinha is bought on the way down to one. Two entries of the same chapter,
+    facing opposite directions, and `ZoneEntry` refuses to carry both meanings at once.
+    """
+    [placed] = _fffd([*_IMPULSE, *_UP_TO_THE_PUSH])[17]
+
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.side is Side.LONG
+    assert placed.stop_price == Decimal("99.61")
+    assert placed.stop_loss == Decimal("96.77")
+    assert placed.limit_price is None
+
+
+def test_the_fffd_sell_is_the_exact_mirror_of_the_buy() -> None:
+    """Reflected around 200, both levels reflect: 100.39 and 103.23.
+
+    On the sell side the bar has to trade *below* the central line and close *above* it, the order
+    waits under its low and the stop sits over its high. Three separate branches, and a sell that
+    inherited any one of them from the buy side still produces a short — at a price nobody chose.
+    """
+    [placed] = _drive(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD),
+        _mirror([*_IMPULSE, *_UP_TO_THE_PUSH]),
+    )[17]
+
+    assert placed.side is Side.SHORT
+    assert placed.stop_price == Decimal("100.39")  # 200 - 99.61
+    assert placed.stop_loss == Decimal("103.23")  # 200 - 96.77
+
+
+def test_the_order_lives_exactly_the_two_bars_he_gave_it() -> None:
+    """*"Vale 2 barras: a seguinte ou a próxima"* — so bar 18 is a chance and bar 19 is the last.
+
+    The withdrawal lands on 19 and not on 18, which is the whole of the inner clock. It is nested
+    inside the formation's own seven bars, and nested clocks are where an off-by-one hides: one
+    bar early and the second chance never exists, one late and a third one appears.
+    """
+    signals = _fffd([*_IMPULSE, *_UP_TO_THE_PUSH, *_LAPSES])
+
+    assert signals[18] == []
+    [taken_back] = signals[19]
+    assert taken_back.kind is SignalKind.CANCEL
+
+
+def test_a_lapsed_order_resets_the_reading_and_a_lost_low_ends_the_region() -> None:
+    """His two outcomes, and they produce the *same* signal on the bar they happen.
+
+    Both are a lone `CANCEL`. What tells them apart is only what the region is allowed to do
+    afterwards, so the test runs the identical continuation over both — a full second
+    configuration: a reaction, a bar closing up to anchor it, the market retaking, another failed
+    push.
+
+    Where the order merely lapsed, that second configuration arms again, and a third after it. Where
+    the trigger bar's low was lost, nothing ever happens on that region again.
+
+    ⚠️ **I had read these as one outcome.** Asked directly, he distinguished them — the lost low
+    *"mata a região"*, the lapsed order *"reseta a leitura ... tem que ocorrer uma nova
+    configuração"*. Had he not, this engine would have quietly gone on trading a region his method
+    had finished with, and no assertion about the cancel bar would have noticed.
+    """
+    lapsed = _fffd([*_IMPULSE, *_UP_TO_THE_PUSH, *_LAPSES, *_CONFIGURES_AGAIN])
+    annulled = _fffd([*_IMPULSE, *_UP_TO_THE_PUSH, *_LOSES_THE_LOW, *_CONFIGURES_AGAIN])
+
+    # The lapse: taken back on 19, and the region configures itself again on 20 and again on 23.
+    #
+    # ⚠️ **The cancel bars are asserted, not just the entries.** Every trigger after the first
+    # inherits a counter that the previous one left at two, so a missing reset gives the second
+    # and every later order **one** bar instead of the two he gave it — and the entries alone do
+    # not show it: they come out at the same prices under the same names either way. What moves
+    # is where the withdrawal lands, 21 instead of 22, and the trade that would have been taken
+    # on the second bar of a re-read simply never happens.
+    assert [
+        index for index, day in enumerate(lapsed) if any(s.kind is SignalKind.CANCEL for s in day)
+    ] == [19, 22]
+    reopened = [s for day in lapsed[20:] for s in day if s.kind is SignalKind.ENTRY]
+    assert [s.stop_price for s in reopened] == [Decimal("97.81"), Decimal("98.01")]
+    # Each replacement carries its own name: a cancelled id is free to reuse in a backtest, and
+    # still the wrong thing to hand a venue.
+    assert [s.client_id for s in reopened] == [
+        "demand-20240101T0300-1-r1",
+        "demand-20240101T0300-1-r2",
+    ]
+
+    # The annulment: taken back a bar earlier, on the bar that lost the low, and then silence
+    # through the very bars that armed the other one twice.
+    [ended] = annulled[18]
+    assert ended.kind is SignalKind.CANCEL
+    assert all(day == [] for day in annulled[19:])
+
+
+def test_the_same_bars_without_volume_place_no_fffd_order() -> None:
+    """The obligatory pair. No volume, no lines, no crossing to detect — and an assertion of
+    silence that could not tell that apart from "no setup here" would prove nothing at all."""
+    mute = [
+        bar(
+            candle.time.hour,
+            open_=str(candle.open),
+            close=str(candle.close),
+            high=str(candle.high),
+            low=str(candle.low),
+        )
+        for candle in _UP_TO_THE_PUSH
+    ]
+
+    assert len(_fffd([*_IMPULSE, *_UP_TO_THE_PUSH])[17]) == 1
+    assert all(day == [] for day in _fffd([*_IMPULSE, *mute]))
+
+
+_NEVER_PUSHES = [
+    *_UP_TO_THE_PUSH[:5],
+    *[
+        bar(
+            15 + offset,
+            open_=f"{97.5 + offset * 0.6:.2f}",
+            close=f"{98.1 + offset * 0.6:.2f}",
+            high=f"{98.3 + offset * 0.6:.2f}",
+            low=f"{97.4 + offset * 0.6:.2f}",
+            tick_volume=900,
+        )
+        for offset in range(8)
+    ],
+]
+"""The reaction and its confirmation, then eight bars that only ever rise: the market retakes and
+the seller never pushes, so no bar ever crosses the line and closes beyond it."""
+
+
+def test_a_formation_that_never_produced_a_trigger_ends_its_region() -> None:
+    """Seven bars pass with no failed push, the formation is over, and the region goes with it.
+
+    Nothing is ever placed, so nothing is ever cancelled — the zone is given up in silence, which
+    `_release` is careful to do without sending a cancel for an order the venue never received.
+
+    ⚠️ **What this test does and does not prove.** It drives the path and asserts the silence. It
+    does *not* separate the region being spent from the region merely holding a dead formation,
+    because a dead formation prices nothing either way — the same subsumption the botinha's spend
+    has, kept for the same reason: the rule belongs at the chokepoint, and the day `_formation_for`
+    is made to restart on a re-arm, this is what stops the region getting a second window.
+    """
+    assert all(day == [] for day in _fffd([*_IMPULSE, *_NEVER_PUSHES]))
+
+
+def test_an_order_that_lives_no_bars_is_refused() -> None:
+    """Zero would take the order back on the bar that placed it, before the market had a chance
+    at it — an entry that cannot be filled is not an entry."""
+    with pytest.raises(EngineError, match="lives at least one bar"):
+        FffdActivation(bars_to_break=0)
+
+
+def test_touching_the_trigger_bars_low_exactly_ends_the_region() -> None:
+    """ "Lost" includes reaching it, and the boundary decides which of two rules fires.
+
+    Bar 18 dips to 96.80, the trigger bar's own low, to the cent. Read as `<=` that is the low
+    lost: the order is cancelled on this bar and the region is finished. Read as `<` it is a bar
+    that merely came close, the order lives its second bar, and what ends it is the lapse — which
+    leaves the region free to configure itself again.
+
+    So one character decides between a region that is over and a region that trades again, on the
+    most ordinary bar in the method: the one that comes back exactly to the level everyone is
+    watching.
+    """
+    touches_it = [
+        bar(18, open_="97.1", close="97.0", high="97.3", low="96.80", tick_volume=900),
+        bar(19, open_="97.0", close="97.2", high="97.4", low="96.9", tick_volume=900),
+    ]
+    signals = _fffd([*_IMPULSE, *_UP_TO_THE_PUSH, *touches_it, *_CONFIGURES_AGAIN])
+
+    [ended] = signals[18]
+    assert ended.kind is SignalKind.CANCEL
+    assert all(day == [] for day in signals[19:])
+
+
+def test_the_lost_low_is_read_before_the_clock_when_one_bar_does_both() -> None:
+    """A bar can be the last of the two *and* take the trigger bar's low, and the two answers
+    disagree about the region.
+
+    Reading the clock first files it as a reading that merely reset, and the region goes on to
+    configure itself again — here it would arm twice more over the bars that follow. Reading the
+    lost low first ends the region, which is his rule for that event whichever bar it lands on.
+
+    Written because the ordering was asserted in a comment and by nothing else, and a comment that
+    no test defends is a comment a later tidy-up is free to invert.
+    """
+    lapses_and_loses = [
+        bar(18, open_="97.1", close="97.4", high="97.9", low="96.9", tick_volume=900),
+        bar(19, open_="97.4", close="96.6", high="97.6", low="96.50", tick_volume=900),
+    ]
+    signals = _fffd([*_IMPULSE, *_UP_TO_THE_PUSH, *lapses_and_loses, *_CONFIGURES_AGAIN])
+
+    [ended] = signals[19]
+    assert ended.kind is SignalKind.CANCEL
+    # The region is over, so the full second configuration that follows arms nothing at all.
+    assert all(day == [] for day in signals[20:])
+
+
+def test_the_sell_side_loses_the_trigger_bars_high_the_same_way() -> None:
+    """The mirror of the annulment, and the only sell-side scenario that reaches it.
+
+    The other short test places an order and stops there, so the branch that decides *a short's*
+    setup is over was never exercised — paste the buy-side comparison over it and every sell
+    scenario in the file still passes. It is the same shape that blocked three PRs in this series,
+    one door further in.
+    """
+    # ⚠️ Mirrored, this bar sits **entirely above** the trigger bar's high — 103.25 to 103.80
+    # against an annul level of 103.20 — and that is what makes the sell-side comparison
+    # observable. A bar straddling the level satisfies `high >= annul` *and* `low <= annul`, so a
+    # buy-side test pasted over the short passes on it; only a bar clear of the level on both
+    # ends separates them. Same coincidence that let the mirror survive on #190.
+    loses_the_high = [
+        bar(18, open_="96.7", close="96.40", high="96.75", low="96.20", tick_volume=900),
+        bar(19, open_="96.4", close="96.6", high="96.9", low="96.2", tick_volume=900),
+    ]
+    signals = _drive(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD),
+        _mirror([*_IMPULSE, *_UP_TO_THE_PUSH, *loses_the_high]),
+    )
+
+    [placed] = signals[17]
+    assert placed.side is Side.SHORT
+    [ended] = signals[18]
+    assert ended.kind is SignalKind.CANCEL
+
+
+def test_touching_the_trigger_bars_high_exactly_ends_a_short_too() -> None:
+    """The boundary on the sell side, which is a different line of code from the buy side's.
+
+    Mirrored, this bar's high lands on 103.20 to the cent — the short's annul level. `>=` calls
+    that lost and ends the region; `>` calls it a near miss and lets the order live its second
+    bar, after which the lapse leaves the region free to trade again.
+
+    The buy side has had this assertion since the guard was written. Writing one and not the
+    other is the exact habit that has blocked every PR in this chapter, so here is the twin.
+    """
+    touches_the_high = [
+        bar(18, open_="97.0", close="97.1", high="97.2", low="96.80", tick_volume=900),
+        bar(19, open_="97.1", close="97.3", high="97.5", low="97.0", tick_volume=900),
+    ]
+    signals = _drive(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.FFFD),
+        _mirror([*_IMPULSE, *_UP_TO_THE_PUSH, *touches_the_high]),
+    )
+
+    [ended] = signals[18]
+    assert ended.kind is SignalKind.CANCEL
+    assert all(day == [] for day in signals[19:])
+
+
+def test_a_live_trigger_does_not_follow_the_activation_to_another_region() -> None:
+    """The levels belong to the region that produced them, and switching zones must forget them.
+
+    An activation holds one formation at a time and follows whatever zone the strategy has armed.
+    Two ordinary paths change that zone while a trigger is live — the tracker dropping the region,
+    or a fresh block qualifying — and both happen on exactly the kind of bar that marks a region:
+    an impulse, which is what the two bars of a resting FFFD order are waiting for.
+
+    ⚠️ **Without the reset, region B is handed A's order whole.** Same entry, same stop, on a zone
+    that never formed anything and whose own arithmetic does not contain those prices — and worse,
+    B would then be ended by price losing the low of *A's* trigger bar. Nothing downstream could
+    tell: the order is well formed, the region is real, and the backtest simply trades something
+    nobody described.
+    """
+    produced_it = _zone_at("100", "90", hour=3)
+    never_formed = _zone_at("101", "91", hour=4)
+    activation = FffdActivation()
+
+    with localcontext(ENGINE_CONTEXT):
+        for candle in _UP_TO_THE_PUSH:
+            activation.observe(produced_it, context=_context(candle))
+        on_the_push = _context(_UP_TO_THE_PUSH[-1])
+        assert activation.entry_for(produced_it, context=on_the_push) is not None
+
+        next_bar = _context(
+            bar(18, open_="97.1", close="97.4", high="97.9", low="96.9", tick_volume=900)
+        )
+        activation.observe(never_formed, context=next_bar)
+
+        assert activation.entry_for(never_formed, context=next_bar) is None
+    # And it is not spent either: the new region is untouched, not condemned by the old one's bar.
+    assert activation.spent(never_formed) is False
+
+
+def _context(candle: Candle) -> Context:
+    return Context(candle=candle, instrument=AAPL, account=_ACCOUNT)
+
+
+def test_a_second_trigger_at_the_very_same_levels_still_reaches_the_book() -> None:
+    """The re-pricing guard compares levels, and a withdrawal has to forget what was resting.
+
+    Bar 20 repeats bar 17's high and low to the cent, so its order comes out at 99.61 and 96.77
+    again. The strategy suppresses an order equal to what is already resting — which is what makes
+    the botinha's chase free for every other entry point — and after a withdrawal nothing *is*
+    resting, so the comparison has to be against nothing.
+
+    ⚠️ **Otherwise the trade disappears without a trace.** The entry is deduplicated against an
+    order the venue gave back two bars ago, `placed` stays false, and the lapse that follows does
+    not even cancel, because there is nothing to cancel. No signal, no error, one trade fewer.
+    Implausible at a cent tick and perfectly ordinary on a coarse one, where two pushes a few bars
+    apart land on the same two prices.
+    """
+    repeats_the_levels = [
+        bar(20, open_="97.6", close="97.0", high="99.60", low="96.80", tick_volume=1300),
+        bar(21, open_="97.0", close="97.3", high="97.6", low="96.9", tick_volume=900),
+        bar(22, open_="97.3", close="97.5", high="97.8", low="97.1", tick_volume=900),
+    ]
+    signals = _fffd([*_IMPULSE, *_UP_TO_THE_PUSH, *_LAPSES, *repeats_the_levels])
+
+    [again] = signals[20]
+    assert again.kind is SignalKind.ENTRY
+    assert again.stop_price == Decimal("99.61")  # the same level as bar 17's order
+    assert again.client_id == "demand-20240101T0300-1-r1"  # under a name of its own
+    # And it lives its own two bars, taken back on 22 rather than never having existed.
+    [taken_back] = signals[22]
+    assert taken_back.kind is SignalKind.CANCEL
+
+
+# --------------------------------------------------------------------------- #
+# The hammer, his chapter 11.1 variation 1, through the whole machine           #
+# --------------------------------------------------------------------------- #
+
+
+# Back down out of the impulse and into the region the golden marks, [90, 100].
+_FALLS_BACK = [
+    bar(10, open_="124", close="118", high="124.5", low="117.5"),
+    bar(11, open_="118", close="110", high="118.5", low="109"),
+    bar(12, open_="110", close="103", high="110.5", low="102"),
+]
+
+# Bar 13 both touches the region (low 98) and is the hammer: three points of tail on a
+# four-point bar, under a body of half a point up.
+_TOUCHES_AND_HAMMERS = [bar(13, open_="101", close="101.5", high="102", low="98")]
+
+
+# Bars that reach into the region and are **not** hammers -- they close down.
+def _touch_without_hammering(index: int) -> Candle:
+    return bar(index, open_="99.5", close="99.2", high="100.5", low="99")
+
+
+_QUIET_ABOVE = [
+    bar(index, open_="101.5", close="101.6", high="101.7", low="101.4") for index in (14, 15, 16)
+]
+
+
+def _hammer(index: int) -> Candle:
+    return bar(index, open_="101", close="101.5", high="102", low="98")
+
+
+def _martelo(candles: list[Candle]) -> list[list[Signal]]:
+    return _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO), candles
+    )
+
+
+def test_the_hammer_arms_a_stop_past_its_high_with_a_stop_off_its_own_height() -> None:
+    """His variation 1, end to end. The bar that touches the region is itself the hammer.
+
+    A four-point hammer topping at 102 puts the order at **102.01** -- one tick past it on a penny
+    instrument -- and the protective stop at **97.20**, which is twenty percent of the *bar* below
+    its low of 98. Neither number is arithmetic on the region: [90, 100] appears nowhere in them,
+    and that is the whole point of the stop he moved onto the bar.
+    """
+    [placed] = _martelo([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS])[13]
+
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.side is Side.LONG
+    assert placed.stop_price == Decimal("102.01")
+    assert placed.stop_loss == Decimal("97.20")
+    assert placed.limit_price is None  # a stop entry: price has to break through, not come back
+
+
+def test_the_hammer_sell_is_the_exact_mirror_of_the_buy() -> None:
+    """Reflected around 200, both levels reflect: 97.99 and 102.80.
+
+    Four branches have to mirror at once -- which shadow makes a hammer, which way the body must
+    close, which side the order waits on, and which extreme the stop is measured from. A sell that
+    inherited any one of them from the buy side still produces a short, at a price nobody chose.
+    """
+    [placed] = _drive(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO),
+        _mirror([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS]),
+    )[13]
+
+    assert placed.side is Side.SHORT
+    assert placed.stop_price == Decimal("97.99")  # 200 - 102.01
+    assert placed.stop_loss == Decimal("102.80")  # 200 - 97.20
+
+
+def test_a_hammer_whose_low_sits_inside_the_region_still_arms() -> None:
+    """His correction, and it reversed what he had said a message earlier.
+
+    Asked whether the hammer's low had to be *above* the region, he answered *"a minima do martelo
+    nao precisa estar acima da regiao, falei errado, so nao pode romper a minima da regiao"*. So a
+    hammer working entirely inside [90, 100] is a hammer this setup takes: low 92, order at 98.01,
+    stop at 90.80. Under the reading he corrected, this scenario would produce nothing at all.
+    """
+    inside = [bar(13, open_="97", close="97.5", high="98", low="92")]
+    [placed] = _martelo([*_IMPULSE, *_FALLS_BACK, *inside])[13]
+
+    assert placed.stop_price == Decimal("98.01")
+    assert placed.stop_loss == Decimal("90.80")
+
+
+def test_a_hammer_at_the_arming_ceiling_arms_and_one_past_it_does_not() -> None:
+    """His arithmetic: region [90, 100] is ten points, half is five, the ceiling is **105**.
+
+    A hammer topping exactly at 105 arms -- with its order at 105.01, *past* the ceiling, because
+    the ceiling measures the hammer and not the order. He said so in as many words. One penny
+    higher and nothing is armed at all.
+
+    The two scenarios differ in a single field of a single bar, so whatever separates them is the
+    ceiling and can be nothing else.
+    """
+    at_it = [bar(13, open_="103", close="103.5", high="105", low="99")]
+    past_it = [bar(13, open_="103", close="103.5", high="105.01", low="99")]
+
+    [placed] = _martelo([*_IMPULSE, *_FALLS_BACK, *at_it])[13]
+    assert placed.stop_price == Decimal("105.01")
+    assert placed.stop_loss == Decimal("97.80")
+
+    assert _martelo([*_IMPULSE, *_FALLS_BACK, *past_it])[13] == []
+
+
+def test_the_region_gets_the_touching_bar_and_four_more() -> None:
+    """*"na mesma barra ou nas proximas 4 barras"* -- so bar 17 is a chance and bar 18 is not.
+
+    ⚠️ The bars in between have to **reach into the region** and fail to be hammers, which is what
+    the first version of this scenario got wrong: quiet bars sitting at 100.8 never touched
+    [90, 100] at all, so the count had not started and a hammer on bar 18 armed as its own
+    touching bar. The scenario passed while testing nothing about the window.
+    """
+    waiting = [_touch_without_hammering(index) for index in (13, 14, 15, 16)]
+    inside_the_window = _martelo([*_IMPULSE, *_FALLS_BACK, *waiting, _hammer(17)])
+    assert inside_the_window[17] != []
+
+    one_bar_late = _martelo(
+        [*_IMPULSE, *_FALLS_BACK, *waiting, _touch_without_hammering(17), _hammer(18)]
+    )
+    assert one_bar_late[18] == []
+
+
+def test_losing_the_region_before_any_hammer_ends_it_even_if_one_follows() -> None:
+    """*"nao romper a minima da regiao o que anularia a possibilidade da entrada"*.
+
+    Bar 13 closes through the bottom of [90, 100]; bar 14 is a perfectly good hammer and arms
+    nothing. Without the second bar this test would only prove that a down bar arms no order,
+    which is true of every down bar.
+    """
+    breaks_then_hammers = [
+        bar(13, open_="95", close="92", high="96", low="89"),
+        bar(14, open_="93", close="93.5", high="94", low="90.5"),
+    ]
+    signals = _martelo([*_IMPULSE, *_FALLS_BACK, *breaks_then_hammers])
+
+    assert is_hammer(breaks_then_hammers[1], side=Side.LONG)
+    assert signals[14] == []
+
+
+def test_the_order_lives_two_bars_and_the_region_dies_with_it() -> None:
+    """⚠️ **The line that separates this setup from the FFFD, and both answers are his.**
+
+    Armed on 13, the order lives 14 and 15 and comes back on 15. There the region survives a lapse
+    -- *"reseta a leitura"* -- and can configure itself again; here it does not: *"desarma tudo e
+    tem que esperar um novo contexto"*. So the identical hammer on bar 17 arms **nothing**.
+
+    Both halves are asserted together on purpose. The cancel alone is satisfied by either rule.
+    """
+    signals = _martelo([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, *_QUIET_ABOVE, _hammer(17)])
+
+    assert signals[14] == []
+    [taken_back] = signals[15]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[17] == [], "a second hammer re-armed a region his rule had finished with"
+
+
+def test_losing_the_hammer_s_own_low_cancels_before_the_clock_does() -> None:
+    """*"se nao consumir a ordem e perder a minima do martelo vamos cancelar o gatilho"*.
+
+    The order was armed on 13 with two bars to live; bar 14 takes out the hammer's low of 98 and
+    the cancel lands there rather than on 15. The stop-loss at 97.20 sits below that low and is
+    never reached — the level that ends the setup and the level that would end the trade are
+    different numbers, and this is the bar that tells them apart.
+    """
+    loses_it = [
+        bar(14, open_="101.5", close="98.5", high="101.6", low="97.9"),
+        bar(15, open_="98.5", close="99.0", high="99.5", low="98.0"),
+    ]
+    signals = _martelo([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, *loses_it])
+
+    [taken_back] = signals[14]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[15] == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"bars_to_hammer": 0}, "at least the touching bar"),
+        ({"bars_to_fill": 0}, "at least one bar"),
+        ({"reach_fraction": Decimal("-0.1")}, "fraction of the region"),
+    ],
+)
+def test_the_hammer_activation_refuses_a_dial_that_would_not_be_his_setup(
+    kwargs: dict[str, object], message: str
+) -> None:
+    """Loud rather than defaulting, the same doctrine the VWAP activations follow.
+
+    A window of zero bars can never contain the touching bar, which his rule says is the first
+    chance; an order that lives no bars is cancelled on the bar it is armed and can never fill;
+    and a negative reach puts the arming ceiling *below* the region's own edge, so a hammer
+    reaching into the zone at all would be refused. Each of the three runs silently.
+    """
+    with pytest.raises(EngineError, match=message):
+        HammerBreakActivation(**kwargs)  # type: ignore[arg-type]
+
+
+def _hammer_block(kind: ZoneKind, top: str, bottom: str) -> OrderBlock:
+    return OrderBlock(
+        kind=kind,
+        top=Decimal(top),
+        bottom=Decimal(bottom),
+        time=_at(1),
+        confirmed_at=_at(2),
+        break_kind=StructureKind.BOS,
+        primary=True,
+    )
+
+
+_BarActivation = HammerBreakActivation | HammerForceActivation | ForceFollowActivation
+
+
+def _watch(
+    block: OrderBlock,
+    candles: list[Candle],
+    activation: _BarActivation | None = None,
+) -> tuple[_BarActivation, list[ZoneEntry | None]]:
+    """Drive one activation over hand-built bars, without a qualifier or a structure machine.
+
+    ⚠️ **Deliberately below the strategy**, because three of the rules below are about a *single
+    comparison* on a region's edge, and a scenario driven through the detector cannot put a bar's
+    low exactly on a boundary without also moving the region that boundary belongs to.
+    """
+    live = activation or HammerBreakActivation()
+    seen: list[ZoneEntry | None] = []
+    with localcontext(ENGINE_CONTEXT):
+        for candle in candles:
+            context = Context(candle=candle, instrument=AAPL, account=_ACCOUNT)
+            live.observe(block, context=context)
+            seen.append(live.entry_for(block, context=context))
+    return live, seen
+
+
+def test_a_bar_resting_exactly_on_the_near_edge_has_touched_the_region() -> None:
+    """The boundary of the touch, and `<` instead of `<=` survives every scenario above.
+
+    A hammer whose low is exactly 100 on the region [90, 100] has reached it — his count starts on
+    *"se tocar na borda da região"*, and a bar that stops precisely on the border has touched it.
+    One tick higher and it has not.
+    """
+    region = _hammer_block(ZoneKind.DEMAND, "100", "90")
+    _, on_the_edge = _watch(region, [bar(0, open_="101.5", close="101.8", high="102", low="100")])
+    assert on_the_edge[0] is not None
+    assert on_the_edge[0].stop_price == Decimal("102.01")
+    assert on_the_edge[0].stop_loss == Decimal("99.60")
+
+    _, just_above = _watch(region, [bar(0, open_="101.5", close="101.8", high="102", low="100.01")])
+    assert just_above[0] is None
+
+
+def test_a_hammer_resting_exactly_on_the_far_edge_has_not_broken_the_region() -> None:
+    """The other boundary, and the one his correction turns on.
+
+    *"a mínima do martelo não precisa estar acima da região, falei errado, só não pode romper a
+    mínima da região"* — so a hammer whose low is exactly 90 has not broken [90, 100] and arms;
+    one penny lower has, and ends the setup. `<=` in place of `<` swaps the two and no scenario
+    driven through the detector notices, because it cannot place a low on the number.
+    """
+    region = _hammer_block(ZoneKind.DEMAND, "100", "90")
+    _, on_the_edge = _watch(region, [bar(0, open_="93", close="93.5", high="94", low="90")])
+    assert on_the_edge[0] is not None
+    assert on_the_edge[0].stop_price == Decimal("94.01")
+    assert on_the_edge[0].stop_loss == Decimal("89.20")
+
+    _, through_it = _watch(region, [bar(0, open_="93", close="93.5", high="94", low="89.99")])
+    assert through_it[0] is None
+
+
+def test_bars_below_a_supply_region_have_not_touched_it() -> None:
+    """⚠️ **The sell half of the touch, and it needs six bars to be visible at all.**
+
+    A supply region is touched from *below*, so the test is on the bar's high against the region's
+    bottom. A mutant that keeps the buy comparison for both sides — low against the top — calls
+    every bar under the region a touch, which is not directly observable: what it does is start
+    the five-bar count early. So the fixture spends the whole window below [100, 110] and only
+    then prints a sell hammer. Under the correct reading the count starts there and the order is
+    armed; under the mutant it started six bars ago and the region is already spent.
+    """
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+    beneath = [bar(0, open_="94", close="93.8", high="95", low="90")]
+    beneath += [
+        bar(index, open_="94", close="94.2", high="94.5", low="93.8") for index in range(1, 6)
+    ]
+    hammer = bar(6, open_="101", close="100.5", high="105", low="100.2")
+
+    _, seen = _watch(region, [*beneath, hammer])
+
+    assert all(entry is None for entry in seen[:-1])
+    assert seen[-1] is not None
+    assert seen[-1].side is Side.SHORT
+    assert seen[-1].stop_price == Decimal("100.19")  # one tick under the hammer's low
+    assert seen[-1].stop_loss == Decimal("105.96")  # 105 + 20% of 4.80
+
+
+def test_a_window_that_closes_empty_releases_the_region() -> None:
+    """The window running out has to *retire* the zone, not merely stop offering on it.
+
+    Both readings produce the same silence — no hammer, no order — so silence cannot tell them
+    apart. What separates them is `expired`: a zone that is only quiet is still held by the
+    strategy, and while it is held no other region can be armed. His rule ends this one.
+    """
+    region = _hammer_block(ZoneKind.DEMAND, "100", "90")
+    touching = [
+        bar(index, open_="99.5", close="99.2", high="100.5", low="99") for index in range(6)
+    ]
+
+    live, seen = _watch(region, touching)
+
+    assert all(entry is None for entry in seen)
+    context = Context(candle=touching[-1], instrument=AAPL, account=_ACCOUNT)
+    assert live.expired(region, context=context, zones=()) is True
+
+
+def test_the_hand_over_bar_reaches_the_new_regions_hammer() -> None:
+    """The same trap the botinha hit, arriving at this activation through the same door.
+
+    A zone named while another is armed is observed **twice on the same bar**: once before the
+    strategy asks whether the resting order has expired, and again after arming, because a zone
+    named on this very bar had had no `observe` at the first of those points. The idempotence
+    guard is keyed to the bar's time, so clearing it when a new region starts is the only thing
+    that lets the second call through.
+
+    Here the cost is total rather than subtle. The hand-over bar is the one that touches the new
+    region *and* prints the hammer, so a region blind to it never starts its count and the setup
+    arms nothing at all — while the suite stays green, because every other scenario watches a
+    single region from the start and never hands anything over.
+    """
+    given_up = _zone_at("210", "200", hour=1)
+    named_now = _zone_at("100", "90", hour=2)
+    hand_over = bar(5, open_="101", close="101.5", high="102", low="98")
+    context = Context(candle=hand_over, instrument=AAPL, account=_ACCOUNT)
+
+    activation = HammerBreakActivation()
+    with localcontext(ENGINE_CONTEXT):
+        activation.observe(given_up, context=context)  # the zone being released
+        activation.observe(named_now, context=context)  # the hand-over
+        entry = activation.entry_for(named_now, context=context)
+
+    assert entry is not None
+    assert entry.stop_price == Decimal("102.01")
+    assert entry.stop_loss == Decimal("97.20")
+
+
+def test_a_new_region_does_not_inherit_the_last_one_s_touch() -> None:
+    """The other half of the hand-over reset, and it needs a region the bar does **not** reach.
+
+    The count starts on a touch, and the touch belongs to the region it happened in. An
+    activation that carried `_touched` across a hand-over would open the window on a region price
+    has never been near, and then arm the first hammer it sees there — a setup whose first
+    condition never happened.
+
+    The same bar touches [90, 100] and misses [87, 97] by two cents. Its high of 102 is inside
+    the second region's arming ceiling of 102, so the ceiling cannot be what refuses it: the only
+    thing left is the touch.
+    """
+    touched = _zone_at("100", "90", hour=1)
+    never_reached = _zone_at("97", "87", hour=2)
+    hammer = bar(5, open_="101", close="101.5", high="102", low="98")
+    context = Context(candle=hammer, instrument=AAPL, account=_ACCOUNT)
+
+    activation = HammerBreakActivation()
+    with localcontext(ENGINE_CONTEXT):
+        activation.observe(touched, context=context)
+        armed_where_it_touched = activation.entry_for(touched, context=context)
+        activation.observe(never_reached, context=context)
+        armed_where_it_did_not = activation.entry_for(never_reached, context=context)
+
+    assert armed_where_it_touched is not None
+    assert armed_where_it_did_not is None
+
+
+def test_a_live_hammer_does_not_follow_the_activation_to_another_region() -> None:
+    """⚠️ **The leak the FFFD had one chapter ago, waiting at the same door.**
+
+    One activation follows whatever zone the strategy has armed, and two ordinary paths change
+    that zone while an order rests — the tracker dropping the region, or a fresh block qualifying.
+    Without clearing the levels on the way across, region B is handed A's order whole: a stop at a
+    price computed from a bar that happened somewhere else, on a zone that has formed nothing.
+
+    ⚠️ **It has to be handed over on a *later* bar to be visible at all**, which is why this is
+    not folded into the test above. A hammer's annul level is its own low, so on the hammer's bar
+    the ageing clock loses that low immediately and clears the levels by itself — the bug hides
+    behind a correct-looking `None`. Bar 6 keeps clear of 98, so A's trigger is genuinely alive
+    when B arrives.
+    """
+    armed_here = _zone_at("100", "90", hour=1)
+    never_reached = _zone_at("97", "87", hour=2)
+    hammer = bar(5, open_="101", close="101.5", high="102", low="98")
+    later = bar(6, open_="101.5", close="101.8", high="102", low="100")
+
+    activation = HammerBreakActivation()
+    with localcontext(ENGINE_CONTEXT):
+        first = Context(candle=hammer, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(armed_here, context=first)
+        assert activation.entry_for(armed_here, context=first) is not None
+
+        second = Context(candle=later, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(armed_here, context=second)
+        still_live = activation.entry_for(armed_here, context=second)
+        activation.observe(never_reached, context=second)
+        inherited = activation.entry_for(never_reached, context=second)
+
+    assert still_live is not None, "the fixture must hand over while the trigger is alive"
+    assert inherited is None
+
+
+def test_a_region_named_on_the_very_bar_that_hammers_still_sees_it() -> None:
+    """⚠️ **The hand-over bar, and it was the blocking finding one chapter ago.**
+
+    `observe` runs twice on the bar a zone is armed — once for the zone being let go and once for
+    the new one — and the activation's own "have I seen this bar?" guard would swallow the second
+    call. Clearing it when the watched region changes is three words, and without them a region
+    named on bar 13 never sees bar 13: exactly the bar that touched it and printed the hammer.
+    The whole suite stays green, and the setup silently never arms on its own first bar.
+
+    `_LateMarked(after=22)` offers the zone for the first time on bar 13, which is that bar.
+    """
+    late = _drive_from_bullish(
+        ageless_structure(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.MARTELO),
+        [*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS],
+    )
+
+    [placed] = late[13]
+    assert placed.stop_price == Decimal("102.01")
+
+
+def test_a_region_price_has_already_reached_is_still_armed() -> None:
+    """⚠️ **`spent_by_mitigation` is `False`, and this is the only test that says so.**
+
+    For the three activations that rest *on* the region, the touch that mitigates a zone is the
+    event their order was placed for, so a mitigated zone is finished. Here it is the opposite:
+    the touch is where the count **begins**. Answering `True` would retire the region on the very
+    bar the reaction starts, and this setup could never arm at all — which is precisely what the
+    scenario above proves it does.
+    """
+    activation = HammerBreakActivation()
+    assert activation.spent_by_mitigation is False
+    assert (
+        activation.withdraws(
+            _hammer_block(ZoneKind.DEMAND, "100", "90"),
+            context=Context(
+                candle=bar(0, open_="99", close="99.5", high="100", low="98"),
+                instrument=AAPL,
+                account=_ACCOUNT,
+            ),
+        )
+        is False
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Variation 2 — the hammer, then a bar of force, then the pullback              #
+# --------------------------------------------------------------------------- #
+
+
+# 70% body in the trade's direction, and its high of 104.50 clears the hammer's 102.
+_BAR_OF_FORCE = bar(14, open_="101.6", close="104", high="104.5", low="101.4")
+_QUIET_ABOVE_THE_FORCE = [
+    bar(index, open_="103", close="103.2", high="103.5", low="102.9") for index in (15, 16, 17)
+]
+
+
+def _martelo_forca(candles: list[Candle]) -> list[list[Signal]]:
+    return _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO_FORCA), candles
+    )
+
+
+def test_the_force_bar_turns_the_hammer_into_a_limit_below_the_market() -> None:
+    """His variation 2, end to end, and the order is the opposite kind from variation 1's.
+
+    The hammer tops at 102 and the force bar at 104.50, so the limit rests at **102.75** — thirty
+    percent of the way between the two — with the same stop off the hammer, **97.20**. It is a
+    *limit*: the force bar closed at 104, so the order sits below the market waiting for price to
+    come back, where `martelo` would be waiting above it for a break.
+
+    ⚠️ Nothing is placed on the hammer's own bar. That is the whole shape of this variation, and
+    asserting it here is what stops the two from being one setup with a dial.
+    """
+    signals = _martelo_forca([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, _BAR_OF_FORCE])
+
+    assert signals[13] == [], "the hammer alone places nothing in this variation"
+    [placed] = signals[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.limit_price == Decimal("102.75")
+    assert placed.stop_loss == Decimal("97.20")
+    assert placed.stop_price is None
+
+
+def test_the_force_variation_sell_is_the_exact_mirror_of_the_buy() -> None:
+    """Reflected around 200: the limit at 97.25 and the stop at 102.80.
+
+    Five branches mirror at once here — the hammer's shadow, the force bar's body, which extreme
+    each is measured from, which way the limit is offset, and which side the stop goes. A sell
+    that inherited any of them still produces a short at a price nobody chose.
+    """
+    [placed] = _drive(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.MARTELO_FORCA),
+        _mirror([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, _BAR_OF_FORCE]),
+    )[14]
+
+    assert placed.side is Side.SHORT
+    assert placed.limit_price == Decimal("97.25")  # 200 - 102.75
+    assert placed.stop_loss == Decimal("102.80")  # 200 - 97.20
+
+
+def test_a_bar_after_the_hammer_that_is_not_a_bar_of_force_ends_the_region() -> None:
+    """⚠️ **His ruling, and it is the reason this is not "wait for a better bar".**
+
+    Asked what happens when the bar after the hammer fails: *"se a barra de força falha a região
+    deixa de valer, tem que esperar configurar tudo de novo"*. So the second, perfectly good
+    hammer on bar 16 arms nothing — the region is finished, not merely quiet.
+
+    Without the second hammer this test would only prove that a weak bar places no order, which is
+    true of almost every bar.
+    """
+    weak = bar(14, open_="101.6", close="102", high="103", low="101")
+    signals = _martelo_forca(
+        [*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, weak, _hammer(15), _bar_of_force_at(16)]
+    )
+
+    assert not is_force_bar(weak, side=Side.LONG)
+    assert signals == [[] for _ in signals], "something armed after the force bar had failed"
+
+
+def test_a_force_bar_that_does_not_clear_the_hammer_ends_the_region_too() -> None:
+    """*"barra de força que não supera o martelo cancela entrada"* — his words, asked directly.
+
+    A perfectly good bar of force whose high stops under the hammer's leaves "between the two
+    extremes" naming an empty interval. It is the same ending as the bar not being a force bar at
+    all, which is why the activation cannot tell the caller *which* of the two happened — and does
+    not need to.
+    """
+    short_force = bar(14, open_="99", close="101.5", high="101.9", low="98.9")
+    signals = _martelo_forca([*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, short_force])
+
+    assert is_force_bar(short_force, side=Side.LONG)
+    assert short_force.high < _TOUCHES_AND_HAMMERS[0].high
+    assert signals[14] == []
+
+
+def test_a_close_beyond_the_force_bar_withdraws_the_order() -> None:
+    """*"se na barra seguinte da barra de força ocorrer de a barra fechar acima da máxima da barra
+    de força a entrada é anulada"*.
+
+    The market left without us: the limit was waiting at 102.75 for a pullback and bar 15 finished
+    at 105, above the force bar's 104.50. The cancel lands on 15, a bar before the clock would
+    have taken the order back anyway — which is what makes the rule observable at all.
+    """
+    ran_away = bar(15, open_="104", close="105", high="105.5", low="103.8")
+    signals = _martelo_forca(
+        [*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, _BAR_OF_FORCE, ran_away]
+    )
+
+    [taken_back] = signals[15]
+    assert taken_back.kind is SignalKind.CANCEL
+
+
+def test_the_force_order_lives_two_bars_from_the_force_bars_close() -> None:
+    """Armed on 14, so 15 and 16 are its chances and the withdrawal lands on 16.
+
+    ⚠️ The quiet bars close *below* the force bar's high on purpose. A bar that ran past it would
+    end the order through the cancel rule instead, and the test would pass while proving nothing
+    about the clock — the two endings are one bar apart.
+    """
+    signals = _martelo_forca(
+        [*_IMPULSE, *_FALLS_BACK, *_TOUCHES_AND_HAMMERS, _BAR_OF_FORCE, *_QUIET_ABOVE_THE_FORCE]
+    )
+
+    assert all(quiet.close < _BAR_OF_FORCE.high for quiet in _QUIET_ABOVE_THE_FORCE)
+    assert signals[15] == []
+    [taken_back] = signals[16]
+    assert taken_back.kind is SignalKind.CANCEL
+
+
+def test_the_arming_ceiling_governs_the_force_variation_as_well() -> None:
+    """The region's limits are shared, and sharing them is the point of `_RegionWatch`.
+
+    A hammer topping one penny past the ceiling of 105 is refused here exactly as it is in
+    variation 1, so no force bar is ever looked for. Without this the extraction could have
+    wired the ceiling into one activation and not the other, and only variation 1 would say so.
+    """
+    too_high = bar(13, open_="103", close="103.5", high="105.01", low="99")
+    signals = _martelo_forca(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            too_high,
+            bar(14, open_="105", close="108", high="108.5", low="104.8"),
+        ]
+    )
+
+    assert is_hammer(too_high, side=Side.LONG)
+    assert signals == [[] for _ in signals]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"bars_to_hammer": 0}, "at least the touching bar"),
+        ({"bars_to_fill": 0}, "at least one bar"),
+        ({"reach_fraction": Decimal("-0.1")}, "fraction of the region"),
+    ],
+)
+def test_the_force_activation_refuses_a_dial_that_would_not_be_his_setup(
+    kwargs: dict[str, object], message: str
+) -> None:
+    """The same three dials the first variation refuses, and for the same reasons — they are the
+    region's rules, and both activations answer to them."""
+    with pytest.raises(EngineError, match=message):
+        HammerForceActivation(**kwargs)  # type: ignore[arg-type]
+
+
+def _bar_of_force_at(index: int) -> Candle:
+    """The same bar of force, on another index — for scenarios with two hammers."""
+    return bar(index, open_="101.6", close="104", high="104.5", low="101.4")
+
+
+def test_losing_the_region_ends_the_force_variation_before_any_hammer() -> None:
+    """The region's own edge governs both variations, and the wiring is per-activation.
+
+    Extracting the shared rules into one place makes them *possible* to share; it does not prove
+    both activations call them. Bar 13 closes through the bottom of [90, 100] and the perfectly
+    good hammer on bar 14 — with a real bar of force behind it on 15 — arms nothing.
+    """
+    breaks_it = bar(13, open_="95", close="92", high="96", low="89")
+    signals = _martelo_forca(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            breaks_it,
+            bar(14, open_="93", close="93.5", high="94", low="90.5"),
+            bar(15, open_="93.6", close="96", high="96.5", low="93.4"),
+        ]
+    )
+
+    assert is_hammer(bar(14, open_="93", close="93.5", high="94", low="90.5"), side=Side.LONG)
+    assert signals == [[] for _ in signals]
+
+
+def test_a_pending_hammer_does_not_follow_the_activation_to_another_region() -> None:
+    """⚠️ **The same leak variation 1 has, one step earlier in the sequence.**
+
+    Here the dangerous state is not a resting order but a hammer *waiting for its bar of force*.
+    Carried across a hand-over, region B's next bar is read as the force bar for a hammer that
+    printed on region A — and B gets a limit priced off two bars that have nothing to do with it,
+    on a zone price has never even touched.
+
+    The force bar's low of 101.40 is well above B's top of 97, so B has had no touch and no window
+    at all. Anything it arms came from A.
+    """
+    armed_here = _zone_at("100", "90", hour=1)
+    never_reached = _zone_at("97", "87", hour=2)
+    hammer = bar(5, open_="101", close="101.5", high="102", low="98")
+    force = bar(6, open_="101.6", close="104", high="104.5", low="101.4")
+
+    activation = HammerForceActivation()
+    with localcontext(ENGINE_CONTEXT):
+        first = Context(candle=hammer, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(armed_here, context=first)
+        assert activation.entry_for(armed_here, context=first) is None  # the hammer places nothing
+
+        second = Context(candle=force, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(never_reached, context=second)
+        inherited = activation.entry_for(never_reached, context=second)
+
+    assert force.low > never_reached.top, "the fixture must leave the second region untouched"
+    assert inherited is None
+
+
+def test_a_bar_that_spikes_past_the_force_bar_but_closes_short_leaves_the_order() -> None:
+    """⚠️ **"Fecha acima" is a close, and this is the only fixture that says so.**
+
+    Bar 15 trades to 105, past the force bar's 104.50, and finishes at 103 — a rejection wick,
+    the most ordinary thing to happen right after a bar of force. His rule reads the **close**, so
+    the limit at 102.75 is still waiting and the withdrawal comes from the clock on bar 16.
+
+    The existing cancel test uses a bar that closes *and* trades beyond, where the two readings
+    coincide — the shape this project keeps getting caught by. A mutant reading `candle.high` here
+    survives that test and dies on this one.
+
+    ⚠️ It is also the exact opposite of variation 1's annulment, which **is** a touch: there the
+    hammer's low being *reached* ends the setup. Two neighbouring rules, opposite answers, and now
+    both have proof.
+    """
+    rejection = bar(15, open_="104", close="103", high="105", low="102.8")
+    signals = _martelo_forca(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            *_TOUCHES_AND_HAMMERS,
+            _BAR_OF_FORCE,
+            rejection,
+            bar(16, open_="103", close="103.2", high="103.5", low="102.9"),
+        ]
+    )
+
+    assert rejection.high > _BAR_OF_FORCE.high
+    assert rejection.close < _BAR_OF_FORCE.high
+    assert signals[15] == [], "a wick past the force bar withdrew an order his rule keeps"
+    [taken_back] = signals[16]
+    assert taken_back.kind is SignalKind.CANCEL
+
+
+def test_the_cancel_reads_only_the_bar_after_the_force_bar() -> None:
+    """The narrow reading of *"na barra seguinte"*, held by the one dial that can reach bar +2.
+
+    ⚠️ **This test exists because a comment claimed it could not.** At the default of two bars the
+    difference between "the bar after" and "any bar" is genuinely unobservable — his own argument,
+    and correct. But `bars_to_fill` is public: at three bars there is a bar +2 on which the order
+    is still live, and a close beyond the force bar there withdraws it under the wide reading and
+    leaves it alone under his. The guardian contested the equivalence claim and was right.
+    """
+    region = _hammer_block(ZoneKind.DEMAND, "100", "90")
+    sequence = [
+        bar(0, open_="101", close="101.5", high="102", low="98"),
+        _BAR_OF_FORCE,
+        bar(15, open_="103", close="103.2", high="103.5", low="102.9"),
+        bar(16, open_="104", close="109", high="109.5", low="103.8"),
+    ]
+
+    _, seen = _watch(region, sequence, HammerForceActivation(bars_to_fill=3))
+
+    assert sequence[-1].close > _BAR_OF_FORCE.high, "bar +2 must close beyond the force bar"
+    assert seen[-1] is not None, "the wide reading withdrew the order on a bar his rule keeps"
+    assert seen[-1].limit_price == Decimal("102.75")
+
+
+def test_a_bar_stopping_exactly_on_a_supply_regions_edge_has_touched_it() -> None:
+    """The sell half of the touch boundary. ⚠️ Fifth engine PR running where only the buy side of
+    an edge comparison was pinned — the mirror of
+    `test_a_bar_resting_exactly_on_the_near_edge_has_touched_the_region`.
+
+    A supply region is reached from below, so the comparison is the bar's high against the
+    region's bottom, and 100.00 exactly is a touch.
+    """
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+    on_the_edge = bar(0, open_="97", close="96.5", high="100", low="96")
+    short_of_it = bar(0, open_="97", close="96.5", high="99.99", low="96")
+
+    _, touched = _watch(region, [on_the_edge])
+    assert touched[0] is not None
+    assert touched[0].stop_price == Decimal("95.99")  # one tick under the hammer's low
+    assert touched[0].stop_loss == Decimal("100.80")  # 100 + 20% of 4
+
+    _, missed = _watch(region, [short_of_it])
+    assert missed[0] is None
+
+
+def test_a_sell_hammer_topping_exactly_on_the_far_edge_has_not_broken_the_region() -> None:
+    """The sell half of the break boundary: strictly past, so 110.00 on a [100, 110] supply is a
+    hammer this setup takes and 110.01 ends the region."""
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+
+    _, on_the_edge = _watch(region, [bar(0, open_="106", close="105.5", high="110", low="104")])
+    assert on_the_edge[0] is not None
+    assert on_the_edge[0].stop_price == Decimal("103.99")
+    assert on_the_edge[0].stop_loss == Decimal("111.20")
+
+    _, through_it = _watch(region, [bar(0, open_="106", close="105.5", high="110.01", low="104")])
+    assert through_it[0] is None
+
+
+def test_the_sell_arming_ceiling_is_inclusive_too() -> None:
+    """The sell half of the ceiling: [100, 110] is ten points, so the ceiling is 100 - 5 = **95**,
+    and a hammer bottoming exactly there arms. One penny lower and it does not."""
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+
+    _, at_it = _watch(region, [bar(0, open_="98", close="97.5", high="103", low="95")])
+    assert at_it[0] is not None
+    assert at_it[0].stop_price == Decimal("94.99")
+    assert at_it[0].stop_loss == Decimal("104.60")
+
+    _, past_it = _watch(region, [bar(0, open_="98", close="97.5", high="103", low="94.99")])
+    assert past_it[0] is None
+
+
+# --------------------------------------------------------------------------- #
+# The gift and the ignored bar -- the bar of force off the region, then one bar #
+# --------------------------------------------------------------------------- #
+
+
+# His force bar, touching [90, 100] with its low of 99.50: 6.50 tall, 5.50 of body. And his two
+# followers on it, dictated 2026-09-07. The numbers below were read off the strategy before they
+# were written here.
+_FORCE_OFF_THE_REGION = bar(13, open_="100", close="105.5", high="106", low="99.5")
+_GIFT = bar(14, open_="105.2", close="105", high="105.6", low="104.4")
+_IGNORED_BAR = bar(14, open_="105.5", close="102.5", high="105.8", low="102")
+_QUIET_UNDER_THE_ENTRY = [
+    bar(index, open_="105", close="105.1", high="105.4", low="104.8") for index in (15, 16, 17)
+]
+
+
+def _force_at(index: int) -> Candle:
+    """The same force bar on another index, its low still touching the region."""
+    return bar(index, open_="100", close="105.5", high="106", low="99.5")
+
+
+def _gift_at(index: int) -> Candle:
+    return bar(index, open_="105.2", close="105", high="105.6", low="104.4")
+
+
+def _touch_without_force(index: int) -> Candle:
+    """Reaches into the region and is not a bar of force: a small red bar."""
+    return bar(index, open_="100.5", close="100.2", high="101", low="99.5")
+
+
+def _off_the_region(index: int) -> Candle:
+    """A whole bar above [90, 100] that is not a bar of force."""
+    return bar(index, open_="101.5", close="101.3", high="102", low="100.5")
+
+
+def _force_off_the_region_at(index: int) -> Candle:
+    """A bar of force whose low of 100.50 does **not** reach [90, 100] -- for the scenarios about
+    the count, where a force bar that touched would reset it and prove nothing."""
+    return bar(index, open_="101", close="105.5", high="106", low="100.5")
+
+
+def _gift_setup(candles: list[Candle], **kwargs: object) -> list[list[Signal]]:
+    return _drive_from_bullish(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.GIFT, **kwargs),
+        candles,
+    )
+
+
+def _ignored_setup(candles: list[Candle], **kwargs: object) -> list[list[Signal]]:
+    return _drive_from_bullish(
+        ageless_structure(
+            qualifier=_Marked(),
+            entry_point=ZoneEntryPoint.BARRA_IGNORADA,
+            **kwargs,
+        ),
+        candles,
+    )
+
+
+def test_the_gift_arms_a_stop_past_the_higher_high_when_the_gift_closes() -> None:
+    """His setup end to end: the force bar off the region on 13, the gift on 14, and the order
+    on the gift's close -- **106.01**, one tick past the force bar's 106, with the stop at
+    **104.16**, twenty percent of the gift's own 1.20 under its low of 104.40.
+
+    ⚠️ Nothing is placed on the force bar's own bar. The force bar starts the setup; the bar
+    after it decides, and asserting the silence on 13 is what keeps that shape.
+    """
+    signals = _gift_setup([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT])
+
+    assert signals[13] == [], "the force bar alone places nothing"
+    [placed] = signals[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.side is Side.LONG
+    assert placed.stop_price == Decimal("106.01")
+    assert placed.stop_loss == Decimal("104.16")
+    assert placed.limit_price is None
+
+
+def test_the_gift_s_stop_may_be_taken_off_the_force_bar_instead() -> None:
+    """His second alternative, chosen on the strategy: the same order at 106.01, the stop at
+    **98.20** -- twenty percent of the force bar's 6.50 under its low of 99.50. The two stops
+    are 5.96 apart on his own example, so the wrong bar is a different number, not an error."""
+    [placed] = _gift_setup(
+        [*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT], gift_stop=GiftStop.FORCA
+    )[14]
+
+    assert placed.stop_price == Decimal("106.01")
+    assert placed.stop_loss == Decimal("98.20")
+
+
+def test_the_gift_sell_is_the_exact_mirror_of_the_buy() -> None:
+    """Reflected around 200: the order at 93.99 and the stop at 95.84. The force bar's body,
+    the gift's place in its lower third, which extreme the entry passes and which the stop is
+    measured from all mirror at once, and a sell inheriting any one of them from the buy still
+    produces a short at a price nobody chose."""
+    [placed] = _drive(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.GIFT),
+        _mirror([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT]),
+    )[14]
+
+    assert placed.side is Side.SHORT
+    assert placed.stop_price == Decimal("93.99")  # 200 - 106.01
+    assert placed.stop_loss == Decimal("95.84")  # 200 - 104.16
+
+
+def test_the_ignored_bar_arms_the_same_entry_with_the_force_bar_s_stop() -> None:
+    """His other follower on the same force bar: a three-point body that kept the low. The order
+    at **106.01** again, the stop at **98.20** -- the force bar's, the only one this setup has."""
+    signals = _ignored_setup([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _IGNORED_BAR])
+
+    assert signals[13] == []
+    [placed] = signals[14]
+    assert placed.kind is SignalKind.ENTRY
+    assert placed.stop_price == Decimal("106.01")
+    assert placed.stop_loss == Decimal("98.20")
+    assert placed.limit_price is None
+
+
+def test_the_ignored_bar_sell_is_the_exact_mirror_of_the_buy() -> None:
+    [placed] = _drive(
+        ageless_structure(qualifier=_Marked(), entry_point=ZoneEntryPoint.BARRA_IGNORADA),
+        _mirror([*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _IGNORED_BAR]),
+    )[14]
+
+    assert placed.side is Side.SHORT
+    assert placed.stop_price == Decimal("93.99")
+    assert placed.stop_loss == Decimal("101.80")  # 200 - 98.20
+
+
+def test_each_setup_is_silent_on_the_other_s_follower_and_the_region_is_spent() -> None:
+    """The gift setup handed an ignored bar, and the other way round: nothing on 14 -- and by his
+    rule the region is finished, so a textbook force bar and gift on 16 and 17 arm nothing.
+
+    ⚠️ The second half is the half that says *cancelled*, not *not yet*. Asked whether the
+    region lives on for the next opportunity: *"cancelou, região não vale"*.
+    """
+    another_chance = [_force_at(16), _gift_at(17)]
+    gift_given_ignored = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _IGNORED_BAR,
+            _off_the_region(15),
+            *another_chance,
+        ]
+    )
+    assert gift_given_ignored[14] == []
+    assert gift_given_ignored[17] == [], "a failed follower did not spend the region"
+
+    ignored_given_gift = _ignored_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _GIFT,
+            _off_the_region(15),
+            _force_at(16),
+            bar(17, open_="105.5", close="102.5", high="105.8", low="102"),
+        ]
+    )
+    assert ignored_given_gift[14] == []
+    assert ignored_given_gift[17] == []
+
+
+def test_a_hammer_before_the_force_bar_is_welcome_and_not_required() -> None:
+    """*"Não precisa ter o martelo antes, mas se tiver não tem problema."* The hammer on 13
+    touches the region and is not a bar of force; the force bar on 14 leaves the region (low
+    101.40) and is still inside the count; the gift on 15 arms at 104.61 with the stop at 103.52
+    off the gift's own 0.90."""
+    hammer = bar(13, open_="101", close="101.5", high="102", low="98")
+    force = bar(14, open_="101.6", close="104", high="104.5", low="101.4")
+    gift = bar(15, open_="104.1", close="104.3", high="104.6", low="103.7")
+    signals = _gift_setup([*_IMPULSE, *_FALLS_BACK, hammer, force, gift])
+
+    assert signals[13] == []
+    assert signals[14] == []
+    [placed] = signals[15]
+    assert placed.stop_price == Decimal("104.61")
+    assert placed.stop_loss == Decimal("103.52")
+
+
+def test_the_gift_order_lives_two_bars_and_the_region_dies_with_it() -> None:
+    """Armed on 14, the order lives 15 and 16 and is taken back on 16. And the region is done:
+    the identical force bar and gift on 17 and 18 arm **nothing**. Both halves asserted together,
+    because the cancel alone is satisfied by the FFFD's rule too."""
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _GIFT,
+            *_QUIET_UNDER_THE_ENTRY[:2],
+            _force_at(17),
+            _gift_at(18),
+        ]
+    )
+
+    assert signals[15] == []
+    [taken_back] = signals[16]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[17] == []
+    assert signals[18] == [], "a second force bar and gift re-armed a region his rule finished"
+
+
+def test_losing_the_force_bar_s_low_cancels_before_the_clock_does() -> None:
+    """*"Se o preço perder a mínima da barra de força anula"* — his answer to the one question the
+    first dictation left open. Armed on 14 with two bars to live; bar 15 reaches the force bar's
+    low of 99.50 and the cancel lands there rather than on 16. And by his rule the region is
+    spent with it: the same force bar and gift on 16 and 17 arm nothing.
+
+    ⚠️ The bar that cancels stays well inside [90, 100], so this is not the region's low doing
+    the work — that rule has its own test, and both spend, so only a level between the two can
+    separate them.
+    """
+    reaches_the_low = bar(15, open_="105", close="104", high="105.2", low="99.5")
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _GIFT,
+            reaches_the_low,
+            _force_at(16),
+            _gift_at(17),
+        ]
+    )
+
+    [taken_back] = signals[15]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[17] == []
+
+
+def test_the_annulment_is_read_on_a_touch_of_the_force_bar_s_low_on_both_sides() -> None:
+    """The boundary: a low exactly on 99.50 has reached the force bar's low and cancels; 99.51
+    has not, and the order rests on. Driven at the activation, where a bar can be put on the
+    number, and mirrored on a supply region because the sell comparison is its own line."""
+    region = _zone_at("100", "90", hour=1)
+    on_it = bar(2, open_="105", close="104", high="105.2", low="99.5")
+    short_of_it = bar(2, open_="105", close="104", high="105.2", low="99.51")
+
+    live, seen = _watch(
+        region, [_force_at(0), _gift_at(1), on_it], ForceFollowActivation(trigger=GiftTrigger())
+    )
+    assert seen[1] is not None
+    assert seen[2] is None
+    assert live.spent(region)
+
+    live, seen = _watch(
+        region,
+        [_force_at(0), _gift_at(1), short_of_it],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[2] is not None
+    assert not live.spent(region)
+
+    supply = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+    force = bar(0, open_="100", close="94.5", high="100.5", low="94")  # touches 100; high 100.5
+    gift = bar(1, open_="94.8", close="95", high="95.6", low="94.4")
+    live, seen = _watch(
+        supply,
+        [force, gift, bar(2, open_="95", close="96", high="100.5", low="94.8")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[1] is not None
+    assert seen[1].side is Side.SHORT
+    assert seen[2] is None
+    assert live.spent(supply)
+
+    live, seen = _watch(
+        supply,
+        [force, gift, bar(2, open_="95", close="96", high="100.49", low="94.8")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[2] is not None
+    assert not live.spent(supply)
+
+
+def test_a_gift_stop_order_outlives_its_own_stop_level_and_dies_at_the_force_bar_s_low() -> None:
+    """The two levels are different kinds of number, and with the stop off the gift the order
+    of them inverts: the stop sits at 104.16 and the annulment at 99.50, below it. Bar 15 trades
+    through 104.16 and stops at 103 — a resting stop order has no position to lose, so it rests
+    on; bar 16 reaches 99.50 and it is taken back. A rule that read the stop as the annulment
+    would cancel a bar early."""
+    region = _zone_at("100", "90", hour=1)
+    through_the_stop = bar(2, open_="105", close="103.5", high="105.2", low="103")
+    to_the_force_low = bar(3, open_="103.5", close="101", high="104", low="99.5")
+    live, seen = _watch(
+        region,
+        [_force_at(0), _gift_at(1), through_the_stop, to_the_force_low],
+        ForceFollowActivation(trigger=GiftTrigger(), bars_to_fill=3),
+    )
+    assert seen[1] is not None
+    assert seen[1].stop_loss == Decimal("104.16")
+    assert through_the_stop.low < seen[1].stop_loss
+    assert seen[2] is not None, "a resting stop order has no position to lose at its stop level"
+    assert seen[3] is None
+    assert live.spent(region)
+
+
+def test_losing_the_region_s_low_by_a_wick_takes_the_resting_order_back() -> None:
+    """*"Desde que o preço em nenhum momento rompa a mínima da região, mesmo que somente por
+    pavio."* Armed on 14 with two bars to live; bar 15 wicks to 89.99 under [90, 100] and closes
+    back at 104. The cancel lands on 15, not on 16 -- and the region is spent with it.
+
+    ⚠️ The hammer reads the region's low only *before* a hammer exists. This setup reads it on
+    every bar, which is the only early ending its order has.
+    """
+    wicks_through = bar(15, open_="105", close="104", high="105.2", low="89.99")
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _FORCE_OFF_THE_REGION,
+            _GIFT,
+            wicks_through,
+            _force_at(16),
+            _gift_at(17),
+        ]
+    )
+
+    [taken_back] = signals[15]
+    assert taken_back.kind is SignalKind.CANCEL
+    assert signals[17] == []
+
+
+def test_losing_the_region_before_any_force_bar_ends_it_even_if_one_follows() -> None:
+    """Bar 13 closes through the bottom of [90, 100]; the perfectly good force bar on 14 and gift
+    on 15 arm nothing."""
+    breaks_it = bar(13, open_="95", close="92", high="96", low="89")
+    signals = _gift_setup([*_IMPULSE, *_FALLS_BACK, breaks_it, _force_at(14), _gift_at(15)])
+
+    assert signals == [[] for _ in signals]
+
+
+def test_the_force_bar_may_come_on_any_bar_while_price_keeps_touching_the_region() -> None:
+    """*"Enquanto os candles tiverem mínima que toca na região a barra de força ainda pode ser
+    válida."* Six touching bars that are not force bars -- one more than the hammer's whole
+    window -- and the force bar on 19 with its gift on 20 still arms. No count runs while price
+    is in the region, which is the line between this clock and the hammer's."""
+    waiting = [_touch_without_force(index) for index in range(13, 19)]
+    signals = _gift_setup([*_IMPULSE, *_FALLS_BACK, *waiting, _force_at(19), _gift_at(20)])
+
+    [placed] = signals[20]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_once_a_whole_bar_leaves_the_region_the_force_bar_has_one_more_bar_to_come() -> None:
+    """His count, fixed when asked: the bar that leaves being N, the force bar may be **N+1**.
+
+    Bar 13 touches; 14 is the first whole bar above the region. A force bar on 15 (one bar off
+    the region before it) arms with its gift on 16. A force bar on 16 (two bars off) is one late
+    and arms nothing, gift or no gift.
+
+    ⚠️ The force bars here do **not** touch the region. The first version of this scenario used
+    one whose low of 99.50 did, which reset the count on the bar under test and armed the "late"
+    case too: a scenario that passed while testing nothing about the count.
+    """
+    in_time = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _touch_without_force(13),
+            _off_the_region(14),
+            _force_off_the_region_at(15),
+            _gift_at(16),
+        ]
+    )
+    assert in_time[16] != []
+
+    one_late = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _touch_without_force(13),
+            _off_the_region(14),
+            _off_the_region(15),
+            _force_off_the_region_at(16),
+            _gift_at(17),
+        ]
+    )
+    assert one_late[17] == []
+
+
+def test_the_bar_that_leaves_the_region_may_itself_be_the_force_bar() -> None:
+    """*"A barra de força pode ocorrer na fuga ou saída da região."* Bar 13 touches without
+    force; bar 14 is a bar of force whose low of 101 never reaches the region; the gift on 15
+    arms."""
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _touch_without_force(13),
+            _force_off_the_region_at(14),
+            _gift_at(15),
+        ]
+    )
+
+    [placed] = signals[15]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_a_shut_window_reopens_when_price_touches_the_region_again() -> None:
+    """Three whole bars above the region close the window; nothing has failed and nothing is
+    spent. Bar 17 comes back to touch, the force bar on 18 and the gift on 19 arm."""
+    signals = _gift_setup(
+        [*_IMPULSE, *_FALLS_BACK, _touch_without_force(13)]
+        + [_off_the_region(index) for index in (14, 15, 16)]
+        + [_touch_without_force(17), _force_at(18), _gift_at(19)]
+    )
+
+    assert signals[16] == []
+    [placed] = signals[19]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_a_reopened_window_forgets_the_bars_spent_away_from_the_region() -> None:
+    """⚠️ **The touch resets the count, and the scenario above cannot see it.** There the force
+    bar's own low touches the region, so the count is never read for it. Here the force bar on
+    18 is the bar that *leaves* the region again (low 100.50) after three bars away and one bar
+    back: his rule 3 lets it be the force bar, so the gift on 19 arms. A count that the retouch
+    on 17 did not clear still reads three, refuses the force bar, and every revisited region
+    silently under-arms — the guardian's mutant, surviving the whole suite."""
+    signals = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            _touch_without_force(13),
+            *[_off_the_region(index) for index in (14, 15, 16)],
+            _touch_without_force(17),
+            _force_off_the_region_at(18),
+            _gift_at(19),
+        ]
+    )
+
+    [placed] = signals[19]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_the_volume_filter_is_a_switch_on_the_strategy_and_reads_the_force_bar() -> None:
+    """*"Vamos dar opção do volume ser um filtro."* The same bars, the same numbers: a gift at
+    700 against a force bar at 1000 arms with the filter on, one at 701 does not -- and spends
+    the region. With the filter off, 701 arms.
+
+    ⚠️ The refusal and the acceptance are on adjacent counts on purpose: a filter reading the
+    wrong bar's volume, or comparing against a constant, cannot land on 700 and not on 701.
+    """
+    force = bar(13, open_="100", close="105.5", high="106", low="99.5", tick_volume=1000)
+
+    def gift_with(volume: int) -> Candle:
+        return bar(14, open_="105.2", close="105", high="105.6", low="104.4", tick_volume=volume)
+
+    quiet_enough = _gift_setup([*_IMPULSE, *_FALLS_BACK, force, gift_with(700)], volume_filter=True)
+    [placed] = quiet_enough[14]
+    assert placed.stop_price == Decimal("106.01")
+
+    too_loud = _gift_setup(
+        [
+            *_IMPULSE,
+            *_FALLS_BACK,
+            force,
+            gift_with(701),
+            _off_the_region(15),
+            _force_at(16),
+            _gift_at(17),
+        ],
+        volume_filter=True,
+    )
+    assert too_loud[14] == []
+    assert too_loud[17] == [], "a follower refused by the filter did not spend the region"
+
+    filter_off = _gift_setup([*_IMPULSE, *_FALLS_BACK, force, gift_with(701)])
+    assert filter_off[14] != []
+
+
+def test_a_region_named_on_the_very_bar_of_force_still_sees_it() -> None:
+    """The hand-over bar, the FFFD's blocking finding and the hammer's third reset. `observe`
+    runs twice on the bar a zone is armed; `_LateMarked(after=22)` names the region for the first
+    time on bar 13, which is the force bar, and the gift on 14 has to find it remembered."""
+    late = _drive_from_bullish(
+        ageless_structure(qualifier=_LateMarked(after=22), entry_point=ZoneEntryPoint.GIFT),
+        [*_IMPULSE, *_FALLS_BACK, _FORCE_OFF_THE_REGION, _GIFT],
+    )
+
+    [placed] = late[14]
+    assert placed.stop_price == Decimal("106.01")
+
+
+def test_a_pending_force_bar_does_not_follow_the_activation_to_another_region() -> None:
+    """The hammer's leak, one step earlier: a bar of force *waiting for its follower*, carried
+    across a hand-over, would have region B's first bar read as the gift of a force bar that
+    printed on region A. B's top is 97; the force bar's low of 99.50 never reached it."""
+    armed_here = _zone_at("100", "90", hour=1)
+    never_reached = _zone_at("97", "87", hour=2)
+
+    activation = ForceFollowActivation(trigger=GiftTrigger())
+    with localcontext(ENGINE_CONTEXT):
+        first = Context(candle=_FORCE_OFF_THE_REGION, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(armed_here, context=first)
+        assert activation.entry_for(armed_here, context=first) is None
+
+        second = Context(candle=_GIFT, instrument=AAPL, account=_ACCOUNT)
+        activation.observe(never_reached, context=second)
+        assert activation.entry_for(never_reached, context=second) is None
+        assert not activation.spent(never_reached)
+
+
+def test_the_entry_may_sit_at_the_ceiling_and_not_a_tick_past_it() -> None:
+    """*"Vamos usar um range de 2x a região pra cima: 90-100 a região, o teto de entrada é 120."*
+
+    The ceiling measures the **entry**, by his words, where the hammer's measured the bar. Bar 0
+    touches; the force bar on 1 runs from 110 to 119.50; a gift topping at 119.99 puts the order
+    at exactly 120.00 and arms. One topping at 120.00 puts it at 120.01, arms nothing -- and
+    spends the region, because a setup that completed and failed a criterion is a cancelled one.
+    """
+    region = _zone_at("100", "90", hour=1)
+    touch = bar(0, open_="100.5", close="100.2", high="101", low="99.5")
+    force = bar(1, open_="110", close="119", high="119.5", low="110")
+
+    _, at_the_ceiling = _watch(
+        region,
+        [touch, force, bar(2, open_="119.5", close="119.7", high="119.99", low="119.2")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert at_the_ceiling[2] is not None
+    assert at_the_ceiling[2].stop_price == Decimal("120.00")
+
+    past_it, seen = _watch(
+        region,
+        [touch, force, bar(2, open_="119.5", close="119.7", high="120", low="119.2")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[2] is None
+    assert past_it.spent(region)
+
+
+def test_the_sell_entry_may_sit_at_the_floor_and_not_a_tick_past_it() -> None:
+    """The mirror of the ceiling, on its own boundary — the `_mirror` scenarios land at 93.99
+    against a floor of 80 and never reach it, so `>=` against `>` on the sell side survived the
+    suite. Supply [100, 110], two heights below the near edge is **80.00**: an entry there arms;
+    one at 79.99 arms nothing and spends the region."""
+    region = _hammer_block(ZoneKind.SUPPLY, "110", "100")
+    touch = bar(0, open_="99", close="99.5", high="100.5", low="98")
+    force = bar(1, open_="90", close="81", high="90", low="80.5")
+    assert is_force_bar(force, side=Side.SHORT)
+
+    _, at_the_floor = _watch(
+        region,
+        [touch, force, bar(2, open_="80.5", close="80.3", high="80.8", low="80.01")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert at_the_floor[2] is not None
+    assert at_the_floor[2].side is Side.SHORT
+    assert at_the_floor[2].stop_price == Decimal("80.00")
+
+    past_it, seen = _watch(
+        region,
+        [touch, force, bar(2, open_="80.5", close="80.3", high="80.8", low="80")],
+        ForceFollowActivation(trigger=GiftTrigger()),
+    )
+    assert seen[2] is None
+    assert past_it.spent(region)
+
+
+def test_a_force_bar_resting_exactly_on_the_near_edge_has_touched_the_region() -> None:
+    """The boundary of the touch: a force bar with its low exactly on 100 has reached [90, 100]
+    and arms with its gift; one at 100.01, with no touch before it, has not."""
+    region = _zone_at("100", "90", hour=1)
+    on_the_edge = bar(0, open_="100.5", close="105.5", high="106", low="100")
+    _, seen = _watch(
+        region, [on_the_edge, _gift_at(1)], ForceFollowActivation(trigger=GiftTrigger())
+    )
+    assert seen[1] is not None
+    assert seen[1].stop_price == Decimal("106.01")
+
+    just_above = bar(0, open_="100.5", close="105.5", high="106", low="100.01")
+    _, seen = _watch(
+        region, [just_above, _gift_at(1)], ForceFollowActivation(trigger=GiftTrigger())
+    )
+    assert seen[1] is None
+
+
+def test_a_bar_resting_exactly_on_the_far_edge_has_not_broken_the_region() -> None:
+    """*"Mesmo que somente por pavio"* -- but a wick that stops exactly on 90 has not broken
+    [90, 100]. The force bar on 1 wicks to 90 and arms with its gift; wicking to 89.99 spends."""
+    region = _zone_at("100", "90", hour=1)
+    to_the_edge = bar(0, open_="92", close="105", high="105.5", low="90")
+    assert is_force_bar(to_the_edge, side=Side.LONG)
+    gift = bar(1, open_="104.8", close="105.2", high="105.4", low="104")
+
+    live, seen = _watch(region, [to_the_edge, gift], ForceFollowActivation(trigger=GiftTrigger()))
+    assert seen[1] is not None
+    assert not live.spent(region)
+
+    through = bar(0, open_="92", close="105", high="105.5", low="89.99")
+    live, seen = _watch(region, [through, gift], ForceFollowActivation(trigger=GiftTrigger()))
+    assert seen[1] is None
+    assert live.spent(region)
+
+
+def test_the_order_s_life_is_the_dial_and_not_the_constant() -> None:
+    """At three bars the cancel lands on the third bar after the gift rather than the second."""
+    region = _zone_at("100", "90", hour=1)
+    sequence = [
+        _force_at(0),
+        _gift_at(1),
+        *[bar(index, open_="105", close="105.1", high="105.4", low="104.8") for index in (2, 3, 4)],
+    ]
+    _, two = _watch(region, sequence, ForceFollowActivation(trigger=GiftTrigger()))
+    assert two[2] is not None
+    assert two[3] is None
+
+    _, three = _watch(
+        region, sequence, ForceFollowActivation(trigger=GiftTrigger(), bars_to_fill=3)
+    )
+    assert three[3] is not None
+    assert three[4] is None
+
+
+def test_the_touch_begins_this_setup_so_mitigation_does_not_end_it() -> None:
+    activation = ForceFollowActivation(trigger=IgnoredBarTrigger())
+    assert activation.spent_by_mitigation is False
+    assert (
+        activation.withdraws(
+            _zone_at("100", "90", hour=1),
+            context=Context(candle=_FORCE_OFF_THE_REGION, instrument=AAPL, account=_ACCOUNT),
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"bars_to_fill": 0}, "at least one bar"),
+        ({"bars_off_region": -1}, "is a count"),
+        ({"reach_fraction": Decimal("-1")}, "fraction of the region"),
+    ],
+)
+def test_the_follow_activation_refuses_a_dial_that_would_not_be_a_setup(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(EngineError, match=message):
+        ForceFollowActivation(trigger=GiftTrigger(), **kwargs)  # type: ignore[arg-type]
+
+
+class TestTheSideFilter:
+    """His request (18/09): every setup offers long only, short only, or both.
+
+    The structure family trades whichever way the zone it reads points — demand is a long, supply
+    a short — and `side` only narrows that. Each test drives a scenario that *does* arm with no
+    filter, so a filter that silenced everything would fail the control rather than pass.
+    """
+
+    def test_the_default_trades_both_as_it_always_did(self) -> None:
+        # The controls: the impulse on an uptrend arms a long on bar 9, its mirror a short.
+        # ⚠️ `_drive_from_bullish` for the long, never `_drive`: from a fresh machine the impulse
+        # confirms nothing, and a "never arms" beside it would pass for any filter at all.
+        [bought] = _drive_from_bullish(
+            ageless_structure(qualifier=_Marked(), name="test"), _IMPULSE
+        )[9]
+        [sold] = _drive(ageless_structure(qualifier=_Marked(), name="test"), _mirror(_IMPULSE))[9]
+
+        assert (bought.side, sold.side) == (Side.LONG, Side.SHORT)
+
+    def test_long_only_never_arms_a_supply_zone_and_still_arms_demand(self) -> None:
+        only_long = ageless_structure(qualifier=_Marked(), name="test", side=Side.LONG)
+        signals = _drive(only_long, _mirror(_IMPULSE))
+
+        assert all(bar == [] for bar in signals)
+        [bought] = _drive_from_bullish(
+            ageless_structure(qualifier=_Marked(), name="test", side=Side.LONG), _IMPULSE
+        )[9]
+        assert bought.side is Side.LONG
+
+    def test_short_only_never_arms_a_demand_zone_and_still_arms_supply(self) -> None:
+        only_short = ageless_structure(qualifier=_Marked(), name="test", side=Side.SHORT)
+        signals = _drive_from_bullish(only_short, _IMPULSE)
+
+        assert all(bar == [] for bar in signals)
+        [sold] = _drive(
+            ageless_structure(qualifier=_Marked(), name="test", side=Side.SHORT),
+            _mirror(_IMPULSE),
+        )[9]
+        assert sold.side is Side.SHORT
+
+
+@pytest.mark.parametrize("kind", ["structure_choch", "structure_continuation"])
+@pytest.mark.parametrize(
+    ("side", "arms_demand", "arms_supply"),
+    [("long", True, False), ("short", False, True), ("both", True, True)],
+)
+def test_a_documents_side_reaches_the_engine_as_the_side_it_names(
+    kind: str, side: str, arms_demand: bool, arms_supply: bool
+) -> None:
+    """⚠️ The engine-guardian's blocker on PR-275: the *document* to engine path, both mirrors.
+
+    `TestTheSideFilter` drives the constructor; this drives `build_setup`, which is what a saved
+    strategy reaches. A factory that always passed SHORT, or dropped `long` and ran both, left every
+    other test green — the only probe of the path was on the short side. Judged by behaviour, not
+    by a private attribute: demand armed on the uptrend's impulse, supply on its mirror.
+    """
+
+    def built() -> StructureStrategy:
+        # The age rule off, as `ageless_structure` does for the constructor: the stream is short.
+        setup = build_setup({"type": kind, "params": {"side": side, "min_bars_to_touch": 1}})
+        assert isinstance(setup, StructureStrategy)
+        # The qualifier under test is the path, not a setup's own taste in zones: `_Marked`
+        # names every zone the detector marks, so the side is the only filter left. ⚠️ Asserted
+        # first: were the attribute renamed, assigning would create a new one silently, and this
+        # test would go on passing while testing a real qualifier instead of the side.
+        assert hasattr(setup, "_qualifier")
+        setup._qualifier = _Marked()
+        return setup
+
+    demand = _drive_from_bullish(built(), _IMPULSE)
+    supply = _drive(built(), _mirror(_IMPULSE))
+
+    assert any(bar != [] for bar in demand) is arms_demand
+    assert any(bar != [] for bar in supply) is arms_supply
+
+
+# --------------------------------------------------------------------------- #
+# His minimum age of a region (29/09)                                          #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _Detected:
+    """The two things `_old_enough` reads off the detector: its regions and its bar count."""
+
+    zones: ZoneView
+    bar_index: int
+
+
+def _aged(block: OrderBlock, *, gap: int, touched: int | None) -> TrackedZone:
+    tracked = TrackedZone(block=block, gap_index=gap, touched_index=touched)
+    tracked.mitigated = touched is not None
+    return tracked
+
+
+def _may_arm_at(bar_index: int, tracked: TrackedZone, **kwargs: object) -> bool:
+    strategy = StructureStrategy(qualifier=ChochQualifier(), **kwargs)  # type: ignore[arg-type]
+    strategy._blocks = _Detected(ZoneView((tracked,)), bar_index)  # type: ignore[assignment]
+    return strategy._old_enough(tracked.block)
+
+
+_YOUNG = OrderBlock(
+    kind=ZoneKind.DEMAND,
+    top=Decimal(100),
+    bottom=Decimal(90),
+    time=START,
+    confirmed_at=START + 3 * HOUR,
+    break_kind=StructureKind.CHOCH,
+    primary=True,
+)
+
+
+def test_a_region_may_be_traded_from_the_close_of_its_seventh_bar() -> None:
+    """His count: the gap's third candle (detector bar 10 here) is bar one, so the seventh is bar
+    16 — the order may be put at its close, and not a bar before."""
+    tracked = _aged(_YOUNG, gap=10, touched=None)
+    assert not _may_arm_at(15, tracked)
+    assert _may_arm_at(16, tracked)
+    assert _may_arm_at(40, tracked)
+
+
+def test_a_touch_on_the_seventh_bar_or_before_cancels_the_trade_for_good() -> None:
+    """*"Se tocar na 7ª barra ou antes, não faz o trade"* — and it does not come back later."""
+    on_the_seventh = _aged(_YOUNG, gap=10, touched=16)
+    after_it = _aged(_YOUNG, gap=10, touched=17)
+    assert not _may_arm_at(16, on_the_seventh)
+    assert not _may_arm_at(60, on_the_seventh)
+    # A touch after the wait is the ordinary trade, the rule has nothing to say about it.
+    assert _may_arm_at(17, after_it)
+
+
+def test_one_bar_is_the_rule_switched_off() -> None:
+    tracked = _aged(_YOUNG, gap=10, touched=11)
+    assert _may_arm_at(10, _aged(_YOUNG, gap=10, touched=None), min_bars_to_touch=1)
+    assert _may_arm_at(11, tracked, min_bars_to_touch=1)
+
+
+def test_the_default_is_seven_and_a_count_below_one_is_refused() -> None:
+    assert DEFAULT_MIN_BARS_TO_TOUCH == 7
+    with pytest.raises(ValueError, match="at least the bar that confirmed its gap"):
+        StructureStrategy(qualifier=ChochQualifier(), min_bars_to_touch=0)
+
+
+def test_a_zone_with_no_gap_on_record_is_left_to_the_other_rules() -> None:
+    """Built by hand, a zone has no gap count; the age rule does not invent one."""
+    assert _may_arm_at(0, TrackedZone(block=_YOUNG))
+
+
+@pytest.mark.parametrize(("age", "trades"), [(1, True), (500, False)])
+def test_the_document_s_minimum_age_reaches_the_zone_it_gates(age: int, trades: bool) -> None:
+    """From the document to the arming decision: the measured scenario arms a resting limit with
+    the rule off, and an age no region of it can reach leaves the book empty."""
+    broker = BacktestBroker(instrument=EURUSD, initial_capital=Decimal("10000"))
+    for _outcome in iter_run(
+        candles=iter(arms_a_resting_limit()),
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=build_setup({"type": "structure_choch", "params": {"min_bars_to_touch": age}}),
+        broker=broker,
+        risk=PercentRiskManager(percent=Decimal("1")),
+    ):
+        pass
+    assert bool(broker.submitted) is trades
+
+
+# --------------------------------------------------------------------------- #
+# A break ends the entries named before it (his rule, 29/09)                    #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _OnceThenSuperseded:
+    """`_Once`, plus the optional `supersedes` answer — true on one chosen bar only."""
+
+    at: int
+    done: bool = False
+    supersedes: bool = False
+
+    def qualify(self, context: SetupContext) -> OrderBlock | None:
+        self.supersedes = _index_of(context.candle) == self.at
+        if self.done or not context.marked:
+            return None
+        self.done = True
+        return context.marked[0]
+
+
+def test_a_superseding_break_withdraws_the_order_resting_on_the_zone_before_it() -> None:
+    """The order armed on bar 9 rests through a quiet bar 10; on bar 11 the qualifier reports that
+    a break ended every entry named before it, and the order is taken back on that bar — the
+    withdrawal `None` alone never asked for."""
+    quiet = [
+        bar(10, open_="124", close="120", high="125", low="119"),
+        bar(11, open_="120", close="115", high="121", low="114"),
+    ]
+    strategy = ageless_structure(qualifier=_OnceThenSuperseded(at=11))
+    signals = _drive_from_bullish(strategy, [*_IMPULSE, *quiet])
+
+    entry_id = signals[9][0].client_id
+    assert signals[10] == []
+    assert [(s.kind, s.client_id) for s in signals[11]] == [(SignalKind.CANCEL, entry_id)]
+    # And the zone is given up, not merely its order cancelled: an armed zone left behind is one a
+    # triggered entry would place again when price came back (the guardian's surviving mutant).
+    assert strategy._armed is None
+
+
+def test_a_qualifier_without_the_answer_never_withdraws_this_way() -> None:
+    """The same bars under `_Once`, which has no `supersedes`: the order rests on."""
+    quiet = [
+        bar(10, open_="124", close="120", high="125", low="119"),
+        bar(11, open_="120", close="115", high="121", low="114"),
+    ]
+    signals = _drive_from_bullish(ageless_structure(qualifier=_Once()), [*_IMPULSE, *quiet])
+
+    assert signals[11] == []
+
+
+@pytest.mark.parametrize("qualifier", [ChochQualifier, ContinuationQualifier])
+def test_both_structure_setups_say_a_break_supersedes_and_a_quiet_bar_does_not(
+    qualifier: type[ChochQualifier] | type[ContinuationQualifier],
+) -> None:
+    setup = qualifier()
+
+    def after(context: SetupContext) -> bool:
+        setup.qualify(context)
+        return setup.supersedes
+
+    assert after(_ctx(break_=_CHOCH_DOWN))
+    assert not after(_ctx())
+    assert after(_ctx(break_=_BOS_DOWN))
+
+
+@dataclass
+class _MarkedAndHearing(_Marked):
+    """`_Marked` that also answers `supersedes` — a qualifier that can end entries, so a break on a
+    position bar is told to it."""
+
+    supersedes: bool = False
+
+
+def test_a_break_while_a_position_is_open_still_reaches_a_qualifier_that_can_end_entries() -> None:
+    """The engine-guardian's blocker (29/09): bar 9's BOS confirms with a position open. A qualifier
+    that can end entries hears it; one that cannot is left exactly as it was."""
+    hearing = _MarkedAndHearing()
+    deaf = _Marked()
+    _drive_from_bullish(ageless_structure(qualifier=hearing), _IMPULSE, position_on=frozenset({9}))
+    _drive_from_bullish(ageless_structure(qualifier=deaf), _IMPULSE, position_on=frozenset({9}))
+
+    heard = [_index_of(context.candle) for context in hearing.seen if context.break_ is not None]
+    unheard = [_index_of(context.candle) for context in deaf.seen if context.break_ is not None]
+    assert 9 in heard
+    assert 9 not in unheard
+
+
+def test_a_choch_whose_trade_a_bos_overtook_does_not_step_down_after_the_stop() -> None:
+    """His rule 2 (29/09), through the position: the choch's short fills at the near rung, a BOS
+    confirms during the trade, the stop comes back at breakeven — and the choch's origin is not
+    sold, because that BOS ended the choch's entries."""
+    qualifier = ChochQualifier()
+    near = _supply("110", "115", 12, primary=False)
+    origin = _supply("120", "125", 9, primary=True)
+    zones = (TrackedZone(block=near), TrackedZone(block=origin))
+    assert qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(origin, near), zones=zones)) is near
+
+    qualifier.qualify(_ctx(break_=_BOS_DOWN, zones=zones))  # heard on the position bar
+    assert qualifier.qualify(_ctx(stopped=near, zones=zones)) is None
+
+
+def test_a_win_ends_its_own_ladder_and_not_the_one_a_later_bos_opened() -> None:
+    """Continuation: BOS #1's zone is traded; BOS #2 confirms during the trade and opens its own
+    ladder; the win then ends BOS #1's, and BOS #2's zone is the next trade."""
+    qualifier = ContinuationQualifier()
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN))
+    first = _bos_zone("96", "100", 15, primary=True)
+    second = _bos_zone("70", "74", 21, primary=True)
+    both = (TrackedZone(block=first), TrackedZone(block=second))
+    assert qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(first,), zones=both)) is first
+
+    qualifier.qualify(_ctx(break_=_BOS_DOWN, marked=(second,), zones=both))  # during the trade
+    assert qualifier.qualify(_ctx(won=first, zones=both)) is second
+
+
+def test_a_choch_win_ends_its_own_ladder_and_not_the_one_a_later_choch_opened() -> None:
+    """The engine-guardian's case (29/09): the choch short fills at its zone; an opposite change of
+    character confirms during the trade and, heard there, puts its own zone on the ladder; the
+    short then wins. The win ends the old regime's ladder only — the new choch's zone is the next
+    trade, not a rung behind the winner."""
+    qualifier = ChochQualifier()
+    old = _supply("110", "115", 12, primary=True)
+    new = _supply("80", "85", 14, primary=True)
+    zones = (TrackedZone(block=old), TrackedZone(block=new))
+    assert qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(old,), zones=zones)) is old
+
+    qualifier.qualify(_ctx(break_=_CHOCH_DOWN, marked=(new,), zones=zones))  # heard mid-trade
+    assert qualifier.qualify(_ctx(won=old, zones=zones)) is new

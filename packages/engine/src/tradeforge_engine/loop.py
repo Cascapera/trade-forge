@@ -20,23 +20,30 @@ the check has both a floor and a ceiling — see `_reject_lookahead`.
 
 import datetime as dt
 import logging
-from collections.abc import Iterable
+from collections import deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, localcontext
 from decimal import Context as DecimalContext
-from typing import cast
+from enum import StrEnum
+from typing import Protocol, cast
 
 from tradeforge_engine.domain import (
+    SNAPSHOT_BARS_BEFORE,
     ZERO,
     AccountState,
     Candle,
     ClosedTrade,
     Context,
+    EntrySnapshot,
     EquityPoint,
     Fill,
     InstrumentSpec,
+    Money,
     OrderRequest,
     Position,
+    Refusal,
+    RefusedBy,
     Signal,
     SignalKind,
 )
@@ -59,16 +66,179 @@ logger = logging.getLogger(__name__)
 ENGINE_PRECISION = 28
 ENGINE_CONTEXT = DecimalContext(prec=ENGINE_PRECISION, rounding=ROUND_HALF_EVEN)
 
+# The window size lives with the type it describes (`domain.SNAPSHOT_BARS_BEFORE`), because the
+# strategies size their own indicator buffers against it and a strategy reaching into the event
+# loop for a constant would be the tail wagging the dog. Re-exported here, where the buffer that
+# uses it is built.
+#
+# A *bounded* window, and that word is the whole design. `run()` takes an `Iterable` precisely
+# so that ten years of M1 never sits in memory at once; a snapshot buffer that grew with the
+# run would give that back, silently, and only on the long backtests where it matters. A
+# `deque` with a `maxlen` cannot: it drops from the left as it fills, at constant cost.
+# ⚠️ **One `__all__`, and it lives here.** There used to be a second one at the foot of the
+# file, and the second one won — silently. Adding `iter_run` and `BarOutcome` to this list did
+# nothing at all until the duplicate was removed, so the module's public surface disagreed with
+# the list that claims to define it. Nothing broke, because every consumer imports from the
+# module directly; a `from tradeforge_engine.loop import *` would have found the new names
+# missing and no error anywhere to explain it.
+__all__ = [
+    "ENGINE_CONTEXT",
+    "ENGINE_PRECISION",
+    "SNAPSHOT_BARS_BEFORE",
+    "BarOutcome",
+    "QuietBars",
+    "RunRecorder",
+    "RunResult",
+    "iter_run",
+    "run",
+]
+
+
+class QuietBars(StrEnum):
+    """What the loop does with a bar a setup calls quiet (ADR-0029, `StructureStrategy.quiet`).
+
+    `OFF` — every bar through `_step`, as a run on its own, paper and live always go. `SKIP` — a
+    quiet bar through `_quiet_step`: the broker's bar and the account as always, the setup's
+    `pass_quiet` instead of its decision. `SHADOW` — every bar through `_step`, and on a bar that
+    would have been quiet, a refusal if anything came of it: the claim, checked on real runs.
+    """
+
+    OFF = "off"
+    SKIP = "skip"
+    SHADOW = "shadow"
+
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
     """What a run produced. Frozen, so a caller cannot doctor the record."""
 
     fills: tuple[Fill, ...]
+    """Every fill from the first booked bar on. ⚠️ Under a warm-up (ADR-0030) the exit of a shadow
+    position that closes after `book_from` is here without its entry, and makes no trade: read the
+    trades for what the run did, never pair these."""
     trades: tuple[ClosedTrade, ...]
     equity_curve: tuple[EquityPoint, ...]
     final_account: AccountState
     candles_processed: int
+
+    warmed: int = 0
+    """Bars the run read before its window opened (ADR-0030): traded on, and never booked. The
+    bars of the window itself are `candles_processed`."""
+    refusals: tuple[Refusal, ...] = ()
+    """Every order the run intended and did not place, in the order it asked for them.
+
+    ⚠️ **Here because the field on `BarOutcome` claimed it and nothing delivered it.** That
+    docstring promised "the record of every order that was intended and did not happen" while
+    the only backtest consumer in the repo dropped the tuple on the floor — the shape of promise
+    this project has been bitten by before (`DEFAULT_BLOCK_MS` guaranteed a one-minute stop that
+    nothing implemented). A comment nobody can execute makes the next reader stop looking.
+
+    The question it answers is the one a backtest could not: **"why did this take no trades?"**
+    A run that placed nothing and a run that decided nothing produce the same empty `fills`, and
+    they mean opposite things about the strategy.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class BarOutcome:
+    """What one bar produced, handed over the moment it is finished.
+
+    The unit a live session works in. A backtest can afford to learn everything at the end,
+    because the end arrives; a paper session's end is whenever somebody stops it, so anything
+    it has not written down by then is lost. This is the record it writes.
+
+    `fills` is **this bar's**, not the run's — the same tuple the strategy was shown in its
+    `Context`. `equity` is the point step 5 appended, so a consumer that keeps every one of
+    these holds exactly the curve `run()` would have built.
+    """
+
+    index: int
+    candle: Candle
+    fills: tuple[Fill, ...]
+    equity: EquityPoint
+
+    refusals: tuple[Refusal, ...] = ()
+    """Orders this bar asked for that never reached the book (see `Refusal`).
+
+    ⚠️ **Not the ones the strategy was shown** — those are the previous bar's, and they went
+    into its `Context`. These were born after the strategy spoke, which is why they are reported
+    here and consumed by the next bar.
+
+    It is reported at all because until now a refusal existed nowhere: three `continue`s and a
+    `logger.debug`, so a run that placed nothing looked exactly like a run that decided nothing.
+    A consumer keeping these holds the record of every order that was intended and did not
+    happen, which is the half of a backtest nobody could see.
+    """
+
+
+def iter_run(  # noqa: PLR0913 — keyword-only; see run()
+    *,
+    candles: Iterable[Candle],
+    timeframe: dt.timedelta,
+    instrument: InstrumentSpec,
+    strategy: Strategy,
+    broker: Broker,
+    risk: RiskManager,
+    refusals: tuple[Refusal, ...] = (),
+    record_snapshots: bool = True,
+    quiet: QuietBars = QuietBars.OFF,
+) -> Iterator[BarOutcome]:
+    """The loop itself, one `BarOutcome` at a time, for as long as candles keep arriving.
+
+    **This is the only implementation of the five ordered steps, and that is the point.** A
+    live session needs the same order as a backtest — not a similar one. Written twice, the
+    two would agree on the day they were written and drift on the first fix applied to one of
+    them, and the drift would be invisible: both would keep producing plausible trades. So the
+    backtest is not a sibling of the live loop, it is a *consumer* of it — `run()` below is
+    the whole of the difference, and it is an accumulator.
+
+    **Live comes for free from `candles` being an `Iterable`.** A backtest hands it a cursor
+    over ten years of history; a paper session hands it a generator that blocks on a Redis
+    stream and yields whenever a bar closes. Neither the loop nor the broker can tell, because
+    there is nothing here to tell them with.
+
+    ⚠️ **Each bar's work runs under `ENGINE_CONTEXT`; the `yield` happens outside it.** Both
+    halves matter. A `with localcontext(...)` wrapped around the *creation* of a generator
+    does nothing at all — the body runs on `next()`, long after that block exited — so pinning
+    the arithmetic from the caller is not available here and the loop has to pin it itself.
+    And holding the context across the `yield` would push the engine's precision and rounding
+    onto whatever the consumer does with the bar, which for a live session is database writes:
+    the engine would be silently reconfiguring code that is not the engine.
+
+    ⚠️ **`refusals` is what was turned away *before this stream's first bar*, and there is
+    exactly one producer of it: `warmup.hand_over`.** A session's warm-up runs against one
+    broker and its live bars against another, so an order the strategy armed on the last bar of
+    history can be refused in the gap between the two loops — by a gate no `BarOutcome` will ever
+    report, because no bar of this stream was running when it happened. Left here, that is the
+    fifth silent hand-over point of ADR-0023: the strategy crosses believing an order rests
+    somewhere it does not, and stops offering the zone for ever.
+
+    It is delivered on the **first** bar and then replaced like any other pending refusal, which
+    is the same rule the loop already follows rather than an exception to it — a refusal is
+    handed to the next bar on which the strategy speaks, and for these that is the first one
+    there is. A backtest has no hand-over and therefore no producer, which is why `run()` does
+    not take this: a parameter nothing can fill is a promise nobody can keep.
+
+    `record_snapshots=False` builds no `EntrySnapshot` for any order — see `run`.
+    """
+    if timeframe <= dt.timedelta(0):
+        raise ValueError(f"timeframe must be positive, got {timeframe}")
+
+    # Validation eagerly, iteration lazily. A generator function's body does not run until it
+    # is first advanced, so a `raise` written directly in it would arrive whenever the caller
+    # happened to start iterating — a bad timeframe would surface from inside a live session's
+    # first bar rather than from the line that configured it.
+    return _iter_run(
+        quiet=quiet,
+        candles=candles,
+        timeframe=timeframe,
+        instrument=instrument,
+        strategy=strategy,
+        broker=broker,
+        risk=risk,
+        refusals=refusals,
+        record_snapshots=record_snapshots,
+    )
 
 
 def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a backtest
@@ -79,8 +249,9 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
     strategy: Strategy,
     broker: Broker,
     risk: RiskManager,
+    record_snapshots: bool = True,
 ) -> RunResult:
-    """Drive a strategy over a stream of closed candles.
+    """Drive a strategy over a stream of closed candles, to the end, and report.
 
     `timeframe` is how long one bar lasts, and the engine needs it to police the broker: a
     fill belongs to the bar being processed, and "the bar being processed" is `[candle.time,
@@ -92,22 +263,82 @@ def run(  # noqa: PLR0913 — keyword-only; each one names a real axis of a back
 
     Takes an `Iterable`, not a list: ten years of M1 is five million bars, and the engine has
     no reason to hold them all at once.
+
+    ⚠️ **To the end.** Handed a stream that never ends — a live one — this never returns, and
+    the lists below grow without bound. That is not a defect to be patched here; it is what
+    `iter_run` is for.
+
+    `record_snapshots=False` is for a run nobody will read trade by trade — a sweep's (2026-09-23).
+    No entry carries the window of bars it was decided on, so no trade carries a picture. It is a
+    record-keeping switch and **nothing else**: the window is only ever copied into the order,
+    never read by a decision, so trades, fills and equity come out identical either way
+    (`test_snapshots_off_change_nothing_but_the_snapshots`). It is not built and dropped later
+    because the copy is the cost — up to 151 bars per entry, over millions of runs.
     """
-    if timeframe <= dt.timedelta(0):
-        raise ValueError(f"timeframe must be positive, got {timeframe}")
+    recorder = RunRecorder(book_from=getattr(broker, "book_from", None))
+    for outcome in iter_run(
+        candles=candles,
+        timeframe=timeframe,
+        instrument=instrument,
+        strategy=strategy,
+        broker=broker,
+        risk=risk,
+        record_snapshots=record_snapshots,
+    ):
+        recorder.add(outcome)
+    return recorder.result(broker)
 
-    with localcontext(ENGINE_CONTEXT):
-        return _run(
-            candles=candles,
-            timeframe=timeframe,
-            instrument=instrument,
-            strategy=strategy,
-            broker=broker,
-            risk=risk,
-        )
+
+class RunRecorder:
+    """What `run` keeps of each bar, and the `RunResult` it makes of them at the end.
+
+    A class of its own so a batch (`batch.run_batch`), which steps many runs a bar at a time
+    instead of draining one, keeps each run's record exactly the way `run` does — one place
+    that decides what a result is made of, not two that agree today (ADR-0029).
+
+    ⚠️ **What happens before `book_from` is not the run's** (ADR-0030): the warm-up's bars are
+    counted (`warmed`) and nothing else of them is kept — no fill, no refusal, no point of the
+    curve. The broker's ledger forgets them the same way; the instant comes from the broker, so
+    the two cannot disagree.
+    """
+
+    def __init__(self, *, book_from: dt.datetime | None = None) -> None:
+        self._book_from = book_from
+        self._fills: list[Fill] = []
+        self._refusals: list[Refusal] = []
+        self._equity_curve: list[EquityPoint] = []
+        self._processed = 0
+        self._warmed = 0
+
+    def add(self, outcome: BarOutcome) -> None:
+        if self._book_from is not None and outcome.candle.time < self._book_from:
+            self._warmed += 1
+            return
+        self._fills.extend(outcome.fills)
+        self._refusals.extend(outcome.refusals)
+        self._equity_curve.append(outcome.equity)
+        self._processed += 1
+
+    def result(self, broker: Broker) -> RunResult:
+        # The closing reads are pinned like every bar's work was. ⚠️ With the brokers in this repo
+        # that is a no-op and provably so — `Portfolio.account()` reads fields already computed and
+        # `trades()` hands back objects already built, so a mutant deleting this block survives. It
+        # stays as a boundary, not as a fix: the arithmetic of totalling a ledger is a broker's to
+        # place, and one that computed equity on demand would need it. The comment says which of
+        # those is true today so nobody reads the block as proof of the other.
+        with localcontext(ENGINE_CONTEXT):
+            return RunResult(
+                fills=tuple(self._fills),
+                trades=tuple(broker.trades()),
+                equity_curve=tuple(self._equity_curve),
+                final_account=broker.account(),
+                candles_processed=self._processed,
+                warmed=self._warmed,
+                refusals=tuple(self._refusals),
+            )
 
 
-def _run(  # noqa: PLR0913 — see run()
+def _iter_run(  # noqa: PLR0913 — see run()
     *,
     candles: Iterable[Candle],
     timeframe: dt.timedelta,
@@ -115,80 +346,327 @@ def _run(  # noqa: PLR0913 — see run()
     strategy: Strategy,
     broker: Broker,
     risk: RiskManager,
-) -> RunResult:
-    fills: list[Fill] = []
-    equity_curve: list[EquityPoint] = []
-    processed = 0
+    refusals: tuple[Refusal, ...] = (),
+    record_snapshots: bool = True,
+    quiet: QuietBars = QuietBars.OFF,
+) -> Iterator[BarOutcome]:
     previous: Candle | None = None
+    # Refusals born on the bar before the one about to run, waiting to be shown to the strategy.
+    # The loop owns this for the same reason it owns `window`: it is the only component that
+    # sees one bar end and the next begin, and a refusal is precisely a fact that crosses that
+    # boundary. See `Context.refusals` for why it cannot be delivered on its own bar.
+    #
+    # It starts at whatever was refused before this stream began — the hand-over's, and nothing
+    # else has any (see `iter_run`). Seeded here rather than yielded as a bar of its own: these
+    # refusals belong to no candle, and inventing one to carry them would put a bar in the
+    # equity curve that the market never produced.
+    pending: tuple[Refusal, ...] = refusals
+    # What the last drain of the broker's mailbox produced, waiting to be put on a `BarOutcome`
+    # (ADR-0025). It is already inside `pending` — the strategy sees it through `Context` — and
+    # it is carried separately only because the *record* needs it and `pending` cannot say which
+    # half of itself came from where.
+    carried: tuple[Refusal, ...] = ()
+    # The arming window. Holds the decision bar plus the bars before it, and no more — see
+    # SNAPSHOT_BARS_BEFORE. The loop owns it because the loop is the only component that sees
+    # the stream, in backtest and in live alike, and because it is here that `decided_at` is
+    # stamped: the window and the instant the anti-lookahead guard checks come from one place.
+    # `None` when nothing is recorded: no window, so no order can be handed one (`run`).
+    window: deque[Candle] | None = (
+        deque(maxlen=SNAPSHOT_BARS_BEFORE + 1) if record_snapshots else None
+    )
 
-    for candle in candles:
-        _reject_out_of_order(previous, candle, timeframe)
+    for index, candle in enumerate(candles):
+        # The engine's arithmetic is pinned for the whole of a bar's work and released before
+        # the hand-over — see `iter_run`. Everything below this line is the engine; everything
+        # the consumer does with the `BarOutcome` is not.
+        with localcontext(ENGINE_CONTEXT):
+            _reject_out_of_order(previous, candle, timeframe)
 
-        # 1. The bar arrives. Whatever was decided on an earlier bar executes now, inside
-        #    this one, at a price the strategy had not seen when it decided. This is the
-        #    ONLY place a fill can be born.
-        born: list[Fill] = []
-        for fill in broker.on_bar(candle):
-            _reject_lookahead(fill, candle, timeframe)
-            _reject_foreign_symbol(fill, instrument)
-            born.append(fill)
-        fills.extend(born)
+            # Before anything else looks at this bar. The strategy is about to be shown it, so
+            # it belongs in any window describing what the strategy had seen — and nothing
+            # below can decide an entry without it being the window's last bar.
+            if window is not None:
+                window.append(candle)
 
-        # 2. Only now is the strategy allowed to look at this candle — and at nothing else.
-        #    The account is read once: against a live terminal, two reads are two round
-        #    trips that can disagree, and the equity curve would stop being what the
-        #    strategy saw.
-        account = broker.account()
-        context = Context(
-            candle=candle,
-            instrument=instrument,
-            account=account,
-            position=_open_position(broker, instrument.symbol),
-            # This bar's fills, not the run's: what step 1 just did is part of what the
-            # bar revealed, and it is the only way a strategy learns of a trade that
-            # opened and died inside one bar (ADR-0015).
-            fills=tuple(born),
-        )
-
-        # 3-4. Intent -> size -> veto -> queue. Never intent -> fill.
-        for signal in strategy.on_bar(context):
-            # A cancel is the one intent that never becomes an order — it withdraws one. It
-            # skips sizing and the veto for the same reason an exit skips sizing: there is
-            # nothing to size, and a risk manager that could refuse a cancel would be a risk
-            # manager that keeps an order alive after the strategy disowned it.
-            if signal.kind is SignalKind.CANCEL:
-                # `Signal.__post_init__` has already refused a cancel with no name, so this
-                # is a `str`. Narrowing it again would add a branch no test could enter.
-                broker.cancel(cast(str, signal.client_id))
-                continue
-
-            order = _to_order(signal, context, instrument, risk)
-            if order is None:
-                continue
-            if not risk.allow(order, account):
-                logger.debug("risk manager vetoed %s at %s", order.reason, candle.time)
-                continue
-            result = broker.submit(order)
-            # A refusal is the broker declining to take the order at all — a duplicate name, an
-            # order it cannot rest. Silence here would look exactly like a trade that simply
-            # never triggered, which is the one failure the strategy author cannot debug.
-            if not result.accepted:
-                logger.debug(
-                    "broker refused %s at %s: %s", order.reason, candle.time, result.reason
+            still = quiet is not QuietBars.OFF and not pending and _quiet(strategy, broker, candle)
+            if still and quiet is QuietBars.SKIP:
+                outcome, gates = _quiet_step(
+                    index=index, candle=candle, strategy=strategy, broker=broker, recorded=carried
                 )
-
-        # 5. The account is worth what it is worth at the close of this bar.
-        equity_curve.append(EquityPoint(time=candle.time, equity=account.equity))
+            else:
+                outcome, gates = _step(
+                    index=index,
+                    candle=candle,
+                    window=window,
+                    timeframe=timeframe,
+                    instrument=instrument,
+                    strategy=strategy,
+                    broker=broker,
+                    risk=risk,
+                    refusals=pending,
+                    recorded=carried,
+                )
+                if still and (fills_or_gates := (outcome.fills, gates)) != ((), ()):
+                    raise EngineError(
+                        f"a bar called quiet was not: {fills_or_gates} at {candle.time}"
+                    )
+                if still and not _idle(broker):
+                    raise EngineError(f"a bar called quiet placed an order at {candle.time}")
+        yield outcome
 
         previous = candle
-        processed += 1
+        # ⚠️ Replaced, never accumulated. A refusal is news, and news delivered twice is a
+        # strategy told its order was turned away on a bar when nothing was asked. That is why
+        # `gates` and not `outcome.refusals`: the outcome also carries the previous drain,
+        # which this bar's `Context` has already shown the strategy.
+        #
+        # ⚠️ **Who that actually hurts, corrected.** This comment used to name `StructurePhase`
+        # — "would forget an order it had just successfully armed" — and that has not been true
+        # since it started matching by name: `_observe_refusal` keeps only the refusals carrying
+        # the `client_id` it is holding, and a re-delivered one names an order it has already
+        # let go of. What the rule protects is the **contract** — `Context.refusals` is news,
+        # delivered once — and any strategy that does not key by name. A `ScriptedStrategy` with
+        # a fixed name is the one in this repo that would see the same refusal on two bars.
+        #
+        # ⚠️ **Asked outside `localcontext`, and after the yield, deliberately.** This is a read
+        # from another process's mailbox (ADR-0024), not arithmetic — and it must happen on every
+        # bar, including the ones `_step` produced nothing on, or a refusal that arrives while
+        # the strategy is quiet waits for the next order to be turned away before it is seen.
+        #
+        # ⚠️ **What is drained here is delivered on the very next bar, and the first version
+        # of ADR-0025 lost that by routing, not by timing.** It drained at the top of `_step`
+        # and put the result on that bar's outcome — from where `pending` carried it to the
+        # bar *after*. An executor's verdict lands milliseconds after `submit` (ADR-0024
+        # measured 8 ms), inside step 3 of this bar; measured on a fake that refuses inside
+        # `submit`, an order sent on bar 2 reached the strategy on bar 3 from here and on bar
+        # 4 that way. Fifteen minutes of a live M15 session believing in an order the venue
+        # never took. The drain itself could sit later still — the `for` above blocks on the
+        # next candle *after* this line, so the top of `_step` sees everything that lands in
+        # that wait too — but only if what it drains goes into the *same* bar's `Context`,
+        # which is not what `Context.refusals` means today. That is the backlog's decision to
+        # make, with the wider window as its prize; this PR restores the delivery it found.
+        carried = tuple(broker.refusals())
+        pending = (*gates, *carried)
 
-    return RunResult(
-        fills=tuple(fills),
-        trades=tuple(broker.trades()),
-        equity_curve=tuple(equity_curve),
-        final_account=broker.account(),
-        candles_processed=processed,
+
+def _quiet(strategy: Strategy, broker: Broker, candle: Candle) -> bool:
+    """Can this bar change nothing and produce nothing? Only a setup that says so on its own terms
+    (`quiet`), over an account that can fill nothing (`idle`) — anything else is never quiet."""
+    asks = getattr(strategy, "quiet", None)
+    return asks is not None and _idle(broker) and bool(asks(candle))
+
+
+def _idle(broker: Broker) -> bool:
+    idle = getattr(broker, "idle", None)
+    return idle is not None and bool(idle())
+
+
+def _quiet_step(
+    *,
+    index: int,
+    candle: Candle,
+    strategy: Strategy,
+    broker: Broker,
+    recorded: tuple[Refusal, ...],
+) -> tuple[BarOutcome, tuple[Refusal, ...]]:
+    """A quiet bar (ADR-0029): `_step` less the setup's decision, which would have been none.
+
+    The broker's bar and the account are the same calls in the same order as `_step`'s — an idle
+    broker fills nothing, and a fill here would be a broken promise, refused loudly. The setup's
+    `on_bar` is replaced by `pass_quiet`, the part of it that must happen on every bar. What the
+    broker turned away on the bar before is recorded on this one, as `_step` records it.
+    """
+    fills = broker.on_bar(candle)
+    if fills:
+        raise EngineError(f"an idle broker filled on a quiet bar at {candle.time}")
+    account = broker.account()
+    cast(_Quiet, strategy).pass_quiet(candle)
+    return (
+        BarOutcome(
+            index=index,
+            candle=candle,
+            fills=(),
+            equity=EquityPoint(time=candle.time, equity=account.equity),
+            refusals=recorded,
+        ),
+        (),
+    )
+
+
+class _Quiet(Protocol):
+    def pass_quiet(self, candle: Candle) -> None: ...
+
+
+def _step(  # noqa: PLR0913 — one bar of the loop; every argument is a seam or the bar itself
+    *,
+    index: int,
+    candle: Candle,
+    window: deque[Candle] | None,
+    timeframe: dt.timedelta,
+    instrument: InstrumentSpec,
+    strategy: Strategy,
+    broker: Broker,
+    risk: RiskManager,
+    refusals: tuple[Refusal, ...] = (),
+    recorded: tuple[Refusal, ...] = (),
+) -> tuple[BarOutcome, tuple[Refusal, ...]]:
+    """One bar, five ordered steps. The order is the anti-lookahead rule — see the module
+    docstring. Runs inside `ENGINE_CONTEXT`; its caller is responsible for that.
+
+    `refusals` is what the **previous** bar asked for and did not get; the ones this bar produces
+    come back on the `BarOutcome`. See `Context.refusals`."""
+    # 1. The bar arrives. Whatever was decided on an earlier bar executes now, inside
+    #    this one, at a price the strategy had not seen when it decided. This is the
+    #    ONLY place a fill can be born.
+    born: list[Fill] = []
+    for fill in broker.on_bar(candle):
+        _reject_lookahead(fill, candle, timeframe)
+        _reject_foreign_symbol(fill, instrument)
+        born.append(fill)
+
+    # 1b. `recorded` is what `iter_run` drained from the broker's mailbox after the previous
+    #     bar — refusals nobody in this loop built, and until ADR-0025 the only ones that
+    #     reached no `BarOutcome` at all. They are put on this bar's outcome so that
+    #     `RunResult.refusals` — "every order the run intended and did not place" — can hold
+    #     them, and they are *also* in `refusals` above, which is how the strategy sees them.
+    #
+    # ⚠️ **Recorded here, one bar after the bar they belong to, and that is the price of
+    # keeping `Context.refusals` meaning "the previous bar's".** The first version of this PR
+    # drained at the top of this step and put the result on this bar's outcome; that dated
+    # them correctly and delivered them one bar late, because `pending` is built from the
+    # outcome. Draining here *and* showing the result in this bar's `Context` would fix both —
+    # it is the change the backlog holds — but it is a change to what a strategy is told a
+    # refusal in its `Context` means, not to this broker. Delivery beat provenance:
+    # `RunResult.refusals` is a flat list and does not care which bar recorded a refusal,
+    # while `StructurePhase` cares very much which bar it learns on.
+    turned_away: list[Refusal] = []
+
+    # 2. Only now is the strategy allowed to look at this candle — and at nothing else.
+    #    The account is read once: against a live terminal, two reads are two round
+    #    trips that can disagree, and the equity curve would stop being what the
+    #    strategy saw.
+    account = broker.account()
+    context = Context(
+        candle=candle,
+        instrument=instrument,
+        account=account,
+        position=_open_position(broker, instrument.symbol),
+        # This bar's fills, not the run's: what step 1 just did is part of what the
+        # bar revealed, and it is the only way a strategy learns of a trade that
+        # opened and died inside one bar (ADR-0015).
+        fills=tuple(born),
+        # The previous bar's, necessarily — a refusal is born below, after this object has
+        # been built and handed over. See `Context.refusals`.
+        refusals=refusals,
+    )
+
+    # 3-4. Intent -> size -> veto -> queue. Never intent -> fill.
+    #
+    # ⚠️ **Every path out of this loop that is not a queued order is recorded here.** A setup
+    # marks its armed order placed the moment it emits the signal, so a gate that turns an
+    # order away in silence leaves the strategy holding an order that does not exist — the
+    # ghost ADR-0023 measured at four of five hand-over points, arriving through whichever of
+    # these three doors happens to be open. `logger.debug` was not a channel; the strategy
+    # cannot read a log.
+    for signal in strategy.on_bar(context):
+        # A cancel is the one intent that never becomes an order — it withdraws one. It
+        # skips sizing and the veto for the same reason an exit skips sizing: there is
+        # nothing to size, and a risk manager that could refuse a cancel would be a risk
+        # manager that keeps an order alive after the strategy disowned it.
+        if signal.kind is SignalKind.CANCEL:
+            # `Signal.__post_init__` has already refused a cancel with no name, so this
+            # is a `str`. Narrowing it again would add a branch no test could enter.
+            broker.cancel(cast(str, signal.client_id))
+            continue
+
+        # A stop modification skips sizing and the veto for the same reasons, and adds one
+        # of its own: **the decision instant is stamped here, not by the strategy**. It is
+        # this candle's opening time, so a stop decided on this bar's close cannot exit
+        # inside this bar — `_reject_lookahead` checks it on the way out. The loop already
+        # guarantees that by ordering (`broker.on_bar` ran before the strategy saw the
+        # bar), but ordering is a fact about these lines; the stamp is a fact the engine
+        # can verify. See ADR-0018.
+        if signal.kind is SignalKind.MODIFY_STOP:
+            # `Signal.__post_init__` refuses a MODIFY_STOP with no level, same as a
+            # nameless cancel — so this is a `Money`.
+            moved = broker.modify_stop(
+                instrument.symbol, cast(Money, signal.stop_loss), candle.time
+            )
+            # Refused. Usually a strategy trailing a stop onto an entry that has not
+            # filled yet; but a broker holding a position it keeps no protective level for
+            # refuses too, and from here the two are the same answer. So the line reports
+            # the refusal and stops there — naming a cause the loop never checked is how a
+            # log turns into a false lead. Silence is not an option either: it looks
+            # exactly like a trailing rule that ran and worked, which is the one difference
+            # the author is trying to see. Same reason `_to_order` logs an exit with no
+            # open position.
+            if not moved:
+                logger.debug(
+                    "broker refused the stop modification at %s (%s)",
+                    candle.time,
+                    signal.reason,
+                )
+            continue
+
+        order = _to_order(signal, context, instrument, risk, window)
+        if isinstance(order, Refusal):
+            logger.debug(
+                "%s refused %s at %s: %s",
+                order.refused_by,
+                order.reason,
+                candle.time,
+                order.detail,
+            )
+            turned_away.append(order)
+            continue
+        if not risk.allow(order, account):
+            logger.debug("risk manager vetoed %s at %s", order.reason, candle.time)
+            turned_away.append(
+                Refusal(
+                    client_id=order.client_id,
+                    intent=order.intent,
+                    refused_by=RefusedBy.RISK,
+                    reason=order.reason,
+                    detail="the risk manager vetoed it",
+                )
+            )
+            continue
+        result = broker.submit(order)
+        # A refusal is the broker declining to take the order at all — a duplicate name, an
+        # order it cannot rest. Silence here would look exactly like a trade that simply
+        # never triggered, which is the one failure the strategy author cannot debug.
+        if not result.accepted:
+            logger.debug("broker refused %s at %s: %s", order.reason, candle.time, result.reason)
+            turned_away.append(
+                Refusal(
+                    client_id=order.client_id,
+                    intent=order.intent,
+                    refused_by=RefusedBy.BROKER,
+                    reason=order.reason,
+                    detail=result.reason,
+                )
+            )
+
+    # 5. The account is worth what it is worth at the close of this bar.
+    #
+    # ⚠️ `account` is the one read in step 2, deliberately — not a fresh one taken here. The
+    # curve is meant to be what the strategy was looking at when it decided, and against a
+    # live terminal a second read is a second round trip that can disagree with the first.
+    # ⚠️ **Two values, and the second is not a convenience.** The outcome carries everything
+    # known on this bar, `recorded` included, because that is the record. `iter_run` needs the
+    # *gates alone* to build the next bar's `pending`: `recorded` was already delivered to the
+    # strategy in this bar's `Context`, and putting it back in `pending` would deliver the same
+    # news twice, which the contract above forbids.
+    # `_step` is private, so saying it in the return type costs nothing.
+    return (
+        BarOutcome(
+            index=index,
+            candle=candle,
+            fills=tuple(born),
+            equity=EquityPoint(time=candle.time, equity=account.equity),
+            refusals=(*recorded, *turned_away),
+        ),
+        tuple(turned_away),
     )
 
 
@@ -197,18 +675,29 @@ def _to_order(
     context: Context,
     instrument: InstrumentSpec,
     risk: RiskManager,
-) -> OrderRequest | None:
-    """Turn intent into a sized order, or into nothing.
+    window: Iterable[Candle] | None,
+) -> OrderRequest | Refusal:
+    """Turn intent into a sized order, or into the reason it did not become one.
 
     An exit is not sized: you close the position you have, all of it. Running an exit through
     the risk manager is how a stop-loss ends up rejected for exceeding the daily loss limit —
     the position closing *is* the thing that stops the loss.
+
+    ⚠️ **Total: there is no `None`.** Both paths that used to return one were silent — a debug
+    line and a `continue` — and silence is what this whole change is about. A caller that gets
+    something back always knows which of the two it is, and neither one can be dropped by
+    forgetting a branch.
     """
     if signal.kind is SignalKind.EXIT:
         position = context.position
         if position is None:
-            logger.debug("exit signal with no open position at %s", context.candle.time)
-            return None
+            return Refusal(
+                client_id=signal.client_id,
+                intent=SignalKind.EXIT,
+                refused_by=RefusedBy.NO_POSITION,
+                reason=signal.reason,
+                detail="there was no open position to close",
+            )
 
         # An exit does not rest at a price: the broker's own protective levels are the only
         # thing that closes a position at a level, and two paths closing one position is where
@@ -231,8 +720,13 @@ def _to_order(
 
     volume = risk.size(signal, context.account, instrument)
     if volume <= ZERO:
-        logger.debug("sizing returned %s at %s; no trade", volume, context.candle.time)
-        return None
+        return Refusal(
+            client_id=signal.client_id,
+            intent=signal.kind,
+            refused_by=RefusedBy.SIZING,
+            reason=signal.reason,
+            detail=f"sizing returned {volume}",
+        )
 
     return OrderRequest(
         symbol=instrument.symbol,
@@ -244,6 +738,19 @@ def _to_order(
         take_profit=signal.take_profit,
         reason=signal.reason,
         context=signal.context,
+        # Entries only. An exit has already returned above, and neither a cancel nor a stop
+        # modification ever becomes an order — so every window built here ends on the bar the
+        # strategy is being shown right now, which is what `decided_at` says one line up.
+        # No window is a run that records no pictures (`run`), and the order carries none.
+        snapshot=None
+        if window is None
+        else EntrySnapshot(
+            bars=tuple(window),
+            decided_at=context.candle.time,
+            regions=signal.regions,
+            series=signal.series,
+            levels=signal.levels,
+        ),
         limit_price=signal.limit_price,
         stop_price=signal.stop_price,
         client_id=signal.client_id,
@@ -357,6 +864,3 @@ def _reject_out_of_order(previous: Candle | None, candle: Candle, timeframe: dt.
             f"candles {gap} apart under a {timeframe} timeframe: the stream and the "
             f"timeframe disagree, and the lookahead ceiling is only as tight as they agree"
         )
-
-
-__all__ = ["ENGINE_CONTEXT", "ENGINE_PRECISION", "RunResult", "run"]

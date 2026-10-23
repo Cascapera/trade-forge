@@ -48,6 +48,59 @@ def test_a_ref_past_the_start_of_history_is_none() -> None:
     assert compile_operand("candle[-1].close").resolve(_ctx((only,)), 0) is None
 
 
+def test_a_misspelling_inside_a_reserved_namespace_is_refused_at_compile() -> None:
+    """⚠️ The one refusal in this file that exists because of a *silent* failure, not a loud one.
+
+    Anything that matches neither price pattern falls through to "it must be an indicator name", and
+    `indicator_at` answers `None` for a name it has no channel for. So `price.clsoe` — two letters
+    transposed in the most-typed ref in the DSL — used to compile happily and compare against
+    nothing on every bar of every run: the rule reads as declined rather than as broken, and no
+    layer says a word.
+
+    It became reachable when the DSL's grammar gained `id.component` for Bollinger's bands, because
+    `price` is a perfectly good identifier and `clsoe` a perfectly good component name. The schema
+    package refuses it too, in `semantic.py`; this is the lock on the layer that executes, for a
+    mapping that never passed through validation — which the engine accepts by design.
+    """
+    for bad in ("price.clsoe", "price.volume", "candle.high", "candle"):
+        with pytest.raises(EngineError, match="namespace"):
+            compile_operand(bad)
+
+    # ⚠️ **The bracketed form too, and it is a separate half of the check.** The namespace is read by
+    # splitting at the dot *and* at the bracket, because `candle[-1].hihg` splits at the dot into
+    # `candle[-1]` — which is not a reserved name, so without the second split the typo falls
+    # straight through to "it must be an indicator" and resolves to nothing on every bar. Same
+    # silent failure as `price.clsoe` in the neighbouring shape, and a mutation run is what showed
+    # this line had no test: dropping `.partition("[")[0]` survived the whole suite.
+    for bracketed in ("candle[-1].hihg", "candle[0].close", "candle[-2].closee"):
+        with pytest.raises(EngineError, match="namespace"):
+            compile_operand(bracketed)
+
+
+def test_an_indicator_whose_name_merely_starts_like_a_namespace_is_fine() -> None:
+    """The neighbour the refusal above must not take with it.
+
+    `pricey` and `candles` are legal indicator ids — the check is on the namespace *head*, split at
+    the dot, not on a string prefix. A `startswith("price")` would have refused both, and the
+    failure would be a compile error on a strategy that was always correct.
+    """
+    candle = bar(0, open_="1.0", close="1.5")
+    for good in ("pricey", "candles", "price_channel", "candle_body"):
+        operand = compile_operand(good)
+        # Resolves to None here only because no such indicator is registered in this context —
+        # what matters is that compiling it did not raise.
+        assert operand.resolve(_ctx((candle,)), 0) is None
+
+    # And the legal forms inside those namespaces still compile and still read. The pair matters for
+    # the same reason the price pair does: a check that refused `candle[-1].high` along with the
+    # typo would be worse than the hole it closed, and "refuses the typo" alone passes just as
+    # happily on a check that refuses everything.
+    prev = bar(0, open_="1.0", close="1.0")
+    now = bar(1, open_="2.0", close="2.0")
+    assert compile_operand("price.close").resolve(_ctx((now, prev)), 0) == Decimal("2.0")
+    assert compile_operand("candle[-1].close").resolve(_ctx((now, prev)), 0) == Decimal("1.0")
+
+
 def test_indicator_ref_reads_the_named_value() -> None:
     ctx = _ctx(indicators={"sma_fast": (Decimal("1.2345"), None)})
     assert compile_operand("sma_fast").resolve(ctx, 0) == Decimal("1.2345")
@@ -292,3 +345,154 @@ def test_an_empty_logic_list_is_refused() -> None:
 def test_a_logic_child_that_is_not_a_condition_is_refused() -> None:
     with pytest.raises(EngineError, match="child is not a condition"):
         compile_condition({"any": ["not a node"]})
+
+
+# --------------------------------------------------------------------------- #
+# between — three operands, both ends included                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _between(value: str, low: object, high: object) -> bool:
+    node = compile_condition(
+        {
+            "op": "between",
+            "value": {"ref": "rsi"},
+            "low": {"value": low},
+            "high": {"value": high},
+        }
+    )
+    return node.evaluate(_ctx(indicators={"rsi": (Decimal(value),)}))
+
+
+@pytest.mark.parametrize("value", ["30", "50", "70"])
+def test_between_includes_both_of_its_bounds(value: str) -> None:
+    """⚠️ The band is closed at both ends, and the ends are the whole reason to say so.
+
+    A bounded oscillator *reaches* its bounds: `between 0 and 100` on an RSI that has printed a
+    100 has to be true, or the one bar the rule was written for is the one bar it misses. The
+    word "between" is read both ways by different readers, so it is pinned by a test rather
+    than left to whoever edits the comparison next.
+    """
+    assert _between(value, 30, 70) is True
+
+
+@pytest.mark.parametrize("value", ["29.999", "70.001"])
+def test_between_is_false_just_outside_the_band(value: str) -> None:
+    assert _between(value, 30, 70) is False
+
+
+@pytest.mark.parametrize("unknown", ["middle", "lower", "upper"])
+def test_between_is_false_while_any_of_its_three_operands_is_unknown(unknown: str) -> None:
+    """A warming-up indicator does not put price *outside* a band that does not exist yet.
+
+    ⚠️ **Parametrised over all three, and the third is not symmetry for its own sake.** Guarding
+    only `low` and `value` leaves `low <= value <= high` to short-circuit: with `low <= value`
+    true, Python goes on to evaluate `value <= None` and the run dies with a `TypeError` from
+    inside a comparison. And the window where that happens is ordinary — a band between a
+    10-bar channel and a 20-bar one has ten bars where the lower rail answers and the upper
+    one has not, and any close above the lower rail is enough.
+    """
+    node = compile_condition(
+        {
+            "op": "between",
+            "value": {"ref": "middle"},
+            "low": {"ref": "lower"},
+            "high": {"ref": "upper"},
+        }
+    )
+    known = {"middle": Decimal("15"), "lower": Decimal("10"), "upper": Decimal("20")}
+    warming = _ctx(
+        indicators={name: (None,) if name == unknown else (value,) for name, value in known.items()}
+    )
+
+    assert node.evaluate(warming) is False
+
+
+def test_between_draws_its_band_between_two_indicators() -> None:
+    """The bounds are operands, not numbers — which is what makes a channel expressible.
+
+    "Price is inside its own 20-bar channel" is this node over `HIGHEST` and `LOWEST`, and it
+    cannot be written at all if the bounds have to be constants.
+    """
+    node = compile_condition(
+        {
+            "op": "between",
+            "value": {"ref": "price.close"},
+            "low": {"ref": "lowest"},
+            "high": {"ref": "highest"},
+        }
+    )
+    candle = bar(0, open_="12", close="12")
+    inside = _ctx((candle,), indicators={"lowest": (Decimal("10"),), "highest": (Decimal("14"),)})
+    outside = _ctx((candle,), indicators={"lowest": (Decimal("5"),), "highest": (Decimal("11"),)})
+
+    assert node.evaluate(inside) is True
+    assert node.evaluate(outside) is False
+
+
+# --------------------------------------------------------------------------- #
+# rising / falling — monotonic over the window                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _trend(op: str, values: list[str | None], bars: int = 1) -> bool:
+    """`values` newest-first, as the indicator history really is."""
+    node = compile_condition({"op": op, "of": {"ref": "line"}, "bars": bars})
+    history = tuple(None if each is None else Decimal(each) for each in values)
+    return node.evaluate(_ctx(indicators={"line": history}))
+
+
+def test_rising_over_one_bar_is_higher_than_the_previous_bar() -> None:
+    """The base case, and the default when `bars` is left out."""
+    assert _trend("rising", ["2", "1"]) is True
+    assert _trend("rising", ["1", "2"]) is False
+    assert (
+        compile_condition({"op": "rising", "of": {"ref": "line"}}).evaluate(
+            _ctx(indicators={"line": (Decimal("2"), Decimal("1"))})
+        )
+        is True
+    )
+
+
+def test_rising_over_several_bars_means_every_one_of_them_rose() -> None:
+    """⚠️ The rule this node exists to get right.
+
+    `4, 3, 2, 1` newest-first rose on each of the last three bars. `4, 1, 2, 3` did not — it
+    *fell* twice and then jumped — and the loose reading, "higher than it was three bars ago",
+    calls both of them rising. That reading turns a rule about a steady climb into a rule about
+    two endpoints, which is a different strategy wearing the same name.
+    """
+    assert _trend("rising", ["4", "3", "2", "1"], bars=3) is True
+    assert _trend("rising", ["4", "1", "2", "3"], bars=3) is False
+
+
+def test_a_flat_step_breaks_a_rise() -> None:
+    """Strict, and this is the one line where `>` versus `>=` changes the meaning.
+
+    A stalled market repeats a value. Read loosely, a flat stretch counts as rising for as long
+    as it lasts, and a "rising for 5 bars" filter stops filtering exactly when the market stops
+    moving — the case it was added for.
+    """
+    assert _trend("rising", ["3", "3", "2"], bars=2) is False
+    assert _trend("falling", ["1", "1", "2"], bars=2) is False
+
+
+def test_falling_is_the_mirror_and_not_merely_not_rising() -> None:
+    """`not rising` is true on a flat series; `falling` is not. Two different questions."""
+    assert _trend("falling", ["1", "2", "3"], bars=2) is True
+    assert _trend("falling", ["3", "3", "3"], bars=2) is False
+    assert _trend("rising", ["3", "3", "3"], bars=2) is False
+
+
+def test_a_trend_is_false_while_the_window_is_not_yet_filled() -> None:
+    """Not enough history is not a trend — it is nothing to say yet."""
+    assert _trend("rising", ["3", "2"], bars=3) is False
+    assert _trend("rising", ["3", "2", None], bars=2) is False
+
+
+def test_a_trend_refuses_a_bars_that_is_not_a_positive_whole_number() -> None:
+    """The schema bounds this, but the engine is fed documents the schema has not seen —
+    `bars: 0` would compare a value with itself and be true on every bar for ever."""
+    for bad in (0, -1, "3", True):
+        with pytest.raises(EngineError, match="bars must be a positive int"):
+            compile_condition({"op": "rising", "of": {"ref": "line"}, "bars": bad})

@@ -20,11 +20,49 @@ collector found convenient is a candle the engine would have to translate foreve
 """
 
 import datetime as dt
-from typing import Protocol
+from dataclasses import dataclass, replace
+from decimal import Decimal
+from typing import Protocol, runtime_checkable
 
 from tradeforge_engine.domain import Candle, InstrumentSpec
 
-__all__ = ["Candle", "InstrumentSpec", "MarketDataSource"]
+__all__ = [
+    "Candle",
+    "InstrumentSpec",
+    "MarketDataSource",
+    "QuotesAPriceStep",
+    "SymbolInfo",
+    "TickerSource",
+    "price_step_of",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolInfo:
+    """One line of a broker's catalogue: enough to find a symbol, not enough to price it.
+
+    ⚠️ **Deliberately not an `InstrumentSpec`.** That type is the engine's, and every field on
+    it — tick size, tick value, contract size — is a number the engine multiplies money by. To
+    fill one in you have to have decided the symbol's asset class, and the collector refuses to
+    guess that (see `asset_class_from_path`, which returns `None` rather than picking). A
+    catalogue listing must not require that decision: the whole point is to show a user the
+    9550 symbols the broker offers *before* anyone has committed to collecting any of them.
+
+    So this is the shallow view, and it is what a search result is made of. Turning one into an
+    `InstrumentSpec` is the deliberate act of cataloguing, and it happens later, per symbol.
+    """
+
+    symbol: str
+    description: str | None = None
+    path: str | None = None
+    digits: int | None = None
+    visible: bool = False
+    """Whether the symbol sits in the terminal's Market Watch.
+
+    Reported, never used to filter. Measured on this project's broker on 19/08/2026: 74 of 84
+    symbols are outside Market Watch, and every one of them answers `symbols_get(group=...)`
+    and hands over history exactly like a selected one. Only the live loop has to select.
+    """
 
 
 class MarketDataSource(Protocol):
@@ -32,6 +70,30 @@ class MarketDataSource(Protocol):
 
     def instrument(self, symbol: str) -> InstrumentSpec:
         """The contract specification: tick size, tick value, digits, currencies."""
+        ...
+
+    def spread_points(self, symbol: str) -> Decimal | None:
+        """The broker's quoted spread in **ticks**, or `None` if this source cannot say.
+
+        Deliberately not part of `InstrumentSpec`. That type is the engine's, and the engine
+        prices a move without ever consulting a spread — costs reach a run as a plugged-in
+        `CostModel` (ADR-07). This is catalogue data used to *pre-fill* that choice, so it
+        travels beside the spec rather than inside it.
+
+        In ticks, not in whatever unit the venue quotes. MT5 counts spreads in `point`, which
+        is not the same quantity as `trade_tick_size` by definition, and the engine's
+        `SpreadCostModel` counts ticks. Converting at the edge means no reader downstream has
+        to know which unit it is holding.
+
+        `None`, never zero, when unknown: zero is the claim that this instrument is free to
+        trade, and a source that simply has no idea must not make it.
+
+        Declared with no body even though every source but one answers `None`. A default here
+        would not have saved anyone the line: conformance to a `Protocol` is *structural*, so
+        a class satisfies it by having the method, and inheriting a default requires actually
+        subclassing — which nothing here does, on purpose. Writing `return None` above would
+        therefore have failed exactly the same way while looking like it worked.
+        """
         ...
 
     def candles(
@@ -44,3 +106,54 @@ class MarketDataSource(Protocol):
         way to detect.
         """
         ...
+
+
+@runtime_checkable
+class QuotesAPriceStep(Protocol):
+    """A source that knows when a series' prices fall on a finer tick than its venue trades in."""
+
+    def price_step(self, symbol: str) -> Decimal | None:
+        """The venue's step for `symbol`, when it is not the series' tick; else `None`."""
+        ...
+
+
+def price_step_of(source: object, symbol: str) -> Decimal | None:
+    """`source.price_step(symbol)` when the source can say — only MT5 can — else `None`."""
+    return source.price_step(symbol) if isinstance(source, QuotesAPriceStep) else None
+
+
+class TickerSource:
+    """A source asked by the broker's ticker and answering under the internal name (ADR-0032).
+
+    XP calls its continuous mini-index future `WIN$`; this system calls it `WIN`, because a `$`
+    is no name for a Parquet folder (pyarrow writes it `%24`) or a URL. Every request for
+    `internal` goes to the terminal as `ticker`, and the spec comes back renamed — so the bars,
+    the folder and the catalogue all carry the internal name, and nothing downstream knows.
+    """
+
+    def __init__(self, source: MarketDataSource, *, internal: str, ticker: str) -> None:
+        self._source = source
+        self._internal = internal
+        self._ticker = ticker
+
+    def _ask(self, symbol: str) -> str:
+        return self._ticker if symbol == self._internal else symbol
+
+    def instrument(self, symbol: str) -> InstrumentSpec:
+        """The ticker's spec under the internal name."""
+        spec = self._source.instrument(self._ask(symbol))
+        return replace(spec, symbol=symbol) if symbol == self._internal else spec
+
+    def spread_points(self, symbol: str) -> Decimal | None:
+        """The ticker's quoted spread."""
+        return self._source.spread_points(self._ask(symbol))
+
+    def price_step(self, symbol: str) -> Decimal | None:
+        """The ticker's step at the venue, when its source can say."""
+        return price_step_of(self._source, self._ask(symbol))
+
+    def candles(
+        self, symbol: str, timeframe: str, start: dt.datetime, end: dt.datetime
+    ) -> list[Candle]:
+        """The ticker's bars; a `Candle` carries no name, so nothing to rename."""
+        return self._source.candles(self._ask(symbol), timeframe, start, end)

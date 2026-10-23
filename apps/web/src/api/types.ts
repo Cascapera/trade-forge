@@ -6,6 +6,8 @@
 // to keep it exact — a JSON number would be a float, and the precision the engine and database
 // preserved would be lost on the wire. The UI parses these only at the edge, to display.
 
+import type { RankKey } from '../sweep/ranking'
+
 export type BacktestStatus = 'queued' | 'running' | 'done' | 'failed'
 
 export interface Instrument {
@@ -19,6 +21,19 @@ export interface Instrument {
   tick_value: string
   contract_size: string
   digits: number
+  /**
+   * The broker's quoted spread in ticks, for pre-filling a run's cost model.
+   *
+   * `null` means nobody has measured this symbol — a seeded row, or one catalogued before
+   * the collector recorded it. Not zero, which would be the claim that this instrument is
+   * free to trade, and the screen has to be able to tell the two apart: it charges nothing
+   * for an unmeasured instrument, but says so rather than implying the number is a result.
+   */
+  default_spread_points: string | null
+  /** The broker it is collected from (ADR-0032); `null` for a seed no broker catalogued. */
+  broker?: string | null
+  /** That broker's own ticker — may differ from `symbol`, the internal name. */
+  broker_symbol?: string | null
 }
 
 export interface StrategyOut {
@@ -48,6 +63,66 @@ export interface Metrics {
   sortino: string | null
   cagr: string | null
   avg_trade_duration: string | null
+  // In R (25/09). Null for a run recorded before them; optional so older fixtures still type.
+  net_r?: string | null
+  max_drawdown_r?: string | null
+  losing_streak?: number | null
+  losing_streak_r?: string | null
+  /** Null too with fewer than two years that had a trade. */
+  positive_year_share?: string | null
+  /** R per calendar year of entry: `{ "2019": "3.25" }`. */
+  yearly_r?: Record<string, string> | null
+}
+
+/**
+ * A run cut to whole years `[first_year, last_year]` in R, without running it again
+ * (`GET /backtests/{id}/years`): what a run of that window would have made, from the trades that
+ * entered and left inside it. `yearly_r` is per year of entry; a year with no such trade is absent.
+ */
+export interface YearCut {
+  first_year: number
+  last_year: number
+  net_r: string
+  yearly_r: Record<string, string>
+  /** How many trades the cut closes (01/10); null for a run recorded before it kept the count. */
+  trades?: number | null
+}
+
+/**
+ * What a finished run kept of itself (2026-09-23). A sweep's runs keep less — see the server's
+ * `retention`: `trades` has no entry pictures and no equity curve, `metrics` has the metrics alone.
+ * A screen reads this to say what is missing and why, rather than drawing an empty chart as if
+ * the run had produced one. What was not kept comes back by running the point again.
+ */
+export type Recorded = 'full' | 'trades' | 'metrics'
+
+/** One rung of a run's target ladder, in R net of each trade's costs. Numbers are strings. */
+export interface TargetOutcome {
+  trades: number
+  hits: number
+  net_r: string
+  expectancy_r: string
+  max_drawdown_r: string
+}
+
+/** One rung of the ladder across a sweep entry's runs. */
+export interface TargetRung {
+  /** The target in R as the ladder writes it: `'0.5'`, `'2'`, `'10'`. */
+  rung: string
+  runs_scored: number
+  runs_positive: number
+  median_expectancy_r: string | null
+  best_label: string | null
+  best_net_r: string | null
+}
+
+/** Where a sweep's run sits on its grid (29/09): the catalogue entry it came from (read live;
+ *  null once taken off the shelf), the point's label and its coordinates by dotted path. */
+export interface BacktestPoint {
+  entry_id: string
+  entry_name: string | null
+  label: string
+  values: Record<string, unknown>
 }
 
 export interface Backtest {
@@ -61,10 +136,91 @@ export interface Backtest {
   status: BacktestStatus
   error: string | null
   engine_version: string
+  recorded: Recorded
+  /** The sweep point this run measured; null or absent for a run launched on its own. */
+  point?: BacktestPoint | null
+  /** The finished run this one is a copy of: the same measurement under the same engine, taken
+   *  instead of run again (28/09). Null for a run that ran; absent from older fixtures. */
+  reused_from?: string | null
   created_at: string
   started_at: string | null
   finished_at: string | null
+  // What the run actually read. `date_from`/`date_to` above are only the request: the dataset
+  // underneath may start later or end earlier. Null on runs that failed, and on rows written
+  // before the API recorded this — null means unknown, never zero.
+  candles_seen: number | null
+  first_candle: string | null
+  last_candle: string | null
   metrics: Metrics | null
+  /**
+   * What the run's trades would have made at each target of the ladder, keyed by the target in R.
+   * Null for a run recorded before the ladder existed; a rung is null when a trade could not
+   * answer it (it had a target of its own below that rung).
+   */
+  targets: Record<string, TargetOutcome | null> | null
+  /**
+   * R by year of entry, then year of exit: `{ "2021": { "2021": "2.5", "2022": "-1" } }` (01/10).
+   * Null for a run recorded before 29/09 and while there are no results; absent from older
+   * fixtures. A sweep's ranked rows carry only `metrics.yearly_r`, the same R summed per entry year.
+   */
+  r_by_years?: Record<string, Record<string, string>> | null
+  /**
+   * The downloads this run is waiting for before it can start, oldest window first.
+   *
+   * ⚠️ Without them, waiting reads exactly like queueing: both sit at `queued`, and the
+   * difference is minutes against hours. Each row carries its own progress, so the screen can
+   * say what is being fetched. Kept after they finish — then they are history, not a wait.
+   */
+  waiting_for: Collection[]
+}
+
+/**
+ * One row of the run log. Deliberately not `Backtest`, and the differences are the point.
+ *
+ * It resolves what the detail shape leaves as foreign keys — `symbol`, `strategy_name`,
+ * `strategy_version` — because a list is read by a human choosing where to look, and an
+ * `instrument_id` answers nothing. And it carries `cost_model`, because under ADR-07 the same
+ * strategy over the same window with a wider spread is a *different experiment*: a table that
+ * hid that would invite reading two incomparable rows as like for like.
+ *
+ * What it does not carry is the equity curve. That is fetched per run, only for the runs
+ * someone selected — see `useEquityCurves`.
+ */
+export interface BacktestListItem {
+  id: string
+  strategy_id: string
+  strategy_name: string
+  strategy_version: number
+  symbol: string
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+  cost_model: Record<string, unknown>
+  status: BacktestStatus
+  error: string | null
+  recorded: Recorded
+  /** See `BacktestOut.reused_from`. */
+  reused_from?: string | null
+  created_at: string
+  finished_at: string | null
+  metrics: Metrics | null
+}
+
+export interface BacktestsPage {
+  total: number
+  limit: number
+  offset: number
+  items: BacktestListItem[]
+}
+
+/** The run log's filters. Every field absent means "no filter", which is the default view. */
+export interface BacktestFilters {
+  symbol?: string
+  timeframe?: string
+  status?: BacktestStatus
+  limit?: number
+  offset?: number
 }
 
 export interface Trade {
@@ -80,9 +236,162 @@ export interface Trade {
   take_profit: string | null
   gross_pnl: string | null
   costs: string | null
+  /** Signed: negative was charged for holding it overnight, positive was paid (24/09). */
+  swap?: string
   net_pnl: string | null
   r_multiple: string | null
   context: Record<string, string | null>
+  /**
+   * Whether this trade has an entry picture to fetch — not the picture itself.
+   *
+   * A snapshot is fifty-odd bars, and a reader opens the two or three entries that look wrong,
+   * not all of them. So the list says only that one exists and `getTradeSnapshot` fetches it
+   * when asked. `false` on a run older than the feature.
+   */
+  has_snapshot: boolean
+}
+
+/** One bar of an entry's picture. Prices are strings for the same reason every price here is. */
+export interface SnapshotBar {
+  time: string
+  open: string
+  high: string
+  low: string
+  close: string
+}
+
+/**
+ * A rectangle to draw over the bars: a band of price with a left edge in time.
+ *
+ * `from_time` is the candle that *formed* the zone and is routinely older than the window's
+ * first bar. Clamp the drawing at the chart's left edge; never move `from_time` to the first
+ * visible bar, which would redraw the zone as younger than it is.
+ */
+export interface SnapshotRegion {
+  label: string
+  top: string
+  bottom: string
+  from_time: string
+}
+
+/**
+ * A curve to draw across the bars — an indicator, as the strategy computed it.
+ *
+ * Each point is `[time, value]`. Join to the bars **on the timestamp**, never by position: the
+ * curve legitimately ends before the last bar (it stops at the decision, while the bars run on
+ * to the fill) and legitimately starts after the first (the indicator was warming up).
+ */
+export interface SnapshotSeries {
+  label: string
+  points: [string, string][]
+}
+
+/**
+ * A horizontal segment: the structure a break of structure broke.
+ *
+ * Bounded at **both** ends, unlike a region. A zone stays in force after the entry and extends
+ * rightward; a level is over the moment it is crossed. Its length is how long the structure
+ * held — draw it between the two instants and do not extend it.
+ *
+ * `label` is `choch` or `bos`: one turns the trend, the other continues it.
+ */
+export interface SnapshotLevel {
+  label: string
+  price: string
+  from_time: string
+  to_time: string
+}
+
+export interface Snapshot {
+  decided_at: string
+  /** The bar the order filled on — the window's last. Equal to `decided_at` on a long rest. */
+  filled_at: string
+  bars: SnapshotBar[]
+  regions: SnapshotRegion[]
+  series: SnapshotSeries[]
+  levels: SnapshotLevel[]
+}
+
+/** One bar of the price chart. Prices are strings for the same reason every price here is. */
+export interface Candle {
+  time: string
+  open: string
+  high: string
+  low: string
+  close: string
+}
+
+/**
+ * The bars a run read, with the provenance to check them against.
+ *
+ * `candles_seen` is what the run *recorded* eating; `count` is what was found on disk just now.
+ * They are two different questions — Parquet underneath a run can be re-collected or extended
+ * afterwards — and they are both carried so a client can see them disagree instead of drawing a
+ * chart that quietly covers a different period than the trades plotted on it.
+ */
+export interface CandlesResponse {
+  timeframe: string
+  symbol: string
+  candles_seen: number
+  first_candle: string
+  last_candle: string
+  count: number
+  candles: Candle[]
+}
+
+/**
+ * A curve to draw across the run's bars — an indicator, as the strategy computed it.
+ *
+ * Each point is `[time, value]`. Join to the candles **on the timestamp**, never by index: the
+ * series is shorter than the bars whenever the indicator was warming up, so an index join draws
+ * every point one period to the left of where it belongs — and the shape still looks right.
+ */
+export interface OverlaySeries {
+  label: string
+  points: [string, string][]
+}
+
+/**
+ * One region over the whole run, with both ends of its life.
+ *
+ * Three instants, none interchangeable. `from_time` is where the rectangle begins — the candle
+ * before the gap, routinely far older than the break that revealed it. `confirmed_at` is when a
+ * strategy could first act on it; the two are a median of 8 bars apart on real data, so
+ * collapsing them draws most regions much younger than they are. `mitigated_at` is the bar whose
+ * wick took the region, and `null` means it was still standing when the run ended — extend that
+ * one to the chart's right edge rather than closing it somewhere invented.
+ */
+export interface Zone {
+  kind: 'demand' | 'supply'
+  top: string
+  bottom: string
+  from_time: string
+  confirmed_at: string
+  mitigated_at: string | null
+  primary: boolean
+  /**
+   * Which series the region belongs to: `zone` for the run's own timeframe, or the name of a
+   * higher one (`H4`) for the regions a filtered setup was released by. Optional because every
+   * run recorded before the filter existed answers without it.
+   */
+  label?: string
+}
+
+/** Every curve the run's strategy was reading. Empty for a setup whose overlay is zones. */
+export interface OverlaysResponse {
+  symbol: string
+  timeframe: string
+  /**
+   * The same provenance pair the candles carry, and the curve needs it *more* than they do: the
+   * bars are read back, while the curve is recomputed over them, so one extra bar inside the
+   * window does not add a point at the end — it reseeds the average and moves the whole line.
+   */
+  candles_seen: number
+  count: number
+  series: OverlaySeries[]
+  /** Empty for the swing setups, which read a curve and mark no zones. The two halves are
+   * independent: having one says nothing about whether a strategy has the other. */
+  zones: Zone[]
 }
 
 export interface TradesPage {
@@ -110,4 +419,1846 @@ export interface CreateBacktestRequest {
   date_to: string
   initial_capital: string
   cost_model: Record<string, unknown>
+  /**
+   * Collect what this window is missing, and run once it has landed.
+   *
+   * ⚠️ The windows are the server's plan, never the client's: a window chosen here could be part
+   * of a year, and the collector replaces whole year partitions. Left out, a window the index
+   * holds no candle of is refused at once.
+   */
+  collect_missing?: boolean
+}
+
+// --------------------------------------------------------------------------- //
+// Baskets — one strategy across several markets                                 //
+// --------------------------------------------------------------------------- //
+
+/**
+ * Launch one strategy over several symbols, one run each.
+ *
+ * ⚠️ **No `cost_model`, and that absence is the contract.** Each run is charged the spread
+ * measured for *its own* instrument, resolved by the server. A single figure across a basket
+ * would be meaningless: 8 ticks of EURUSD and 4 of AAPL are not only different numbers, they
+ * are counted in tick sizes that differ by a factor of a thousand. The screen's job is to
+ * *show* what each symbol will be charged before the launch, not to choose it.
+ */
+export interface CreateBasketRequest {
+  strategy_id: string
+  symbols: string[]
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+  /**
+   * Collect what each market is missing, and run it once its own downloads have landed.
+   *
+   * ⚠️ Per market: the covered ones start at once, and only the others wait. Left out, a market
+   * with no candles in the window is skipped and named in `skipped`.
+   */
+  collect_missing?: boolean
+}
+
+/** One symbol's place in the basket: which run it became, and what it is being charged. */
+export interface BasketRunOut {
+  backtest_id: string
+  symbol: string
+  status: BacktestStatus
+  cost_model: Record<string, unknown>
+  /** `null` means nobody measured this symbol, so the run is uncosted. Never zero. */
+  default_spread_points: string | null
+}
+
+export interface CreatedBasket {
+  id: string
+  runs: BasketRunOut[]
+  /**
+   * Markets left out because the index holds no candle of theirs in the window — his rule: told
+   * not to collect, the basket runs on what exists and names the rest. ⚠️ Only in this response;
+   * the basket read back later does not know them.
+   */
+  skipped: UncoveredMarket[]
+}
+
+/**
+ * What a basket says once its runs finish — **dispersion, never a combined account.**
+ *
+ * There is no summed equity curve in this shape, and its absence is deliberate. Every run in a
+ * basket starts with the whole `initial_capital`, so four runs of $10 000 are neither a $10 000
+ * account nor a $40 000 one. Adding the curves would draw a line that looks like a portfolio and
+ * is not one — the same failure as the forward-fill the run comparator refuses.
+ *
+ * The median rather than the mean, and the extremes by name: a strategy returning 30% on one
+ * symbol and −25% on another has an average near zero and a story the average destroys.
+ *
+ * `null` for every statistic until at least one run finishes. Undefined, not zero — a basket
+ * whose runs are still queued has not returned 0%.
+ */
+export interface BasketAggregate {
+  runs_total: number
+  runs_finished: number
+  runs_failed: number
+  runs_profitable: number
+  best_symbol: string | null
+  best_return: string | null
+  worst_symbol: string | null
+  worst_return: string | null
+  median_return: string | null
+}
+
+/**
+ * A basket read back: how it was launched, every run in it, and how far apart they landed.
+ *
+ * `runs` is `BacktestListItem[]` — the same row the run log renders, from the same builder on the
+ * server. That is why this screen reuses `RunTable` and `ComparisonChart` unchanged: a basket
+ * assembling its own idea of a run would drift from the log's the first time a column is added,
+ * and the two views would then disagree about what a run *is* while both looking right.
+ */
+export interface BasketOut {
+  id: string
+  strategy_id: string
+  strategy_name: string
+  strategy_version: number
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+  created_at: string
+  aggregate: BasketAggregate
+  runs: BacktestListItem[]
+  /** Downloads that failed under this basket's runs, once each. Those runs went ahead on what
+   *  was on disk (his rule of 22/09); this is where the basket says so. */
+  failed_collections: Collection[]
+}
+
+/** One combination of a study's grid: the run it became, and where it sits on the axes. */
+export interface StudyPoint {
+  backtest_id: string
+  strategy_id: string
+  /** `period=9, breakeven_at_r=2.0` — what makes this point different from the others. */
+  label: string
+  /**
+   * The point's coordinates, keyed by the same dotted paths the grid declares.
+   *
+   * Place a heatmap cell from these, never from `label`: a label is a caption, and deriving
+   * coordinates by splitting one on commas and equals signs works until a value contains either.
+   */
+  values: Record<string, unknown>
+  status: BacktestStatus
+}
+
+/**
+ * What a grid says once its runs finish — dispersion, and never the maximum alone.
+ *
+ * ⚠️ A grid **always** has a best point; a grid of pure noise has a best point. Reading that
+ * number on its own is how an optimiser becomes a machine for producing convincing false
+ * results, and the wider the grid the more convincing they get. So the headline is
+ * `median_return` — what a parameter set chosen without hindsight would have returned — beside
+ * how much of the searched space works at all, with the best as one end of a range.
+ *
+ * **Every figure here is in-sample**, the best one included: these runs were scored on the same
+ * data the grid was searched over.
+ */
+export interface StudyAggregate {
+  points_total: number
+  points_finished: number
+  points_failed: number
+  points_profitable: number
+  best_label: string | null
+  best_return: string | null
+  worst_label: string | null
+  worst_return: string | null
+  /** Null until at least one run finishes — "nothing has landed yet", never a measured zero. */
+  median_return: string | null
+}
+
+export interface CreateStudyRequest {
+  strategy_id: string
+  symbol: string
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+  cost_model: Record<string, unknown>
+  /** Dotted paths into the strategy document, and the values to try at each. */
+  grid: Record<string, unknown[]>
+  /** Collect what the market is missing, once for every point, and run once it lands (PR-272).
+   *  Left out, a window with no candles refuses the study: there is one market to run. */
+  collect_missing?: boolean
+}
+
+export interface PreviewStudyRequest {
+  strategy_id: string
+  /** The same shape `CreateStudyRequest.grid` takes, so the preview is of the request itself. */
+  grid: Record<string, unknown[]>
+  /**
+   * The timeframe the study would run at — and **not** just another property of the run.
+   *
+   * ⚠️ A document carries its own `timeframe`, and a setup builds its higher-timeframe bars out
+   * of that one while the engine's loop steps at the run's. So a point whose `htf` filter is
+   * legal on the saved document can be a filter that quietly stops filtering at the study's
+   * timeframe. Required, because a preview that skipped the check when this was absent would
+   * agree with the launch everywhere except where it matters.
+   */
+  timeframe: string
+}
+
+/** One point of a grid that cannot run, and why. */
+export interface GridRefusal {
+  /** `htf='M5', stop_buffer=0.2` — the point in the words the rest of the study screen uses. */
+  label: string
+  /** Keyed by full path, so the screen can point at the axis the bad value is on. */
+  values: Record<string, unknown>
+  reason: string
+}
+
+/**
+ * What a grid would produce, asked before anything is produced.
+ *
+ * ⚠️ **`refusals` is every bad point, not the first.** Launching stops at the first, because
+ * nothing may be half-written; a preview that did the same would hand back one problem per round
+ * trip. And a body full of refusals arrives as a 200: the endpoint reports, and reporting that
+ * the news is bad is still a successful answer.
+ */
+export interface StudyPreview {
+  points: number
+  refusals: GridRefusal[]
+  /** Set when the grid cannot be applied to this strategy at all — a path that leads nowhere, an
+   *  empty axis, a repeated value. A different kind of no: there are no points at all. */
+  grid_error: string | null
+}
+
+export interface CreatedStudy {
+  id: string
+  points: StudyPoint[]
+}
+
+export interface StudyOut {
+  id: string
+  strategy_id: string
+  /** The **base** strategy's name. Each point has its own, carried on its run. */
+  strategy_name: string
+  symbol: string
+  timeframe: string
+  date_from: string
+  date_to: string
+  initial_capital: string
+  created_at: string
+  /**
+   * The axes as declared, in order. Served because it is not recoverable from the runs: each
+   * point's values survive only as text inside its strategy's name.
+   */
+  grid: Record<string, unknown[]>
+  points: StudyPoint[]
+  aggregate: StudyAggregate
+  runs: BacktestListItem[]
+}
+
+export type SelectionMetric = 'net_profit' | 'profit_factor' | 'sharpe' | 'expectancy'
+
+export interface CreateWalkForwardRequest {
+  /**
+   * The study to re-run honestly. The only thing named, and deliberately so: the comparison
+   * this produces is "the heatmap said X, a blind choice got Y", and it only holds if both
+   * halves searched the same grid over the same market.
+   */
+  study_id: string
+  folds: number
+  /** How many times longer the training window is than the test window that follows it. */
+  train_multiple: number
+  /** `false` slides a fixed-length training window; `true` trains on all prior history. */
+  anchored: boolean
+  metric: SelectionMetric
+}
+
+/** One train→test pair: the windows, the choice, and what the choice was worth on each side. */
+export interface WalkForwardFold {
+  index: number
+  /** The training grid, with its own heatmap at `/studies/{id}`. */
+  study_id: string
+  train_from: string
+  train_to: string
+  test_from: string
+  test_to: string
+  /**
+   * The candles counted into each window. Shown because the split was cut by counting bars and
+   * expressed as dates — a reader who only saw the dates could not tell an even split from one
+   * where a holiday week halved a fold's evidence.
+   */
+  train_bars: number
+  test_bars: number
+  /**
+   * `period=9` — the point this fold selected, or null if it could not select one.
+   *
+   * ⚠️ Null is a **result**, not a pending state: nothing in the grid traded that window, or
+   * nothing that traded had a defined score. Rendering it as a blank cell would read as
+   * "still running".
+   */
+  chosen_label: string | null
+  chosen_strategy_id: string | null
+  test_backtest_id: string | null
+  /** What the chosen point returned over the window it was chosen on. The promise. */
+  in_sample_return: string | null
+  /** What it returned over the window that followed. The delivery — and the only evidence. */
+  out_of_sample_return: string | null
+  test_status: BacktestStatus | null
+  /** Read before believing the return: a fold that traded twice has a number, not a finding. */
+  test_trades: number | null
+}
+
+/**
+ * What the folds add up to.
+ *
+ * `degradation` is the headline and is normally negative: a small gap is a method that
+ * generalises, a gap that swallows the whole in-sample result is a grid that was fitting noise.
+ */
+export interface WalkForwardVerdict {
+  folds_total: number
+  folds_decided: number
+  folds_scored: number
+  folds_profitable: number
+  in_sample_median: string | null
+  out_of_sample_median: string | null
+  /** `out_of_sample_median - in_sample_median`. Null until at least one fold has both. */
+  degradation: string | null
+  /** The folds multiplied together, `Π(1 + r) - 1` — what an account would have done. */
+  compounded: string | null
+  /**
+   * How many *different* points the folds chose. 1 is the strongest evidence a grid can give;
+   * a number near `folds_decided` means there is no "the parameters" to go and trade.
+   */
+  distinct_choices: number
+}
+
+export interface CreatedWalkForward {
+  id: string
+  folds: WalkForwardFold[]
+  runs_queued: number
+}
+
+export interface WalkForwardOut {
+  id: string
+  study_id: string
+  strategy_id: string
+  strategy_name: string
+  symbol: string
+  timeframe: string
+  initial_capital: string
+  grid: Record<string, unknown[]>
+  /** The number of folds asked for, as against the rows in `folds`. They agree. */
+  folds_requested: number
+  train_multiple: number
+  anchored: boolean
+  metric: SelectionMetric
+  status: BacktestStatus
+  error: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  folds: WalkForwardFold[]
+  verdict: WalkForwardVerdict
+}
+
+/** One row of the strategy picker: enough to choose between lineages without opening any. */
+export interface StrategyListItem {
+  id: string
+  name: string
+  /** The **latest** version of this lineage; the id above is that version's row. */
+  version: number
+  schema_version: string
+  /**
+   * The named setup this strategy runs, or null for a DSL document built from indicators.
+   *
+   * ⚠️ Read from the document, never from the name — and the difference is not theoretical.
+   * This project's own database holds a strategy called `Structure — CHoCH 56454` that runs
+   * `mme9_breakout`: a name is typed by a person, a setup is executed by the engine.
+   */
+  setup: string | null
+  /** How many backtests have used it — what tells a real strategy from an abandoned draft. */
+  /** The catalogue's labels for this lineage, alphabetically (29/09) — the names he gave it.
+   *  The document behind "CHOCH COMPLETO" is called `SCHOCH-20260922-222429`. Absent from
+   *  older fixtures. */
+  catalog?: string[]
+  runs: number
+  created_at: string
+}
+
+export interface StrategiesPage {
+  total: number
+  limit: number
+  offset: number
+  items: StrategyListItem[]
+}
+
+export interface StrategyFilters {
+  /** Case-insensitive substring, for a person searching. */
+  q?: string
+  /** Exact, for asking whether a name is taken. */
+  name?: string
+  /** Include the strategies a grid generated — hidden by default, but never *free*. */
+  include_generated?: boolean
+  limit?: number
+  offset?: number
+}
+
+/**
+ * One line of the broker's own catalogue — what the account can *see*, which is a much longer
+ * list than what this system has collected.
+ *
+ * Deliberately not an `Instrument`: it carries no tick size and no tick value, because most of
+ * these symbols have never been catalogued and nothing has ever decided how to price them.
+ */
+export interface BrokerSymbol {
+  symbol: string
+  description: string | null
+  path: string | null
+  digits: number | null
+  /** In the terminal's Market Watch. Display only — a hidden symbol searches and collects
+   *  exactly the same, and 74 of this broker's 84 are hidden. */
+  visible: boolean
+  /**
+   * The class the broker's own filing decides, or `null` when it decides nothing.
+   *
+   * ⚠️ `null` is the field's whole purpose: it marks the symbols a person has to answer for
+   * before a collection can be sent. Measured on this broker, 24 of its 84 symbols file under
+   * roots that name no class the system has.
+   *
+   * ⚠️ Derived by the API, never re-derived here. The rule that maps a tree path to a class is
+   * `classify.asset_class_from_path`, and a TypeScript copy of it would disagree with the
+   * server the first time the broker files something under a new root — the screen would offer
+   * the symbol and the API would refuse it, with nothing explaining the disagreement.
+   */
+  asset_class_from_path: AssetClass | null
+  /**
+   * Whether this system has an instrument row for it, which is what a backtest needs.
+   *
+   * ⚠️ Without this the screen would offer every symbol the broker has and let the user find
+   * out which ones actually run by clicking. It is not a promise that candles exist for any
+   * particular window — only that the symbol has been catalogued at all.
+   */
+  catalogued: boolean
+  /** The broker whose terminal lists it (ADR-0032); `null` for a server nobody registered. */
+  broker?: string | null
+  /** The system's name once collected from this broker — WIN for WIN$ (ADR-0032). A launch
+   *  chooses this; the collect screen keeps `symbol`, the terminal's ticker. */
+  name?: string | null
+}
+
+/** Where the symbol list came from. `null` means nobody has ever synced this broker. */
+export interface SymbolSnapshot {
+  server: string | null
+  synced_at: string
+}
+
+/**
+ * A search result, plus the provenance of the list it came from.
+ *
+ * ⚠️ `snapshot: null` and an empty `symbols` are the two different reasons the list can be
+ * empty, and the screen has to say different things: "no symbol starts with that" versus
+ * "there is no catalogue yet — sync your terminal".
+ */
+export interface SymbolSearch {
+  symbols: BrokerSymbol[]
+  snapshot: SymbolSnapshot | null
+}
+
+/** One tab of the market browser: how many symbols the broker lists there, and how many have candles. */
+export interface Market {
+  key: string
+  label: string
+  count: number
+  collected: number
+}
+
+export interface Markets {
+  markets: Market[]
+  snapshot: SymbolSnapshot | null
+}
+
+/** A broker symbol as the market browser lists it. */
+export interface BrowsedSymbol {
+  /** What a run is launched over: the system's name once collected (WIN), else the ticker. */
+  symbol: string
+  /** The broker's own ticker (WIN$), shown beside `symbol` when the two differ. */
+  ticker?: string | null
+  description: string | null
+  path: string | null
+  market: string
+  /** Whether it has candles. A sweep over one that has none collects it first. */
+  catalogued: boolean
+  /** The measured spread in ticks; `null` until the collector catalogued it. */
+  spread_points: string | null
+  /** The broker whose terminal lists it (ADR-0032); `null` for a server nobody registered. */
+  broker?: string | null
+}
+
+/** One page of a market's symbols. */
+export interface SymbolBrowse {
+  total: number
+  offset: number
+  limit: number
+  items: BrowsedSymbol[]
+}
+
+/**
+ * What a probe found about one (symbol, timeframe), and what bounded the answer.
+ *
+ * ⚠️ Four bounds where a screen wants one date, on purpose. Measured on EURUSD D1 they give
+ * 1971, 1972 and 2009 — three answers to what looks like one question — and a reader can only
+ * act on the one that binds them: the ceiling is fixed in a settings dialog, the filler by
+ * starting later, the costs by not trusting them.
+ */
+export interface SymbolHistory {
+  symbol: string
+  timeframe: string
+  /** The oldest bar the terminal will hand over. `null` when it has none. */
+  oldest: string | null
+  /** Positions the series holds, including the bar still forming — the unit `maxbars` counts in. */
+  bar_count: number
+  terminal_maxbars: number
+  /** ⚠️ `true` when `bar_count` is the probe's own bound rather than the data's. */
+  bar_count_is_a_ceiling: boolean
+  /** The most recent year still holding bars nobody traded. Not "when the instrument became real". */
+  last_fabricated: number | null
+  /** The first year whose spread varied rather than being one number typed across it. */
+  first_measured_cost: number | null
+  probed_at: string
+  capped_by_terminal: boolean
+  /** The later of the two honest floors. A **lower** bound on trust, never an upper one. */
+  usable_from: string | null
+}
+
+/** The five classes the system has a member for. `metal` is deliberately not among them. */
+export type AssetClass = 'forex' | 'stock' | 'index' | 'future' | 'crypto'
+
+export interface CollectionItem {
+  symbol: string
+  /**
+   * Left out when the symbol's tree path already names the class, which it does for 60 of this
+   * broker's 84 symbols. Sent only when the API asked — its absence is not a default.
+   *
+   * ⚠️ Per symbol, not per request: XAUUSD is a future and BTCUSD is crypto, and one field for
+   * the whole batch would have to file one of them as the other.
+   */
+  asset_class?: AssetClass
+}
+
+export interface CollectionRow {
+  timeframe: string
+  date_from: string
+  date_to: string
+}
+
+export interface CreateCollection {
+  /** One to twenty symbols. */
+  items: CollectionItem[]
+  /**
+   * One timeframe per row, each with its own window — the batch is the product.
+   *
+   * The window belongs to the row because it is a property of the timeframe: the bar budget
+   * gives about a year for M1 and seventeen for H1, so one window across several timeframes
+   * would be wrong for all but one of them.
+   */
+  rows: CollectionRow[]
+}
+
+/** Which markets still need collecting before a run over this window (`POST /collections/plan`). */
+export interface PlanCollectionRequest {
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+}
+
+/** One span to collect, inclusive: whole UTC years, the current one stopping at the plan's now. */
+export interface PlannedWindow {
+  date_from: string
+  date_to: string
+}
+
+/** One (symbol, timeframe) not fully on disk. Covered pairs are left out of the answer. */
+/** How long something is expected to take, measured from this installation's own history (his
+ *  call, 22/09). ⚠️ An order of magnitude, not a promise; `based_on` is how many past runs or
+ *  downloads the rate is the median of. */
+export interface TimeEstimate {
+  seconds: number
+  based_on: number
+}
+
+export interface PlannedCollection {
+  symbol: string
+  timeframe: string
+  /** What the index holds, as `2020-01-02 to 2026-09-10`, or `null` when never collected. */
+  covers: string | null
+  /**
+   * Whether the index holds a candle **inside the window asked about** — whether a run over it
+   * would read anything at all.
+   *
+   * ⚠️ Not derivable from `covers`: a pair collected for 2019 under a window in 2024 has a
+   * `covers` string and nothing to run. The launch refuses exactly this, so the screen asks the
+   * server rather than guessing.
+   */
+  in_window: boolean
+  /** ⚠️ Possibly wider than asked: a window always reaches the data already on disk. */
+  windows: PlannedWindow[]
+  /** Whether the broker's symbol list names this symbol. `false` only when the list was synced
+   *  and does not: such a pair cannot be collected — the basket and the sweep skip it, the single
+   *  backtest refuses it. `null` when the list has never been synced — unknown, and still offered
+   *  for collection. */
+  /** How long these windows would take to download, or `null` with no finished download to
+   *  measure by. */
+  time: TimeEstimate | null
+  at_broker: boolean | null
+}
+
+export interface Collection {
+  id: string
+  symbol: string
+  timeframe: string
+  /** ⚠️ What was **asked for**, not what was found. A window can legitimately come back shorter. */
+  date_from: string
+  date_to: string
+  /** `null` when the symbol's path decided; a value records that a person did. */
+  asset_class: string | null
+  status: 'queued' | 'running' | 'done' | 'failed'
+  /** Progress in years, because "3 of 5 years" is a sentence and 0.6 is not. */
+  years_done: number
+  years_total: number
+  /** ⚠️ `null` until it finishes — which is not the same claim as `0`, meaning nothing was there. */
+  candles: number | null
+  gaps: number | null
+  error: string | null
+  requested_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+/**
+ * One live session as the panel sees it.
+ *
+ * ⚠️ **`status: 'running'` is not "alive".** The thing that would change a status is the process,
+ * so a session that died leaves its row saying `running` for ever — which is exactly why `stale`
+ * is on this shape. A screen that rendered `status` alone would show the deadest sessions as the
+ * healthiest, and nothing would look wrong.
+ */
+export interface LiveSession {
+  id: string
+  strategy_id: string
+  instrument_id: string
+  symbol: string
+  timeframe: string
+  mode: string
+  status: 'running' | 'stopped' | 'failed'
+  /** Money crosses the wire as text; the exact decimal is preserved all the way here. */
+  initial_capital: string
+  engine_version: string
+  warmup_bars: number
+  started_at: string
+  stopped_at: string | null
+  heartbeat_at: string | null
+  last_bar_time: string | null
+  error: string | null
+  /** The freshness question already answered by the server. Render this, not a clock of your own. */
+  stale: boolean
+  silent_for_seconds: number
+}
+
+/** A trade this session opened and has not closed — `trades` with no exit, not the venue. */
+export interface OpenPosition {
+  id: number
+  direction: string
+  entry_time: string
+  entry_price: string
+  volume: string
+  stop_loss: string | null
+  take_profit: string | null
+}
+
+export interface LiveSessionDetail extends LiveSession {
+  /**
+   * When somebody asked it to stop, if anybody has. `null` is "nobody asked" and only ever that:
+   * a Redis the API could not read is a 503, never a `null`.
+   */
+  stop_requested_at: string | null
+  open_positions: OpenPosition[]
+  /** Net P&L of what this session **closed** today, UTC — the same midnight the loss cap counts. */
+  realised_today: string
+  /** ⚠️ Beside the total, because zero from no trades and zero from two that cancelled differ. */
+  trades_closed_today: number
+}
+
+export interface LiveSessionsPage {
+  total: number
+  sessions: LiveSession[]
+}
+
+/** One row of `order_audit`: every order the executor was asked to send, and what became of it. */
+export interface SessionEvent {
+  id: string
+  client_id: string
+  status: string
+  /** The rule that refused it. `null` means no refusal happened, not an unexplained one. */
+  reason: string | null
+  requested_at: string
+  resolved_at: string | null
+  request: Record<string, unknown>
+  response: Record<string, unknown> | null
+}
+
+export interface SessionEventsPage {
+  total: number
+  events: SessionEvent[]
+}
+
+/**
+ * The state of the **one** kill-switch layer the API can see and write.
+ *
+ * ⚠️ `engaged: false` does not mean the executor is trading. Two of the three layers are invisible
+ * from here — a file on the executor's disk and a flag in its memory — and either one engaged
+ * stops everything while this reports `false`. That is why `layer` is on the body: whatever
+ * renders it must name the handle it is showing.
+ */
+export interface KillSwitch {
+  engaged: boolean
+  engaged_at: string | null
+  layer: string
+}
+
+/** A frame off `WS /ws/live-sessions/{id}`. Four shapes, one `type`. */
+export type SessionFrame =
+  | { type: 'state'; session: LiveSession }
+  | {
+      type: 'fill'
+      client_id: string
+      at: string
+      symbol: string
+      price: string
+      volume: string
+      spread: string
+    }
+  | {
+      type: 'refusal'
+      client_id: string
+      at: string
+      reason: string
+      by_venue: boolean
+      retcode: number | null
+    }
+  | { type: 'error'; detail: string }
+
+/**
+ * One shelf entry: a strategy, a label a person wrote, and the sweep it is meant to be asked.
+ *
+ * ⚠️ `name` and `strategy_name` are different facts and both are carried. The strategy's is a
+ * generated column projected out of its document, so it is whatever the builder stamped — this
+ * database is full of `MME9-20260910-172055`. A screen showing only one of them is showing
+ * either a label nobody can trace or an identifier nobody can read.
+ */
+export interface CatalogEntry {
+  id: string
+  name: string
+  description: string | null
+  strategy_id: string
+  strategy_name: string
+  strategy_version: number
+  /** The named setup the document runs, or `null` for one built from indicators. Read from the
+   *  document, never from either name. */
+  setup: string | null
+  /** Dotted paths and the values to try at each — the shape a study's grid takes. */
+  grid: Record<string, unknown[]>
+  /** How many backtests one sweep would be. `1` for an entry with no axes: the empty product,
+   *  not zero, because an entry with nothing to vary is still one run. */
+  points: number
+  created_at: string
+}
+
+export interface CatalogPage {
+  total: number
+  items: CatalogEntry[]
+}
+
+/**
+ * Change an entry in place — only what is sent (29/09). `description: null` clears it; the
+ * strategy is not here: it moves by saving a new version in the builder.
+ */
+export interface UpdateCatalogEntry {
+  name?: string
+  description?: string | null
+  grid?: Record<string, unknown[]>
+}
+
+export interface CreateCatalogEntry {
+  name: string
+  /** Omitted rather than sent empty when nobody wrote one: `null` and `''` are different facts
+   *  and the column keeps them apart. */
+  description?: string
+  strategy_id: string
+  grid: Record<string, unknown[]>
+}
+
+/**
+ * Ask what a sweep would enqueue, before any of it is enqueued.
+ *
+ * ⚠️ **The window is part of the question, not a detail of the runs.** Coverage is per
+ * (symbol, timeframe): a pair with no candles inside these dates cannot run at all, which is a
+ * different fact from how much history each run would read. The first real sweep lost nine runs
+ * of twelve to exactly that, each at the cost of a worker discovering what the index knew.
+ */
+export interface PreviewSweepRequest {
+  entry_ids: string[]
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+}
+
+/** What one shelf entry contributes to a sweep, and why some of it may not run. */
+export interface SweepEntryPreview {
+  entry_id: string
+  name: string
+  /** Its grid's own size — before the timeframes and the markets multiply it. */
+  points: number
+  /** ⚠️ Per entry rather than pooled: a sweep holds several, and `htf must be coarser than H4`
+   *  says nothing about which shelf label caused it. Grouped by reason, never one per point: one
+   *  per point made a preview of 435 thousand points per chart answer 1.09 GB (26/09). */
+  refusals: RefusalGroup[]
+}
+
+/** Every combination of one entry refused for one reason: how many, and the first few. */
+export interface RefusalGroup {
+  reason: string
+  count: number
+  /** Labels of the first few refused for it, in launch order. */
+  examples: string[]
+}
+
+/**
+ * One (symbol, timeframe) with no candles inside the requested window.
+ *
+ * ⚠️ **A third kind of no, and it must not be shown as the other two.** A DSL refusal is a
+ * combination to fix and a cap is a sweep to shrink; this one is data that was never collected,
+ * or collected for other years. The fix is a backfill or a different window — nothing in the
+ * form will make it go away.
+ */
+export interface UncoveredMarket {
+  symbol: string
+  timeframe: string
+  /** What the dataset does hold, as `2025-01-01 to 2026-07-31` — or `null` when nothing of this
+   *  pair has ever been collected. ⚠️ The two are different failures with different fixes. */
+  covers: string | null
+}
+
+export interface SweepPreview {
+  /** What a launch **without collecting** enqueues: DSL refusals and the pairs in `uncovered`
+   *  are both subtracted. ⚠️ Told to collect, the launch runs the uncovered pairs too, so this is
+   *  the smaller of the two answers. */
+  runs: number
+  /** Strategy documents the sweep would write: entries x timeframes x points, before markets. */
+  documents: number
+  entries: SweepEntryPreview[]
+  /** Pairs with no candles in this window, on a chart where some point can run. The launch skips
+   *  and names them (PR-269), unless it is told to collect them. */
+  uncovered: UncoveredMarket[]
+  /** Set when the sweep cannot be launched at all — never for its size (no cap), but nothing runnable, or
+   *  **every** pair without data. ⚠️ That last one is filled **beside** `uncovered` with `runs`
+   *  at zero, and collecting is its fix; with `runs` above zero the error is never about data.
+   *  An unknown entry never lands here: the endpoint answers that with a 404. */
+  /** How long `runs` would take one after another, or `null` with no finished run to measure
+   *  by. Shown beside the count, never used to refuse it (22/09). */
+  backtest_time: TimeEstimate | null
+  error: string | null
+}
+
+export interface CreateSweepRequest {
+  entry_ids: string[]
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  initial_capital: string
+  cost_model: Record<string, unknown>
+  /** Collect what each pair is missing, once per pair, and run once the downloads land
+   *  (PR-268). Left out, a pair with no candles is skipped and named. */
+  collect_missing?: boolean
+  /** Every run keeps its trades, won or lost (02/10) — a base for meta-labeling (ADR-0031).
+   *  Left out, a run keeps them only when it passed the bar. */
+  keep_all_trades?: boolean
+}
+
+export interface CreatedSweep {
+  id: string
+  runs: number
+  /** Pairs left out for having no candles in the window — also kept on the sweep. */
+  skipped: UncoveredMarket[]
+  /** Pairs whose runs start at their first month of real bars, later than the window asked
+   *  (02/10). Absent from a server before it. */
+  trimmed?: TrimmedMarket[]
+}
+
+/** A pair whose runs start later than the sweep's window: at its first month of real bars — before
+ *  it, the broker's intraday history is one bar a day stored as the chart (02/10). */
+export interface TrimmedMarket {
+  symbol: string
+  timeframe: string
+  date_from: string
+}
+
+/** One run of a sweep: where it sits on the axes, wrapped around the run-log row itself. */
+export interface SweepRunOut {
+  entry_id: string
+  /** The shelf label, or the generated strategy's name once the entry has been removed. */
+  entry_name: string
+  /** `M15 · period=9` — a caption. ⚠️ Place anything by `values`, never by splitting this. */
+  label: string
+  /** The coordinates, keyed by the grid's dotted paths plus `timeframe`. */
+  values: Record<string, unknown>
+  run: BacktestListItem
+  /** How many runs of the same entry, chart and market made exactly this run's trades and were
+   *  launched after it (01/10) — hidden behind it on the ranked page unless clones are asked for.
+   *  Unlike a point the run answers, each of them did run. 0 on a clone shown; absent from older
+   *  fixtures. */
+  clones?: number
+}
+
+/**
+ * One shelf entry's share of a sweep, summarised on its own.
+ *
+ * ⚠️ **Per entry, never pooled.** Entries are alternatives, so a median across two of them is the
+ * median of two methods and describes neither. A "point" in `aggregate` is one run.
+ */
+export interface SweepEntryOut {
+  entry_id: string
+  /** Null once the entry has been removed from the shelf — the summary survives, the name does not. */
+  entry_name: string | null
+  /** `best_label`/`worst_label` lead with the symbol: `EURUSD · M15 · period=9`. */
+  aggregate: StudyAggregate
+  /** The target ladder across this entry's runs, lowest target first. */
+  targets: TargetRung[]
+}
+
+/**
+ * What "best" means when a reserved-window test picks its points: the walk-forward's four, and
+ * the run's risk in R (25/09). Its own type — the walk-forward keeps `SelectionMetric`.
+ */
+export type HoldoutRank = SelectionMetric | 'net_r' | 'recovery_r' | 'positive_years'
+
+/** How a reserved-window test chose the points it runs again. */
+export interface HoldoutRule {
+  metric: HoldoutRank
+  top_n: number
+  /** The fewest trades a run needed to be ranked, per chart. */
+  min_trades: Record<string, number>
+  /** Present only when the test set it: the deepest drawdown in R a chosen run could have. */
+  max_drawdown_r?: string
+  /** Present only when the test set it: the least share of positive years. */
+  min_positive_year_share?: string
+  /** Clones skipped (28/09): a run with the same record as a better-ranked one was not chosen.
+   *  Absent on a test launched before, which kept them. */
+  distinct?: boolean
+  /** Near-clones skipped too (02/10): a run whose entries all lay within a better-ranked one's, or
+   *  held all of them, was not chosen. Absent on a test launched before. */
+  nested_entries?: boolean
+  /** Present only on a retest (01/10): this window had been used by an earlier test of the same
+   *  sweep, and the test was launched knowing it. */
+  retest?: boolean
+  /** The earlier tests it repeats — a test's id, or a walk-forward's for its folds. */
+  retest_of?: string[]
+}
+
+/** Test a sweep's best points on a window none of them was chosen on. */
+export interface CreateHoldoutRequest {
+  date_from: string
+  date_to: string
+  top_n: number
+  metric: HoldoutRank
+  /** Only runs no deeper than this in R. A run recorded before 25/09 never passes. */
+  max_drawdown_r?: string
+  /** Only runs with at least this share of years positive, as a decimal string. */
+  min_positive_year_share?: string
+  /** Per chart, over the ranking floor (`RANK_MIN_TRADES`, 01/10); a chart left out keeps that
+   *  floor. */
+  min_trades: Record<string, number>
+  /** Skip a run with the same record as a better-ranked one, or entries nested in its (02/10).
+   *  The server's default is true. */
+  distinct?: boolean
+  /** Test again a window an earlier test of this sweep already used (01/10). Without it such a
+   *  launch is a 409 naming those tests (`WindowUsedDetail`). */
+  retest?: boolean
+}
+
+/** One run's result, on one side of the comparison. */
+export interface HoldoutSide {
+  run_id: string
+  status: BacktestStatus
+  /** Net profit over the initial capital, as a fraction. */
+  net_return: string | null
+  total_trades: number | null
+  profit_factor: string | null
+  max_drawdown_pct: string | null
+}
+
+/** A tested point beside the run it was chosen by. */
+export interface HoldoutRow {
+  entry_id: string
+  entry_name: string | null
+  symbol: string
+  timeframe: string
+  label: string
+  values: Record<string, unknown>
+  /** `null` only once the searched sweep is gone. */
+  in_sample: HoldoutSide | null
+  out_of_sample: HoldoutSide
+}
+
+/** One (entry, chart) of a test, summed up both ways — medians, never the best. */
+export interface HoldoutGroup {
+  entry_id: string
+  entry_name: string | null
+  timeframe: string
+  points: number
+  done: number
+  in_sample_median_return: string | null
+  out_of_sample_median_return: string | null
+  /** The fraction of the finished tests that made money on the reserved window. */
+  out_of_sample_positive: string | null
+  /** Finished tests with no trade on the reserved window (01/10): out of the median and the
+   *  positive share, still counted in `done`. Absent from older fixtures. */
+  no_trades_out?: number
+}
+
+/**
+ * An earlier look at a reserved window (01/10): a test of the same sweep, or one fold of a
+ * walk-forward of it. Listed by a 409 that refuses a second look, and by a retest.
+ */
+export interface WindowUse {
+  kind: 'holdout' | 'walk_forward'
+  /** The test, or the walk-forward the fold belongs to. */
+  id: string
+  /** The test sweep — null for a fold still training. */
+  test_id: string | null
+  fold: number | null
+  date_from: string
+  date_to: string
+  created_at: string
+}
+
+/** The body of the 409 for a window already used (01/10). */
+export interface WindowUsedDetail {
+  message: string
+  used_by: WindowUse[]
+}
+
+export interface HoldoutOut {
+  id: string
+  holdout_of: string | null
+  rule: HoldoutRule
+  date_from: string
+  date_to: string
+  searched_from: string | null
+  searched_to: string | null
+  groups: HoldoutGroup[]
+  rows: HoldoutRow[]
+  /** The earlier looks this retest repeats, read live — one since deleted is left out here. */
+  retest_of: WindowUse[]
+  /** How many earlier tests had used the window when this one was launched; 0 for a first look. */
+  earlier_uses: number
+}
+
+/** How a reserved-window test is cut when it is judged in pieces (25/09). */
+export type SliceMode = 'calendar' | 'trades'
+
+export interface CreateSlicingRequest {
+  mode: SliceMode
+  /** Trades per block — given when cutting by trades, and only then. */
+  block_trades?: number
+  /** The share of counted slices that must end above zero R, as a decimal string. */
+  pass_share: string
+}
+
+export interface SliceOut {
+  label: string
+  date_from: string
+  date_to: string
+  trades: number
+  net_r: string
+  counted: boolean
+}
+
+export interface SlicedPoint {
+  run_id: string
+  entry_id: string
+  entry_name: string | null
+  symbol: string
+  timeframe: string
+  label: string
+  /** False for a test run from before 25/09 that lost: it kept no trades and was not cut. */
+  trades_kept: boolean
+  unscored: number
+  net_r: string
+  slices: SliceOut[]
+  counted: number
+  positive: number
+  share: string | null
+  passed: boolean
+}
+
+export interface SlicedGroup {
+  entry_id: string
+  entry_name: string | null
+  timeframe: string
+  points: number
+  judged: number
+  passed: number
+}
+
+export interface SlicingOut {
+  id: string
+  sweep_id: string
+  mode: SliceMode
+  block_trades: number | null
+  pass_share: string
+  created_at: string
+  groups: SlicedGroup[]
+  points: SlicedPoint[]
+}
+
+/** Which runs of an ordinary sweep's ranking are resampled (01/10): the first `top_n` of each
+ * entry, ranked by `rank_by` as the sweep's page ranks them. */
+export interface MonteCarloRanking {
+  rank_by: RankKey
+  top_n: number
+}
+
+/** Resample a finished sweep's points (25/09): a reserved-window test's, or since 01/10 the top
+ * of an ordinary sweep's ranking — `ranking` is required on one and refused on the other. */
+export interface CreateMonteCarloRequest {
+  paths: number
+  /** Blank draws one on the server, which is kept — the answer is repeatable either way. */
+  seed?: string
+  /** The trades in a row each block holds (01/10, 2–50). Blank takes each point's own: the cube
+   * root of its trades. Half a point's trades or more is refused with a 422 naming it. */
+  block_trades?: number
+  ranking?: MonteCarloRanking
+}
+
+/** Percentiles of one measure across the simulated paths, as decimal strings. */
+export interface Spread {
+  p5: string
+  p50: string
+  p95: string
+  p99: string
+}
+
+export interface Simulated {
+  paths: number
+  trades: number
+  drawdown_r: Spread
+  losing_streak: Spread
+  net_r: Spread
+  /** The share of paths that ended below zero R. */
+  negative_share: string
+  /** The trades in a row each block held (01/10); null or absent when drawn trade by trade. */
+  block_trades?: number | null
+}
+
+export interface MonteCarloPoint {
+  run_id: string
+  entry_id: string
+  entry_name: string | null
+  symbol: string
+  timeframe: string
+  label: string
+  /** False for a test run from before 25/09 that lost: no trades were kept to resample. */
+  trades_kept: boolean
+  trades: number
+  observed_net_r: string
+  observed_drawdown_r: string
+  observed_losing_streak: number
+  /** Trade by trade. Null below 20 trades, or with none kept. */
+  simulated: Simulated | null
+  /** In blocks of trades in a row (01/10). Null when `simulated` is; absent on a resampling kept
+   * before 01/10, which drew trade by trade only. */
+  in_blocks?: Simulated | null
+}
+
+export interface MonteCarloOut {
+  id: string
+  sweep_id: string
+  paths: number
+  seed: string
+  /** The block asked for (01/10); null took each point's own, or predates blocks. */
+  block_trades?: number | null
+  /** Which runs of the ranking (01/10); null for a reserved-window test. */
+  ranking?: MonteCarloRanking | null
+  created_at: string
+  points: MonteCarloPoint[]
+}
+
+/** One finished run in a cluster (25/09). Blank risk takes the member's own document's. */
+export interface ClusterMemberIn {
+  backtest_id: string
+  /** Percent of the shared balance each trade risks, as a decimal string: "1" is 1%. */
+  risk_percent?: string
+}
+
+export interface CreateClusterRequest {
+  name: string
+  members: ClusterMemberIn[]
+  initial_capital?: string
+  max_open_positions?: number
+  /** Percent, like a member's risk: "5" is 5% of the balance at risk across what is open. */
+  max_open_risk_percent?: string
+}
+
+/** Why a member's trades were not taken on the shared account. */
+export type ClusterSkip = 'positions' | 'risk' | 'no_stop' | 'empty'
+
+export interface ClusterMember {
+  backtest_id: string
+  /** The run asked for, when it kept no trades and this is its twin run again to keep them. */
+  rerun_of?: string | null
+  risk_percent: string
+  label: string
+  symbol: string
+  timeframe: string
+  /** Null until the replay has run. */
+  offered: number | null
+  taken: number | null
+  skipped: Partial<Record<ClusterSkip, number>> | null
+  net_pnl: string | null
+}
+
+export interface ClusterPoint {
+  time: string
+  balance: string
+  equity: string
+}
+
+export interface ClusterOut {
+  id: string
+  name: string
+  status: BacktestStatus
+  error: string | null
+  initial_capital: string
+  max_open_positions: number
+  max_open_risk_percent: string
+  created_at: string
+  finished_at: string | null
+  members: ClusterMember[]
+  final_balance: string | null
+  net_return: string | null
+  max_drawdown_pct: string | null
+  max_drawdown_abs: string | null
+  most_open: number | null
+  yearly_return: Record<string, string> | null
+  /** The marked equity at the end of each day; the drawdown was measured on every point. */
+  curve: ClusterPoint[] | null
+}
+
+export interface ClusterListItem {
+  id: string
+  name: string
+  status: BacktestStatus
+  members: number
+  created_at: string
+  net_return: string | null
+  max_drawdown_pct: string | null
+}
+
+/** Walk a finished sweep forward (25/09): whole-year windows and each fold's choice rule. */
+export interface CreateSweepWalkForwardRequest {
+  start_year: number
+  train_years: number
+  test_years: number
+  folds: number
+  anchored: boolean
+  top_n: number
+  metric: HoldoutRank
+  /** Per chart, over the ranking floor (`RANK_MIN_TRADES`, 01/10). */
+  min_trades?: Record<string, number>
+  max_drawdown_r?: string
+  min_positive_year_share?: string
+  /** The charts to walk (28/09); left out, every chart of the sweep. */
+  timeframes?: string[]
+  /** Walk over test windows an earlier test of this sweep already used (01/10). */
+  retest?: boolean
+  /**
+   * `cut` (01/10): every fold answered from the sweep's own runs cut to whole years in R — nothing
+   * runs. Ranks by net R only and takes no drawdown limit. Left out, `rerun`.
+   */
+  mode?: WalkForwardMode
+}
+
+/** How a sweep's walk-forward answers its folds: running them again, or cutting the sweep's runs. */
+export type WalkForwardMode = 'rerun' | 'cut'
+
+export interface CreatedSweepWalkForward {
+  id: string
+  folds: number
+  /** Training runs queued now; each fold's test runs are queued when its training ends. */
+  runs: number
+}
+
+export type WalkForwardStage = 'training' | 'testing' | 'done' | 'failed'
+
+export interface SweepWalkForwardFold {
+  index: number
+  train_from: string
+  train_to: string
+  test_from: string
+  test_to: string
+  train_sweep_id: string | null
+  test_sweep_id: string | null
+  stage: WalkForwardStage
+  error: string | null
+  /** By cut only (01/10): the sweep's finished runs this fold could rank. */
+  candidates?: number | null
+  /** By cut only: the runs chosen on the training years. */
+  chosen?: number | null
+  /**
+   * By cut only: runs left out of the ranking by reason — `no_counts`, `refused_cut`,
+   * `under_floor`, `positive_years`.
+   */
+  excluded?: Record<string, number> | null
+}
+
+export interface SweepWalkForwardGroup {
+  entry_id: string
+  entry_name: string | null
+  timeframe: string
+  /** Per fold, in order: the out-of-sample median return; null where there is no test. */
+  medians: (string | null)[]
+  folds: number
+  positive_folds: number
+  most_chosen: string | null
+  most_chosen_folds: number
+  /** By cut only (01/10), per fold: the chosen runs' median net R on the training years. */
+  in_sample_medians?: (string | null)[] | null
+  /** By cut only, per fold: the share of the chosen whose test years ended above zero R. */
+  positive_shares?: (string | null)[] | null
+  /** By cut only, per fold: chosen runs with no trade in the test years, out of the median. */
+  no_trades_out?: (number | null)[] | null
+}
+
+export interface SweepWalkForwardOut {
+  id: string
+  parent_sweep_id: string | null
+  start_year: number
+  train_years: number
+  test_years: number
+  anchored: boolean
+  /** `cut` (01/10): every median is in R, read from the sweep's own runs. Absent before. */
+  mode?: WalkForwardMode
+  rule: Record<string, unknown>
+  status: BacktestStatus
+  error: string | null
+  created_at: string
+  finished_at: string | null
+  folds: SweepWalkForwardFold[]
+  groups: SweepWalkForwardGroup[]
+}
+
+/** A sweep without its markets, kept to run one market at a time (26/09). */
+export interface CreateSweepTemplateRequest {
+  name: string
+  entry_ids: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  initial_capital?: string
+}
+
+/** One market to queue. A blank spread is the market's measured one. */
+export interface QueueMarket {
+  symbol: string
+  spread_points?: string
+  commission_per_unit?: string
+  swap_long_per_lot?: string
+  swap_short_per_lot?: string
+}
+
+export type TemplateItemStatus = 'waiting' | 'launched' | 'failed' | 'removed'
+
+export interface TemplateItem {
+  id: string
+  symbol: string
+  /** The one chart this item runs (26/09); `null` on an item queued before: every chart. */
+  timeframe: string | null
+  cost_model: Record<string, string>
+  position: number
+  status: TemplateItemStatus
+  sweep_id: string | null
+  error: string | null
+  runs: number
+  done: number
+  failed: number
+  /** Its sweep exists and nothing of it is still queued or running. */
+  finished: boolean
+}
+
+export interface SweepTemplateOut {
+  id: string
+  name: string
+  entry_ids: string[]
+  entry_names: (string | null)[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  initial_capital: string
+  paused: boolean
+  created_at: string
+  items: TemplateItem[]
+}
+
+export interface SweepTemplateListItem {
+  id: string
+  name: string
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  paused: boolean
+  waiting: number
+  launched: number
+  failed: number
+  created_at: string
+}
+
+export interface SweepOut {
+  id: string
+  entry_ids: string[]
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  initial_capital: string
+  created_at: string
+  /** Set on a reserved-window test: the sweep whose best points it runs again (24/09). */
+  holdout_of?: string | null
+  /** How a test chose its points — `metric`, `top_n`, `min_trades` per chart. */
+  holdout_rule?: HoldoutRule | null
+  /** The sweeps this one reads together (26/09); null for a sweep that ran. */
+  combines?: string[] | null
+  template_id?: string | null
+  /** Every run kept its trades, won or lost (02/10). Absent from a server before it. */
+  keep_all_trades?: boolean
+  /** How many runs sit in each status — what the screen polls on (24/09). */
+  counts?: SweepRunCounts | null
+  /** When `entries` was computed (05/10): a large sweep's summary is the last one kept while it
+   *  runs, computed again every few minutes. Absent from a server before it. */
+  summary_as_of?: string | null
+  /** In the order the entries were asked for. */
+  entries: SweepEntryOut[]
+  /** Empty when read with `runs=none`, which is how the screen reads it: the runs come a page at a
+   *  time from `getSweepRuns`. */
+  runs: SweepRunOut[]
+  /** Pairs of `symbols` x `timeframes` left out for having no candles in the window (PR-269).
+   *  ⚠️ `symbols` and `timeframes` are what was **asked**: read this before reading them as the
+   *  space that was measured. */
+  skipped: UncoveredMarket[]
+  /** Pairs whose runs start at their first month of real bars, later than the window (02/10).
+   *  Absent from a server before it. */
+  trimmed?: TrimmedMarket[]
+  /** When the sweep was paused: its waiting runs are out of the queue until resumed (02/10). */
+  paused_at?: string | null
+  /** Downloads that failed under this sweep's runs, once each (his rule of 22/09). Unlike
+   *  `skipped`, these runs *did* run — on what was on disk. */
+  failed_collections: Collection[]
+}
+
+/** One page of a sweep's runs, best first by the measure asked — ranked by the server. */
+export interface SweepRunsPage {
+  /** The runs `items` pages through: only those over their chart's ranking floor unless every run
+   *  was asked for (`allRuns`). */
+  total: number
+  offset: number
+  limit: number
+  items: SweepRunOut[]
+  /** How many of the filter's runs are under the ranking floor (01/10) — the same number with or
+   *  without `allRuns`. ⚠️ Every run not finished counts here: it has no trades yet. Absent from
+   *  older fixtures. */
+  below_floor?: number
+  /** How many of the ranked runs are clones of a run launched before them (01/10) — left out of
+   *  `total` and `items` unless `showClones`, and the same number either way. Absent from older
+   *  fixtures. */
+  clones_hidden?: number
+}
+
+/** How many of a sweep's runs sit in each status. The four always add up to `total`. */
+export interface SweepRunCounts {
+  total: number
+  done: number
+  running: number
+  queued: number
+  failed: number
+}
+
+/** One sweep as a line of history — no runs, no summaries; those are a click away. */
+export interface SweepListItem {
+  id: string
+  created_at: string
+  /** In the order they were asked for. `name` is null for an entry since removed from the shelf. */
+  entries: { entry_id: string; name: string | null }[]
+  symbols: string[]
+  timeframes: string[]
+  date_from: string
+  date_to: string
+  runs: SweepRunCounts
+}
+
+/** One group of a dashboard's runs. `winners + losers + flat == finished`. Returns are fractions. */
+export interface DashboardSlice {
+  key: string
+  /** Null only for an entry since removed from the shelf. */
+  label: string | null
+  runs: number
+  finished: number
+  failed: number
+  winners: number
+  losers: number
+  flat: number
+  median_return: string | null
+  mean_return: string | null
+  best_return: string | null
+  worst_return: string | null
+  median_drawdown: string | null
+  worst_drawdown: string | null
+}
+
+/** A per-run ratio's median, and over how many runs it exists at all. */
+export interface DashboardRatio {
+  median: string | null
+  runs: number
+}
+
+export interface DashboardTotals {
+  sweeps: number
+  entries: number
+  symbols: string[]
+  timeframes: string[]
+  /** Every run launched, copies included. */
+  runs: SweepRunCounts
+  /** Distinct measurements among those runs; every result figure counts each one once. */
+  measurements: number
+  trades: number
+  runs_without_trades: number
+  /** Pairs a sweep in the period asked for and skipped for having no candles, with how many
+   *  sweeps skipped each. They have no runs, so no table below can show them. */
+  left_out: DashboardLeftOut[]
+}
+
+export interface DashboardLeftOut {
+  symbol: string
+  timeframe: string
+  sweeps: number
+}
+
+/** One sweep on the timeline. Its median pools the sweep's entries. */
+export interface DashboardSweep {
+  id: string
+  created_at: string
+  entry_names: (string | null)[]
+  runs: number
+  finished: number
+  winners: number
+  median_return: string | null
+  /** Pairs this sweep asked for and skipped for having no candles. */
+  left_out: number
+}
+
+export interface SweepDashboard {
+  launched_from: string | null
+  launched_to: string | null
+  totals: DashboardTotals
+  overall: DashboardSlice
+  win_rate: DashboardRatio
+  profit_factor: DashboardRatio
+  /** Per trade, as a fraction of the run's starting capital. */
+  expectancy: DashboardRatio
+  /** Best median first. */
+  by_entry: DashboardSlice[]
+  by_symbol: DashboardSlice[]
+  by_timeframe: DashboardSlice[]
+  /** Oldest first. */
+  sweeps: DashboardSweep[]
+}
+
+/** Instants with an offset, half-open: `[launched_from, launched_to)`. Either may be absent. */
+export interface LaunchWindow {
+  launched_from?: string
+  launched_to?: string
+}
+
+export interface SweepsPage {
+  total: number
+  limit: number
+  offset: number
+  items: SweepListItem[]
+}
+
+/** What "best" means on the best-by-market page — his four (02/10). */
+export type BestMetric =
+  | 'recovery_r'
+  | 'net_r'
+  | 'net_r_per_year'
+  | 'positive_years'
+  | 'positive_months'
+  | 'return_pct'
+  | 'cagr'
+  | 'profit_factor'
+  | 'win_rate'
+  | 'sharpe'
+  | 'worst_year_r'
+
+/** The best run of one (market, setup, chart) — a cell of `GET /best/map`. */
+export interface BestMapCell {
+  /** The first folder of the broker's tree (`Forex`, `Metals`, `Cash Indices`…), or the asset
+   *  class for a symbol the broker's list does not hold. */
+  market: string
+  symbol: string
+  entry_id: string
+  /** Null once the catalogue entry was removed: its runs still rank. */
+  entry_name: string | null
+  timeframe: string
+  /** The run's value under the metric asked; null when `unbounded`. */
+  value: string | null
+  /** A drawdown ratio with a gain and no drawdown: above every finite one, with no number. */
+  unbounded: boolean
+  run_id: string
+  sweep_id: string | null
+  /** The engine the best run was measured on (23/10): runs of every engine rank side by side,
+   *  so a cell may be won by a run from an older one. */
+  engine_version: string
+  /** How many runs of the cell were ranked — the draws its best is the best of. */
+  ranked: number
+}
+
+export interface BestMapOut {
+  metric: BestMetric
+  every_run: boolean
+  engine_version: string
+  cells: BestMapCell[]
+  /** When the map was computed (05/10): the last one kept, computed again every few minutes. */
+  as_of?: string | null
+  /**
+   * Nobody had opened this map for a day, so it is `as_of` old and being computed again now
+   * (08/10) — the screen says so and asks again sooner until it is fresh.
+   */
+  refreshing?: boolean
+}
+
+/** One reserved-window test of a point. */
+export interface BestTestOut {
+  sweep_id: string | null
+  status: string
+  date_from: string
+  date_to: string
+  net_r: string | null
+  total_trades: number | null
+}
+
+/** One of a cell's top runs, with every measure the page can rank by. */
+export interface BestPointOut {
+  run_id: string
+  sweep_id: string | null
+  strategy_id: string
+  label: string
+  values: Record<string, unknown>
+  date_from: string
+  date_to: string
+  value: string | null
+  unbounded: boolean
+  net_r: string | null
+  net_r_per_year: string | null
+  recovery_r: string | null
+  positive_year_share: string | null
+  max_drawdown_r: string | null
+  total_trades: number
+  profit_factor: string | null
+  /** The net profit over the starting capital (05/10). Absent from a server before it. */
+  return_pct?: string | null
+  cagr?: string | null
+  win_rate?: string | null
+  sharpe?: string | null
+  worst_year_r?: string | null
+  /** Months ending above zero R; none for a run recorded before 05/10. */
+  positive_month_share?: string | null
+  yearly_r: Record<string, string>
+  /** Its reserved-window tests, oldest window first; empty for a point never validated. */
+  tests: BestTestOut[]
+}
+
+export interface BestCellOut {
+  symbol: string
+  entry_id: string
+  entry_name: string | null
+  timeframe: string
+  metric: BestMetric
+  every_run: boolean
+  /** How many runs of the cell were ranked, before clones and near-clones gave their place. */
+  ranked: number
+  points: BestPointOut[]
+}
+
+/** What a sweep's pause or resume did, and what is left (02/10). */
+export interface SweepPauseOut {
+  /** When the sweep was paused; null once resumed. */
+  paused_at: string | null
+  /** The sweep's waiting runs: out of the queue while paused, back in it once resumed. */
+  queued: number
+  /** Runs a worker still holds. Safe to turn the machines off when this is zero and paused. */
+  running: number
+  withdrawn?: number
+  requeued_jobs?: number
+  /** Runs a resume found `running` with no worker holding any job, and queued again. */
+  released?: number
+}
+
+/** One market a live setup follows — on or off on its own. */
+export interface LiveMarket {
+  instrument_id: string
+  symbol: string
+  broker: string | null
+  active: boolean
+}
+
+/** A setup's history summed up, in R only (09/10). */
+export interface LiveMetrics {
+  signals: number
+  closed: number
+  open: number
+  cancelled: number
+  wins: number
+  win_rate: string | null
+  net_r: string
+  average_r: string | null
+  profit_factor: string | null
+  max_drawdown_r: string
+  r_by_month: Record<string, string>
+}
+
+/** One setup the live signals follow, on the markets under it (09/10). */
+export interface LiveSetup {
+  id: string
+  name: string
+  strategy_id: string
+  strategy_name: string
+  timeframe: string
+  /** For a setup with no target: the signal closes at this many R (his rule: 5). */
+  no_target_r: string
+  active: boolean
+  note: string | null
+  /** The run it was taken from; `null` once that run was cleaned away, or registered by hand. */
+  source_backtest_id: string | null
+  created_at: string
+  markets: LiveMarket[]
+  metrics: LiveMetrics
+}
+
+/** A setup registered from scratch: its strategy document, its chart and its markets. */
+export interface LiveSetupNew {
+  definition: Record<string, unknown>
+  timeframe: string
+  instrument_ids: string[]
+  no_target_r?: string
+}
+
+export interface LiveSetupPatch {
+  name?: string
+  active?: boolean
+  no_target_r?: string
+  note?: string
+}
+
+/** One signal of a setup's history. */
+export interface SignalRow {
+  number: number
+  symbol: string
+  timeframe: string
+  side: 'long' | 'short'
+  status: 'armed' | 'triggered' | 'cancelled' | 'closed'
+  order_type: string | null
+  entry: string | null
+  stop: string | null
+  target: string | null
+  exit_price: string | null
+  result_r: string | null
+  reason: string | null
+  armed_at: string | null
+  triggered_at: string | null
+  ended_at: string | null
+  strategy_id: string | null
+}
+
+/** Whether the signals supervisor is supervising, as its own last word says (ADR-0033). */
+export interface SupervisorOut {
+  /** It spoke within its last few rounds. `false`: nobody restarts a session that fails. */
+  alive: boolean
+  at: string | null
+  /** `false` when Redis could not be read, so nothing is known either way. */
+  reachable: boolean
+}
+
+/** One process of a market: what it last said and how many sessions it carries. */
+export interface MarketProcessOut {
+  key: string
+  /** `null` when it has not said anything readable yet. */
+  phase: 'warming' | 'live' | null
+  heard_at: string | null
+  sessions: number
+}
+
+/** What the supervisor says of one setup's session on one market; `off` when switched off. */
+export type LiveSessionState =
+  | 'running'
+  | 'warming'
+  | 'starting'
+  | 'stopping'
+  | 'waiting'
+  | 'off'
+  | 'unknown'
+
+/** One setup on one market: its switch, its session's state, what is under way, its record. */
+export interface LiveMarketSetupOut {
+  setup_id: string
+  name: string
+  strategy_name: string
+  setup_active: boolean
+  /** This market's own switch on the setup. */
+  active: boolean
+  no_target_r: string
+  state: LiveSessionState
+  /** Seconds before a session that failed is tried again (`state` is `waiting`). */
+  retry_in: number | null
+  /** Signals still armed or in a trade, oldest first. */
+  under_way: SignalRow[]
+  /** This setup's record on this market alone. */
+  metrics: LiveMetrics
+}
+
+/** One market — an instrument on a timeframe — and the processes that run it. */
+export interface LiveTimeframeOut {
+  timeframe: string
+  /** Usually one; two or more while a setup added since the last restart still runs apart. */
+  processes: MarketProcessOut[]
+  restarting: boolean
+  setups: LiveMarketSetupOut[]
+}
+
+/** An instrument and its markets, one per timeframe. */
+export interface LiveAssetOut {
+  instrument_id: string
+  symbol: string
+  broker: string | null
+  timeframes: LiveTimeframeOut[]
+}
+
+/** The signals screen by asset (ADR-0033): the supervisor's word, then every asset followed. */
+export interface LiveMarketsOut {
+  supervisor: SupervisorOut
+  assets: LiveAssetOut[]
+}
+
+/** Restart one market's sessions together, in one process. */
+export interface RestartMarketRequest {
+  instrument_id: string
+  timeframe: string
 }

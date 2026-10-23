@@ -19,10 +19,16 @@ approximation it never asked for and cannot undo.
 """
 
 import datetime as dt
+import json
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from decimal import Decimal
+from itertools import chain
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
 from tradeforge_engine.domain import Candle
@@ -52,6 +58,14 @@ OHLCV_SCHEMA = pa.schema(
 
 PARTITION_KEYS = ["symbol", "timeframe", "year"]
 
+SPLITS_KEY = b"tradeforge.splits"
+"""The file metadata key listing the share splits its bars were adjusted for (14/10)."""
+
+
+def symbol_path(root: Path, symbol: str) -> Path:
+    """The directory that holds every timeframe of one symbol."""
+    return root / f"symbol={symbol}"
+
 
 def dataset_path(root: Path, symbol: str, timeframe: str) -> str:
     """The directory that holds one symbol's bars at one timeframe.
@@ -59,7 +73,7 @@ def dataset_path(root: Path, symbol: str, timeframe: str) -> str:
     This is what goes into `datasets.parquet_path`: a *directory*, not a file. The
     year partitions underneath it come and go as the backfill is re-run.
     """
-    return (root / f"symbol={symbol}" / f"timeframe={timeframe}").as_posix()
+    return (symbol_path(root, symbol) / f"timeframe={timeframe}").as_posix()
 
 
 def to_table(symbol: str, timeframe: str, candles: list[Candle]) -> pa.Table:
@@ -82,7 +96,14 @@ def to_table(symbol: str, timeframe: str, candles: list[Candle]) -> pa.Table:
     )
 
 
-def write_candles(root: Path, symbol: str, timeframe: str, candles: list[Candle]) -> str:
+def write_candles(
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    candles: list[Candle],
+    *,
+    splits: Iterable[str] = (),
+) -> str:
     """Write the bars, replacing whatever those partitions held before.
 
     `delete_matching` is what makes a re-backfill idempotent: the year directories this
@@ -90,13 +111,21 @@ def write_candles(root: Path, symbol: str, timeframe: str, candles: list[Candle]
     appending a second, duplicate copy of it. Years this run does not touch are left
     alone — re-fetching 2024 must not delete the 2023 you already have.
 
+    `splits` are the share splits these bars have already been adjusted for (14/10), written
+    into every file's metadata so a later adjustment knows not to divide them again — see
+    `tradeforge_collector.splits`. None, and the files carry no stamp: raw.
+
     Returns the dataset directory, for the catalogue to record.
     """
     if not candles:
         raise ValueError(f"no candles to write for {symbol} {timeframe}")
 
+    table = to_table(symbol, timeframe, candles)
+    if stamp := sorted(set(splits)):
+        table = table.replace_schema_metadata({SPLITS_KEY: json.dumps(stamp)})
+
     ds.write_dataset(
-        to_table(symbol, timeframe, candles),
+        table,
         base_dir=root,
         format="parquet",
         partitioning=ds.partitioning(
@@ -109,34 +138,199 @@ def write_candles(root: Path, symbol: str, timeframe: str, candles: list[Candle]
     return dataset_path(root, symbol, timeframe)
 
 
-def read_candles(root: Path, symbol: str, timeframe: str) -> list[Candle]:
+def read_candles(
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+) -> list[Candle]:
     """Read a symbol's bars back, in order.
 
     Sorted explicitly: a dataset is a set of files, and the order they are listed in is
     the filesystem's business, not ours. Candles that arrive out of order would make the
     engine's notion of "the previous bar" a lie.
+
+    `start` and `end` bound the read and are **inclusive on both ends**. Inclusive because
+    the caller that uses them holds a window as *the first bar and the last bar* — the
+    provenance a finished run records — and a half-open `end` would silently drop the very
+    bar the run finished on.
+
+    The bounds are pushed into Arrow rather than applied to the result, which is the point
+    of the layout described at the top of this file: the year directories outside the window
+    are never opened, and the rows inside the boundary files are never decoded into Python
+    objects. Filtering afterwards would build every `Candle` first and throw most away.
+    """
+    table = _sorted_table(root, symbol, timeframe, start=start, end=end)
+    if table is None:
+        return []
+    return [_candle(row) for row in table.to_pylist()]
+
+
+ROWS_PER_SLICE = 20_000
+"""How many bars `iter_candles` turns into Python objects at a time: a few MB, against the
+hundreds that a whole M5 series costs as objects."""
+
+
+def iter_candles(  # noqa: PLR0913 — `read_candles`' window, plus the slice size
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+    rows_per_slice: int = ROWS_PER_SLICE,
+) -> Iterator[Candle]:
+    """`read_candles`, the same bars in the same order, built one slice at a time (12/10).
+
+    For a reader that walks the bars once and keeps none of them — a live session's warm-up.
+    `read_candles` builds every row as a dict and every bar as a `Candle` before the first is
+    used: on Usa500 M5 (662 thousand bars) that is ~360 MB of objects at once and a peak of
+    ~930 MB, and freeing them afterwards does not hand the memory back to the system — the
+    process stays at ~640 MB for the rest of its life. Here only the Arrow table (columnar,
+    ~50 MB) and one slice of objects exist at a time: peak ~340 MB.
+
+    ⚠️ **A generator: nothing is read until the first bar is asked for.** That is what a caller
+    sequencing the read wants (`splice` creates its consumer group first), and it means a
+    missing series is an empty iteration, not an error at the call.
+
+    When the walk ends, Arrow's memory pool is asked to give back what it no longer uses — it
+    otherwise keeps it (~110 MB measured) for allocations that will never come.
+    """
+    table = _sorted_table(root, symbol, timeframe, start=start, end=end)
+    if table is None:
+        return
+    try:
+        # ⚠️ **No name for the slices.** A slice shares the table's buffers, and a loop variable
+        # outlives its loop: the last slice would still hold the whole table when the pool is
+        # asked below, and the release would find nothing to give back (12/10).
+        for row in chain.from_iterable(
+            piece.to_pylist() for piece in table.to_batches(max_chunksize=rows_per_slice)
+        ):
+            yield _candle(row)
+    finally:
+        del table
+        pa.default_memory_pool().release_unused()
+
+
+def _sorted_table(
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> pa.Table | None:
+    """The series' rows inside the window, sorted by time — `None` when it was never collected."""
+    directory = Path(dataset_path(root, symbol, timeframe))
+    if not directory.exists():
+        return None
+
+    window = None
+    if start is not None:
+        window = ds.field("time") >= start
+    if end is not None:
+        upper = ds.field("time") <= end
+        window = upper if window is None else window & upper
+
+    table = ds.dataset(directory, format="parquet", partitioning="hive").to_table(filter=window)
+    return table.sort_by("time")
+
+
+def _candle(row: dict[str, Any]) -> Candle:
+    return Candle(
+        time=_as_utc(row["time"]),
+        open=row["open"],
+        high=row["high"],
+        low=row["low"],
+        close=row["close"],
+        tick_volume=row["tick_volume"],
+        spread=row["spread"],
+        real_volume=row["real_volume"],
+    )
+
+
+def read_times(
+    root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+) -> list[dt.datetime]:
+    """Just the instants of a symbol's bars, in order — the same window rules as `read_candles`.
+
+    Separate from `read_candles` rather than derived from it, because the caller that needs
+    this needs *only* this. A walk-forward cuts its folds by counting candles, so it asks how
+    many there are and when each one falls, and never opens a price. Reading the whole table to
+    take one column would decode six numbers per row into Python objects and drop all six —
+    over a decade of M5 that is a million allocations for a list of timestamps.
+
+    Columnar storage is what makes the difference free rather than clever: Parquet keeps each
+    column separately, so naming one means the others are never read off disk at all.
     """
     directory = Path(dataset_path(root, symbol, timeframe))
     if not directory.exists():
         return []
 
-    table = ds.dataset(directory, format="parquet", partitioning="hive").to_table()
-    table = table.sort_by("time")
+    window = None
+    if start is not None:
+        window = ds.field("time") >= start
+    if end is not None:
+        upper = ds.field("time") <= end
+        window = upper if window is None else window & upper
 
-    rows = table.to_pylist()
-    return [
-        Candle(
-            time=_as_utc(row["time"]),
-            open=row["open"],
-            high=row["high"],
-            low=row["low"],
-            close=row["close"],
-            tick_volume=row["tick_volume"],
-            spread=row["spread"],
-            real_volume=row["real_volume"],
-        )
-        for row in rows
-    ]
+    table = ds.dataset(directory, format="parquet", partitioning="hive").to_table(
+        columns=["time"], filter=window
+    )
+    return [_as_utc(moment) for moment in table.sort_by("time").column("time").to_pylist()]
+
+
+@dataclass(frozen=True, slots=True)
+class Coverage:
+    """What a dataset directory actually holds, read from the files rather than from a run."""
+
+    date_from: dt.datetime
+    date_to: dt.datetime
+    candle_count: int
+
+
+def coverage(root: Path, symbol: str, timeframe: str) -> Coverage | None:
+    """The span and size of what is on disk. `None` when nothing is.
+
+    ⚠️ **Asked of the disk, not of the download that just finished, and the difference is a
+    whole class of surprise.** `write_candles` only deletes the year partitions it is about to
+    write, so collecting 2015 after 2020 leaves 2020 exactly where it was — while a catalogue
+    row built from the second run's own candles would claim the symbol covers 2015 alone. The
+    files and the record of the files would disagree, and the screen believes the record: bars
+    the user paid three minutes to download would stop being offered to a backtest.
+
+    Deriving it here means the catalogue describes **what exists**, which is the only claim the
+    files can support, and it makes the answer independent of how many runs it took to get
+    there.
+
+    Costs a metadata read and one column. `count_rows` answers from the Parquet footers without
+    decoding a row, and `min_max` runs inside Arrow over the `time` column alone — the prices
+    are never touched, which is the layout at the top of this file paying for itself.
+    """
+    directory = Path(dataset_path(root, symbol, timeframe))
+    if not directory.exists():
+        return None
+
+    dataset = ds.dataset(directory, format="parquet", partitioning="hive")
+    count = dataset.count_rows()
+    if count == 0:
+        # A directory that exists and holds nothing. Reporting a span here would mean
+        # inventing two instants; reporting `None` says the same thing as never having run.
+        return None
+
+    span = pc.min_max(dataset.to_table(columns=["time"]).column("time"))
+    return Coverage(
+        date_from=_as_utc(span["min"].as_py()),
+        date_to=_as_utc(span["max"].as_py()),
+        candle_count=count,
+    )
 
 
 def _as_utc(moment: dt.datetime) -> dt.datetime:

@@ -16,8 +16,17 @@ property-based test over random trade sequences.
 Phase 1 holds at most one open position at a time (`max_open_positions` defaults to 1 in
 the DSL). This class enforces that rather than pretending to support a book it has never
 been tested with.
+
+⚠️ **A position opened before `book_from` is shadow** (ADR-0030). A run warms up on the bars before
+its window, trading as it would, so that its indicators and its structure are ready when the window
+opens — and so that a trade the warm-up took still occupies the one slot it would occupy in a
+longer run. Such a position is simulated to its end but never booked: its costs, its result and
+its unrealised value never touch the balance, and it never becomes a trade. The account opens at
+`book_from` with the initial capital, and the property above holds over what was booked.
 """
 
+import datetime as dt
+from dataclasses import replace
 from decimal import Decimal
 
 from tradeforge_engine.domain import (
@@ -25,13 +34,16 @@ from tradeforge_engine.domain import (
     AccountState,
     Candle,
     ClosedTrade,
+    EntrySnapshot,
     Fill,
     InstrumentSpec,
     Money,
     Position,
+    Side,
     SignalKind,
 )
 from tradeforge_engine.errors import EngineError
+from tradeforge_engine.swap import SwapRates
 
 
 class Portfolio:
@@ -43,6 +55,8 @@ class Portfolio:
         initial_capital: Money,
         instrument: InstrumentSpec,
         currency: str = "USD",
+        swap: SwapRates | None = None,
+        book_from: dt.datetime | None = None,
     ) -> None:
         if initial_capital <= ZERO:
             raise ValueError(f"initial capital must be positive, got {initial_capital}")
@@ -54,6 +68,10 @@ class Portfolio:
         self._equity = initial_capital
         self._position: Position | None = None
         self._trades: list[ClosedTrade] = []
+        self._swap = swap if swap is not None else SwapRates()
+        self._book_from = book_from
+        # Whether the open position was opened before `book_from` — see the module's note.
+        self._shadow = False
 
     @property
     def initial_capital(self) -> Money:
@@ -70,10 +88,18 @@ class Portfolio:
     def account(self) -> AccountState:
         return AccountState(balance=self._balance, equity=self._equity, currency=self._currency)
 
-    def apply(self, fill: Fill) -> ClosedTrade | None:
-        """Fold one fill into the ledger. Returns the trade, if this fill closed one."""
+    def apply(self, fill: Fill, *, snapshot: EntrySnapshot | None = None) -> ClosedTrade | None:
+        """Fold one fill into the ledger. Returns the trade, if this fill closed one.
+
+        `snapshot` is the window of bars around this entry, and it is passed rather than read
+        off `fill.order` because it is not finished until now: the loop attached the bars up to
+        the decision, and only the caller filling this order knows which bar the waiting ended
+        on (`BacktestBroker._snapshot_through`). Ignored on an exit, which opens no position to
+        hang it from. Defaults to `None` so a ledger driven without one still balances — the
+        snapshot is something to look at, never something the arithmetic reads.
+        """
         if fill.order.intent is SignalKind.ENTRY:
-            self._open(fill)
+            self._open(fill, snapshot)
             return None
 
         return self._close(fill)
@@ -83,13 +109,79 @@ class Portfolio:
 
         Equity, not balance. An account with a losing position still open has not lost the
         money yet — but it *has* drawn down, and a drawdown measured on balance reports a
-        serene flat line right up to the margin call.
+        serene flat line right up to the margin call. A shadow position is worth nothing to the
+        account (ADR-0030): it is not the account's.
         """
+        if self._shadow:
+            self._equity = self._balance
+            return
         self._equity = self._balance + self._unrealised(candle.close)
+
+    def observe_price(self, price: Money) -> None:
+        """The position traded at `price` — typically its exit fill. Extends both extremes.
+
+        For a position leaving at its stop this is the **only** observation of that bar: the
+        bar's high may have come after the exit, so it is not the position's
+        (`Position.best_price`).
+        """
+        position = self._position
+        if position is None:
+            return
+        best, worst = _extremes(position)
+        if position.side is Side.LONG:
+            best, worst = max(best, price), min(worst, price)
+        else:
+            best, worst = min(best, price), max(worst, price)
+        self._position = replace(position, best_price=best, worst_price=worst)
+
+    def observe_bar(self, candle: Candle, *, favourable: bool = True, adverse: bool = True) -> None:
+        """The position lived through this bar's range — or the half of it the broker can vouch
+        for. `favourable=False` is a bar whose favourable extreme may not have been the
+        position's (it was born inside the bar); `adverse=False` the other way round.
+
+        The broker decides which, because only it knows how the position entered and left the
+        bar. The ledger only keeps the extremes.
+        """
+        position = self._position
+        if position is None:
+            return
+        best, worst = _extremes(position)
+        long = position.side is Side.LONG
+        if favourable:
+            best = max(best, candle.high) if long else min(best, candle.low)
+        if adverse:
+            worst = min(worst, candle.low) if long else max(worst, candle.high)
+        self._position = replace(position, best_price=best, worst_price=worst)
+
+    def record_target(self, take_profit: Money) -> None:
+        """Record the target the broker armed for the open position.
+
+        A target set as a multiple of the risk (`take_profit_rr`) is computed by the broker at the
+        fill, from the price it filled at — the order never carried it. Without this the trade
+        would report no target while having left at one, and every reading of how far it could
+        have gone (`excursion.with_target`) would take a target exit for the trade's own course.
+        """
+        if self._position is None:
+            raise EngineError("cannot record a target on a position that is not open")
+        self._position = replace(self._position, take_profit=take_profit)
+
+    def amend_stop(self, stop_loss: Money) -> None:
+        """Record that the open position's stop now sits at `stop_loss` (ADR-0018).
+
+        The ledger does not judge the level — whether a move is a tightening is the broker's
+        rule, and it has already been enforced by the time this is called. What the ledger
+        owes is that the position it hands out stops describing a stop that no longer exists.
+
+        `initial_stop_loss` deliberately does not move: it is the risk the lot was sized
+        against, and the denominator of every R multiple this trade will report.
+        """
+        if self._position is None:
+            raise EngineError("cannot move the stop of a position that is not open")
+        self._position = replace(self._position, stop_loss=stop_loss)
 
     # ----------------------------------------------------------------------- #
 
-    def _open(self, fill: Fill) -> None:
+    def _open(self, fill: Fill, snapshot: EntrySnapshot | None = None) -> None:
         if self._position is not None:
             raise EngineError(
                 f"cannot open a {fill.order.side} position while one is already open "
@@ -103,10 +195,13 @@ class Portfolio:
                 f"aggregate them before returning a Fill"
             )
 
+        # Opened before the account opens: simulated, never booked (ADR-0030).
+        self._shadow = self._book_from is not None and fill.time < self._book_from
         # The entry's cost leaves the account the moment the order executes. But it is also
         # *remembered on the position*, because the trade this becomes has to report the
         # whole round trip — see ClosedTrade.
-        self._balance -= fill.costs
+        if not self._shadow:
+            self._balance -= fill.costs
         self._equity = self._balance
 
         self._position = Position(
@@ -117,8 +212,16 @@ class Portfolio:
             entry_time=fill.time,
             entry_costs=fill.costs,
             stop_loss=fill.order.stop_loss,
+            # The same level twice, on purpose: at the fill "where the stop is" and "where
+            # the stop started" are one fact. They separate the first time `modify_stop`
+            # moves one (ADR-0018), and only the left-hand one follows it.
+            initial_stop_loss=fill.order.stop_loss,
             take_profit=fill.order.take_profit,
             context=fill.order.context,
+            snapshot=snapshot,
+            # The entry is the first price the position provably traded at, in both directions.
+            best_price=fill.price,
+            worst_price=fill.price,
         )
 
     def _close(self, fill: Fill) -> ClosedTrade:
@@ -140,15 +243,22 @@ class Portfolio:
             )
 
         gross = self._pnl(position, position.entry_price, fill.price)
+        # Settled with the trade rather than night by night: the result and the balance are
+        # exact, and the curve does not show it accruing while the position is open (`swap`).
+        swap = self._swap.on(position.side, position.volume, position.entry_time, fill.time)
 
         # The balance only moves by what has not moved yet: the entry's cost was already
-        # taken at `_open`. The *trade*, however, reports both legs.
-        self._balance += gross - fill.costs
+        # taken at `_open`. The *trade*, however, reports both legs. A shadow position moves
+        # nothing and is not kept (ADR-0030); the trade is still built and handed back, because
+        # the broker's caller reads it the same way either way.
+        shadow, self._shadow = self._shadow, False
+        if not shadow:
+            self._balance += gross - fill.costs + swap
         self._equity = self._balance
         self._position = None
 
         costs = position.entry_costs + fill.costs
-        net = gross - costs
+        net = gross - costs + swap
         trade = ClosedTrade(
             symbol=position.symbol,
             side=position.side,
@@ -161,12 +271,23 @@ class Portfolio:
             costs=costs,
             net_pnl=net,
             reason=fill.order.reason,
-            stop_loss=position.stop_loss,
+            # The stop the trade was *sized* against, not the one it died at. It is the level
+            # `r_multiple` divides by, and the record would contradict itself if the two came
+            # from different stops. A trade that exits at a trailed stop therefore reports an
+            # `exit_price` that is not this number — see `ClosedTrade.stop_loss`.
+            stop_loss=position.initial_stop_loss,
             take_profit=position.take_profit,
             r_multiple=self._r_multiple(position, net),
             context=position.context,
+            snapshot=position.snapshot,
+            mfe_price=position.best_price,
+            mae_price=position.worst_price,
+            mfe_r=_in_r(position, position.best_price),
+            mae_r=_in_r(position, position.worst_price),
+            swap=swap,
         )
-        self._trades.append(trade)
+        if not shadow:
+            self._trades.append(trade)
         return trade
 
     def _r_multiple(self, position: Position, net_pnl: Money) -> Money | None:
@@ -175,10 +296,16 @@ class Portfolio:
         The risk is measured at the *entry* — `|entry - stop| * per-lot value * volume` — which
         is the money the position stood to lose when it was opened. Dividing the net result by
         it turns a dollar figure into a comparable unit: +2R is the same edge on any size.
+
+        Hence `initial_stop_loss` and not `stop_loss`, which a trailing strategy moves. Divide
+        by the *current* stop and a trade whose stop reached breakeven divides by zero risk;
+        one trailed into profit divides by a negative. Neither is a number — and the trailing
+        setups this engine is being built for (the MME9 conduction) would produce them on
+        every winning trade.
         """
-        if position.stop_loss is None:
+        if position.initial_stop_loss is None:
             return None
-        distance = abs(position.entry_price - position.stop_loss)
+        distance = abs(position.entry_price - position.initial_stop_loss)
         risk = self._instrument.money_for(distance, position.volume)
         if risk <= ZERO:
             return None
@@ -199,3 +326,26 @@ class Portfolio:
         if position is None:
             return Decimal(0)
         return self._pnl(position, position.entry_price, price)
+
+
+def _in_r(position: Position, price: Money | None) -> Money | None:
+    """How far `price` is from the entry, in multiples of the distance to the initial stop.
+
+    Always non-negative: which way it went is the field's name (`mfe_r` or `mae_r`), not its sign.
+    A price ratio, not money, so it carries no costs — see `ClosedTrade.mfe_r`.
+    """
+    if price is None or position.initial_stop_loss is None:
+        return None
+    risk = abs(position.entry_price - position.initial_stop_loss)
+    if risk <= ZERO:
+        return None
+    return abs(price - position.entry_price) / risk
+
+
+def _extremes(position: Position) -> tuple[Money, Money]:
+    """The position's best and worst prices so far. Set at `_open` and never cleared, so a
+    position without them was built somewhere other than this ledger — and measuring it would
+    start from a price it never had."""
+    if position.best_price is None or position.worst_price is None:
+        raise EngineError("a position opened outside the ledger carries no excursion to extend")
+    return position.best_price, position.worst_price

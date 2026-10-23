@@ -15,9 +15,20 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from tradeforge_engine.backtest_broker import BacktestBroker
-from tradeforge_engine.costs import SpreadCostModel
-from tradeforge_engine.domain import OrderRequest, OrderResult, Side, Signal, SignalKind
-from tradeforge_engine.loop import run
+from tradeforge_engine.costs import BarSpreadCostModel, SpreadCostModel
+from tradeforge_engine.domain import (
+    Candle,
+    Context,
+    OrderRequest,
+    OrderResult,
+    Position,
+    RefusedBy,
+    Side,
+    Signal,
+    SignalKind,
+)
+from tradeforge_engine.errors import EngineError, LookaheadError
+from tradeforge_engine.loop import _reject_lookahead, run
 from tradeforge_engine.testing import EURUSD, HOUR, START, FixedRisk, ScriptedStrategy, bar
 
 DECIDED = START  # a decision instant strictly before the first bar we hand the broker
@@ -55,6 +66,7 @@ def _limit(  # noqa: PLR0913 — keyword-only; each names one axis of a resting 
     stop: str | None = None,
     client_id: str = "zone-1",
     decided_at: dt.datetime = DECIDED,
+    reason: str = "",
 ) -> OrderResult:
     return broker.submit(
         OrderRequest(
@@ -66,6 +78,7 @@ def _limit(  # noqa: PLR0913 — keyword-only; each names one axis of a resting 
             stop_loss=Decimal(stop) if stop is not None else None,
             limit_price=Decimal(limit),
             client_id=client_id,
+            reason=reason,
         )
     )
 
@@ -747,12 +760,16 @@ def test_a_limit_fills_when_a_market_entry_gapped_straight_through_its_stop() ->
     The pair below is the whole argument — identical candle, identical economics, and the only
     difference is which bar the position was born on. Blocking one and not the other would
     make the answer depend on a fact the market cannot see."""
-    gap_bar = {"open_": "1.09500", "close": "1.09150", "high": "1.09550", "low": "1.09100"}
+
+    # A function rather than a `**kwargs` dict: the dict types as `dict[str, str]`, and
+    # `Candle` has an `int` field now, so unpacking it stopped type-checking.
+    def gap_bar(index: int) -> Candle:
+        return bar(index, open_="1.09500", close="1.09150", high="1.09550", low="1.09100")
 
     born_here = _broker()
     _entry(born_here, side=Side.LONG, stop="1.09800")  # decided when price was up at 1.10000
     _limit(born_here, limit="1.09200")
-    fills = born_here.on_bar(bar(1, **gap_bar))
+    fills = born_here.on_bar(gap_bar(1))
     # the market entry and its stop both land on the open, and then the limit is free to fill
     assert [(fill.order.reason, fill.price) for fill in fills] == [
         ("sl", Decimal("1.09500")),
@@ -765,7 +782,7 @@ def test_a_limit_fills_when_a_market_entry_gapped_straight_through_its_stop() ->
     _entry(born_earlier, side=Side.LONG, stop="1.09800")
     born_earlier.on_bar(bar(1, open_="1.10000", close="1.10000", high="1.10050", low="1.09950"))
     _limit(born_earlier, limit="1.09200")
-    later = born_earlier.on_bar(bar(2, **gap_bar))
+    later = born_earlier.on_bar(gap_bar(2))
     # same candle, same answer — the limit fills at the same price either way
     assert [(fill.order.reason, fill.price) for fill in later] == [
         ("sl", Decimal("1.09500")),
@@ -831,6 +848,114 @@ def test_a_dead_order_does_not_cost_the_next_one_its_fill() -> None:
     assert fill.order.client_id == "alive"
     assert fill.price == Decimal("1.09200")  # the open: it gapped through this level too
     assert broker.resting() == ()
+
+
+# --------------------------------------------------------------------------- #
+# A dropped order is reported, not only logged (ADR-0025)                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_gapped_order_is_reported_as_refused_by_the_market() -> None:
+    """The drop above, read from the strategy's side: it has to be *told*.
+
+    Until ADR-0025 the only trace was a `logger.debug`, which no strategy can read, so a phase
+    went on holding a name for an order that no longer existed anywhere. `MARKET` rather than
+    `BROKER` because nothing refused it — it was accepted, it rested, and the market left.
+    """
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.09300", client_id="zone-9", reason="entry.gap")
+    assert (
+        broker.on_bar(bar(1, open_="1.09200", close="1.09100", high="1.09250", low="1.09000")) == []
+    )
+
+    [refusal] = broker.refusals()
+    assert refusal.client_id == "zone-9"
+    assert refusal.refused_by is RefusedBy.MARKET
+    assert refusal.intent is SignalKind.ENTRY
+    # ⚠️ Both halves of the split `_end_by_market` documents, because only `detail` was asserted
+    # at first and dropping `reason` left the whole suite green: `reason` is what the *strategy*
+    # called the order ("entry.choch" in a real run), `detail` is this broker's account of the
+    # market. The record that answers "why did this take no trades?" needs the first to say
+    # which setup, and the second to say what happened.
+    assert refusal.reason == "entry.gap"
+    assert "1.09300" in refusal.detail  # the stop it gapped past, so a human can see which one
+
+
+def test_a_stop_dropped_for_slipping_too_far_is_reported_too() -> None:
+    """The mirror path, and it needs its own test rather than its own assertion.
+
+    `_survives_the_gap` and `_survives_the_slip` are two `continue`s in one loop, and a change
+    that reports one and not the other leaves a suite green: the gap test above passes, and the
+    order still disappears here. Both were dropped in silence, and the census that found this
+    saw 18 of the first and **1** of the second in a year — the rare one is exactly the one a
+    scenario-shaped suite forgets.
+    """
+    broker = _broker()
+    _stop(broker, stop_price="1.10500", stop="1.10000", client_id="zone-slip")
+    assert (
+        broker.on_bar(bar(1, open_="1.15000", close="1.15100", high="1.15200", low="1.14900")) == []
+    )
+
+    [refusal] = broker.refusals()
+    assert refusal.client_id == "zone-slip"
+    assert refusal.refused_by is RefusedBy.MARKET
+    assert "1.10500" in refusal.detail  # the trigger, not the stop: this is the other guard
+
+
+def test_an_order_that_simply_fills_is_not_reported_as_refused() -> None:
+    """The negative case, without which every assertion above is satisfied by "always report".
+
+    Same order, same shape of bar, gapping *toward* the limit but nowhere near the stop: it
+    fills, and nothing was ended by anybody.
+    """
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.08000")
+    [fill] = broker.on_bar(bar(1, open_="1.09200", close="1.09300", high="1.09350", low="1.09150"))
+    assert fill.price == Decimal("1.09200")
+    assert broker.refusals() == ()
+
+
+def test_a_strategy_cancelling_its_own_order_is_not_the_market_ending_it() -> None:
+    """`cancel` empties the book too, and it must not come back as a refusal.
+
+    The two are opposite instructions to the phase that hears them: a cancel is the strategy's
+    own decision and spends nothing, while a refusal says the order it believes in is gone. A
+    broker that reported both would tell a strategy it was turned away every time it changed
+    its mind — and `setups._observe_refusal` reads exactly that field to decide.
+    """
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.09300", client_id="mine")
+    assert broker.cancel("mine") is True
+    assert broker.refusals() == ()
+
+
+def test_the_refusals_are_drained_not_republished() -> None:
+    """Asked once a bar by the loop, and news delivered twice is a strategy told its order was
+    ended on a bar where it holds a perfectly good one.
+
+    ⚠️ The second read only proves anything because the first one returned something: a broker
+    that never reported would pass the `== ()` line on its own.
+    """
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.09300", client_id="zone-9")
+    broker.on_bar(bar(1, open_="1.09200", close="1.09100", high="1.09250", low="1.09000"))
+
+    assert len(broker.refusals()) == 1
+    assert broker.refusals() == ()
+
+
+def test_two_orders_ended_by_one_gap_are_both_reported() -> None:
+    """A list, not a slot. One overnight gap can pass the level of every order in the book, and
+    a phase matches refusals by `client_id` — so a report that kept only the last one would
+    leave the other zone believing in an order forever."""
+    broker = _broker()
+    _limit(broker, limit="1.09500", stop="1.09300", client_id="zone-a")
+    _limit(broker, limit="1.09450", stop="1.09250", client_id="zone-b")
+    assert (
+        broker.on_bar(bar(1, open_="1.09200", close="1.09100", high="1.09250", low="1.09000")) == []
+    )
+
+    assert sorted(refusal.client_id or "" for refusal in broker.refusals()) == ["zone-a", "zone-b"]
 
 
 def test_the_target_is_measured_from_the_fill_not_from_the_level() -> None:
@@ -1504,3 +1629,677 @@ def test_a_stop_whose_loss_sits_on_its_trigger_has_no_risk_to_measure() -> None:
     _stop(broker, stop_price="1.10500", stop="1.10500")
     [fill] = broker.on_bar(bar(1, open_="1.10600", close="1.10700", high="1.10800", low="1.10550"))
     assert fill.price == Decimal("1.10600")
+
+
+# --------------------------------------------------------------------------- #
+# Moving the stop of an open position (ADR-0018)                               #
+# --------------------------------------------------------------------------- #
+
+BAR_ONE = START + HOUR  # the bar the modifications below are decided on
+
+
+def _the_open_position(broker: BacktestBroker) -> Position:
+    """The one open position, asserted to be exactly one.
+
+    Not `[position] = broker.positions(...)`, tempting as that is: `positions()` returns
+    `(position,)` or `()`, and a static analyser can see the empty branch — it reads the
+    unpack as a mismatched multiple assignment, which is a fair reading of `[x] = ()`.
+
+    The sequence is not defensiveness either. A live MT5 account reports positions this
+    strategy never opened, so `Broker.positions` has to be able to answer with more than one;
+    phase 1 is what holds a single position at a time.
+    """
+    positions = broker.positions("EURUSD")
+    assert len(positions) == 1
+    return positions[0]
+
+
+def _open_a_long(broker: BacktestBroker, *, stop: str | None = "1.09000") -> None:
+    """Fill a market long at 1.10000 on bar 1, so bar 2 onwards can test the stop."""
+    _entry(broker, side=Side.LONG, stop=stop)
+    [fill] = broker.on_bar(bar(1, open_="1.10000", close="1.10000"))
+    assert fill.price == Decimal("1.10000")
+
+
+def test_a_tightened_stop_is_where_the_position_is_stopped_out() -> None:
+    """The golden. Bar 2 dips to 1.09400 — past the new stop, nowhere near the original one.
+
+    Without the modification this bar does nothing at all: 1.09400 never reaches 1.09000. So a
+    single assertion covers three separate ways to break this — the modification not applying,
+    applying at the wrong level, and the exit still reading the old one.
+    """
+    broker = _broker()
+    _open_a_long(broker)
+
+    assert broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE) is True
+
+    [fill] = broker.on_bar(bar(2, open_="1.10000", close="1.09400", low="1.09400"))
+    assert fill.price == Decimal("1.09500")
+    assert fill.order.reason == "sl"
+
+
+def test_the_modified_stop_carries_the_instant_it_was_decided_not_the_entrys() -> None:
+    """The whole ADR in one assertion, and the one that fails if anyone collapses the two
+    instants back into one.
+
+    A stop the strategy moved on bar 1 was decided on bar 1 — not when the entry was. Wearing
+    the entry's older stamp, the exit would clear `loop._reject_lookahead` on *any* bar,
+    including the one whose close decided the level. Nothing about the resulting equity curve
+    would look wrong; it would simply be better than the market gave.
+    """
+    broker = _broker()
+    _open_a_long(broker)
+    broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE)
+
+    [fill] = broker.on_bar(bar(2, open_="1.10000", close="1.09400", low="1.09400"))
+
+    assert fill.order.decided_at == BAR_ONE
+    assert fill.order.decided_at != DECIDED  # the entry's — the stamp that hides the bug
+
+
+def test_the_guard_bites_on_a_modified_stop_filling_inside_its_own_bar() -> None:
+    """The other half of the test above: an honest stamp is only worth having because the
+    engine checks it. A stop decided on bar 1, exiting *inside* bar 1, is refused.
+
+    This one calls the guard directly instead of driving a misbehaving broker through `run()`,
+    the way `test_lookahead.py` does — and the reason is the point being made. With the loop as
+    written, **no broker can produce this fill**: `modify_stop` is called after `on_bar` has
+    already returned, so the next protective check always happens on a later candle. The
+    ordering makes the bug unreachable today, which is exactly why the guard, and not the
+    ordering, has to be what forbids it. Reorder those two steps, or hand the protocol to an
+    `MT5Broker` that reconciles differently, and this is the line still standing.
+    """
+    broker = _broker()
+    _open_a_long(broker)
+    broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE)
+    [fill] = broker.on_bar(bar(2, open_="1.10000", close="1.09400", low="1.09400"))
+
+    with pytest.raises(LookaheadError):
+        _reject_lookahead(fill, bar(1, open_="1.10000", close="1.09400", low="1.09400"), HOUR)
+
+
+def test_a_long_stop_may_not_be_moved_away_from_price() -> None:
+    """The lot was sized against 1.09000. Widening to 1.08000 doubles the money at risk on a
+    position nobody re-sized — martingale wearing a trailing stop's clothes."""
+    broker = _broker()
+    _open_a_long(broker)
+
+    with pytest.raises(EngineError, match="may only tighten"):
+        broker.modify_stop("EURUSD", Decimal("1.08000"), BAR_ONE)
+
+
+def test_a_short_stop_may_not_be_moved_away_from_price() -> None:
+    """The mirror, and a separate test because the comparison flips: a short's stop sits
+    *above* it, so loosening means moving up. One `<` left unflipped and only this fails."""
+    broker = _broker()
+    _entry(broker, side=Side.SHORT, stop="1.11000")
+    broker.on_bar(bar(1, open_="1.10000", close="1.10000"))
+
+    with pytest.raises(EngineError, match="may only tighten"):
+        broker.modify_stop("EURUSD", Decimal("1.12000"), BAR_ONE)
+
+
+def test_a_short_stop_tightens_downward() -> None:
+    """And the short's tightening direction, which the refusal above does not prove."""
+    broker = _broker()
+    _entry(broker, side=Side.SHORT, stop="1.11000")
+    broker.on_bar(bar(1, open_="1.10000", close="1.10000"))
+
+    assert broker.modify_stop("EURUSD", Decimal("1.10500"), BAR_ONE) is True
+
+    [fill] = broker.on_bar(bar(2, open_="1.10000", close="1.10600", high="1.10600"))
+    assert fill.price == Decimal("1.10500")
+    assert fill.order.reason == "sl"
+
+
+def test_moving_a_stop_to_where_it_already_is_is_accepted() -> None:
+    """A strategy that recomputes the same level every bar must not be punished for it, and
+    the author's own conduction does exactly that: while price holds above the average, the
+    stop stays on the bar that broke it and the setup keeps naming that same low."""
+    broker = _broker()
+    _open_a_long(broker)
+
+    assert broker.modify_stop("EURUSD", Decimal("1.09000"), BAR_ONE) is True
+
+
+def test_modifying_with_no_position_open_is_false_not_an_error() -> None:
+    """In live the trade may have closed while the instruction was in flight. That is a race,
+    and a broker that raised would turn a normal execution into a dead session."""
+    assert _broker().modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE) is False
+
+
+def test_modifying_another_symbols_position_is_false() -> None:
+    broker = _broker()
+    _open_a_long(broker)
+
+    assert broker.modify_stop("GBPUSD", Decimal("1.09500"), BAR_ONE) is False
+
+
+def test_a_stop_can_be_armed_on_a_position_that_had_none() -> None:
+    """An entry with no `stop_loss` leaves no protection at all. Arming one later only ever
+    reduces risk, and refusing it would be the engine declining to make a position safer.
+
+    The stamp is asserted here too, and it is not decoration: this branch builds a
+    `_Protection` from scratch rather than replacing one, so it is the one path where the
+    decision instant could be filled in from anywhere at all and every other test would still
+    pass. A mutation run proved exactly that — the level was checked, the instant was not.
+    """
+    broker = _broker()
+    _open_a_long(broker, stop=None)
+
+    # Proof it really was unprotected: this bar would have taken any stop at 1.09500.
+    assert broker.on_bar(bar(2, open_="1.10000", close="1.09400", low="1.09400")) == []
+
+    armed_on = START + 2 * HOUR
+    assert broker.modify_stop("EURUSD", Decimal("1.09500"), armed_on) is True
+
+    [fill] = broker.on_bar(bar(3, open_="1.09600", close="1.09400", low="1.09400"))
+    assert fill.price == Decimal("1.09500")
+    assert fill.order.reason == "sl"
+    assert fill.order.decided_at == armed_on
+
+
+def test_the_target_keeps_its_level_and_its_own_instant_across_a_stop_modification() -> None:
+    """`modify_stop` touches the stop and nothing else. The take-profit was computed from the
+    entry price at the fill and was decided when the entry was — so it keeps both its level and
+    the entry's stamp, which is the whole reason the two instants are stored separately."""
+    broker = _broker(take_profit_rr=Decimal(2))
+    _open_a_long(broker)  # entry 1.10000, stop 1.09000 -> risk 0.01000, target 1.12000
+    broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE)
+
+    [fill] = broker.on_bar(bar(2, open_="1.10000", close="1.12100", high="1.12100"))
+
+    assert fill.price == Decimal("1.12000")
+    assert fill.order.reason == "tp"
+    assert fill.order.decided_at == DECIDED  # the entry's, unmoved
+
+
+def test_a_stop_can_be_tightened_more_than_once() -> None:
+    """The author's conduction ratchets: each bar that closes back across the average brings
+    the stop to that bar's extreme, and the level before it is never revisited."""
+    broker = _broker()
+    _open_a_long(broker)
+    assert broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE) is True
+    assert broker.modify_stop("EURUSD", Decimal("1.10000"), START + 2 * HOUR) is True
+
+    with pytest.raises(EngineError, match="may only tighten"):
+        broker.modify_stop("EURUSD", Decimal("1.09900"), START + 3 * HOUR)
+
+    [fill] = broker.on_bar(bar(3, open_="1.10200", close="1.09900", low="1.09900"))
+    assert fill.price == Decimal("1.10000")
+
+
+def test_a_modification_moves_where_a_real_run_exits() -> None:
+    """End to end through `run()`: the strategy asks on bar 2, the loop stamps and routes, and
+    the trade exits at the tightened level on bar 3 — a level the original stop never reaches.
+
+    This is also what proves the intent never becomes an order: a `MODIFY_STOP` that fell
+    through to `_to_order` would be sized, queued and filled as a *second* entry, and the run
+    would end holding a position instead of flat.
+
+    **The modification deliberately does not happen on the bar the entry filled on.** Three
+    instants are in play — the entry's decision (`DECIDED`), the entry's fill (`BAR_ONE`, which
+    is `position.entry_time`), and the bar that moved the stop — and the exit must carry the
+    third. Ask on bar 1 and all three collapse onto two, so stamping the modification with
+    `position.entry_time` instead of `candle.time` passes: the assertion pins a *value* while
+    leaving the *source* free. That substitution is the one ADR-0018 calls "the bug", and it is
+    what `Broker.modify_stop` promises does not happen — so the whole promise rides on this bar
+    being a different bar.
+    """
+    broker = _broker()
+    modified_on = START + 2 * HOUR
+    strategy = ScriptedStrategy(
+        script={
+            0: [
+                Signal(
+                    kind=SignalKind.ENTRY,
+                    side=Side.LONG,
+                    reference_price=Decimal("1.10000"),
+                    stop_loss=Decimal("1.09000"),
+                )
+            ],
+            2: [
+                Signal(
+                    kind=SignalKind.MODIFY_STOP,
+                    side=Side.LONG,
+                    reference_price=Decimal("1.10000"),
+                    stop_loss=Decimal("1.09500"),
+                )
+            ],
+        }
+    )
+    result = run(
+        candles=[
+            bar(0, open_="1.10000", close="1.10000"),
+            bar(1, open_="1.10000", close="1.10000"),  # the entry fills here: entry_time
+            bar(2, open_="1.10000", close="1.10000"),  # the stop moves here: decided_at
+            bar(3, open_="1.10000", close="1.09400", low="1.09400"),
+        ],
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=broker,
+        risk=FixedRisk(),
+    )
+
+    [entry_fill, exit_fill] = result.fills
+    assert entry_fill.order.intent is SignalKind.ENTRY
+    assert entry_fill.time == BAR_ONE
+    assert exit_fill.price == Decimal("1.09500")
+    assert exit_fill.order.reason == "sl"
+    assert exit_fill.order.decided_at == modified_on
+    assert broker.positions("EURUSD") == ()
+
+
+def test_an_untouched_stop_exits_carrying_the_entrys_instant() -> None:
+    """The stamp on the path every stopped-out trade in every backtest already took.
+
+    `_arm_protection` fills `stop_decided_at` from the entry, and until a modification arrives
+    that is the truth: nothing has moved the stop. It reads as too obvious to test — which is
+    exactly why a mutation run put **1970** there and all 488 tests stayed green. The level was
+    right, the exit was right, the P&L was right; only the field the whole ADR exists to
+    protect was wrong, and wrong in the direction that goes quiet (a stamp far enough in the
+    past can never trip `_reject_lookahead`, while one in the future trips it at once).
+
+    Its sibling on the arm-from-scratch branch is asserted in
+    `test_a_stop_can_be_armed_on_a_position_that_had_none`. This is the busy one.
+    """
+    broker = _broker()
+    _open_a_long(broker)
+
+    [fill] = broker.on_bar(bar(2, open_="1.10000", close="1.08900", low="1.08900"))
+
+    assert fill.price == Decimal("1.09000")
+    assert fill.order.reason == "sl"
+    assert fill.order.decided_at == DECIDED
+
+
+def test_arming_a_stop_on_an_unstopped_position_invents_no_target() -> None:
+    """Arming protection where there was none creates a stop and *only* a stop.
+
+    The take-profit is computed from the entry price at the fill, and that moment has gone; a
+    target conjured here would close positions in the one kind of setup this method was built
+    for — the MME9 conduction runs with `take_profit_rr=None` on purpose, because the stop is
+    the only way out. A phantom target would report that method finishing every trade at a tidy
+    +1R: consistent, positive, and not the method at all.
+
+    **The probe bar's high is absurd on purpose.** A realistic bar only rules out a target
+    *inside* it, which turns this into "no target within ten points of the open" while the name
+    claims "no target". A 1:1 target inventable from these levels sits at 1.10500 — outside a
+    plausible hourly range and comfortably inside this one. The low stays well clear of the
+    stop, so the only thing this bar can possibly fill is a target that should not exist.
+    """
+    broker = _broker()
+    _open_a_long(broker, stop=None)
+    assert broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE) is True
+
+    assert (
+        broker.on_bar(bar(2, open_="1.10000", close="1.10000", high="1.30000", low="1.09900")) == []
+    )
+
+
+def test_a_naive_decision_instant_is_refused_at_the_call() -> None:
+    """Every other instant is validated where it is built; this one never becomes an
+    `OrderRequest`, so nothing else would catch it. Accepted here it is stored, and surfaces
+    bars later from inside the exit path — a traceback pointing at the fill, not the caller."""
+    broker = _broker()
+    _open_a_long(broker)
+
+    with pytest.raises(ValueError, match="modify_stop decided_at"):
+        broker.modify_stop("EURUSD", Decimal("1.09500"), dt.datetime(2024, 1, 1, 1))  # noqa: DTZ001
+
+
+# --------------------------------------------------------------------------- #
+# The moved stop, as the rest of the engine sees it (ADR-0018)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_position_reports_the_stop_it_would_exit_at_today() -> None:
+    """`Position.stop_loss` follows the modification; `initial_stop_loss` never does.
+
+    Two facts that were one fact until a stop could move. The live level is what the strategy
+    must read to know whether its next level tightens; the entry's level is what the lot was
+    sized against, and therefore the only honest denominator for an R multiple.
+    """
+    broker = _broker()
+    _open_a_long(broker)  # entry 1.10000, stop 1.09000
+
+    broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE)
+
+    position = _the_open_position(broker)
+    assert position.stop_loss == Decimal("1.09500")
+    assert position.initial_stop_loss == Decimal("1.09000")
+
+
+def test_a_conduction_that_reads_its_own_stop_back_is_never_refused() -> None:
+    """The author's conduction, end to end, with the guard an author actually writes.
+
+    Breakeven at +2R, then "the stop goes to the average's extreme" — and the extreme named on
+    a later bar can sit *below* the breakeven stop, because the average trails price rather
+    than tracking it. So the strategy guards itself: only move if the new level tightens.
+
+    That guard is only as good as what it reads. While `Position.stop_loss` reported the
+    *entry's* stop, the comparison was made against a level that no longer existed: 1.09950
+    beats the stale 1.09000, the signal goes out, and the engine — which knows the stop is
+    really at 1.10000 — raises. A trade that is winning, on a bar that never threatens the
+    stop, kills the whole backtest, and nothing the strategy could read would have saved it.
+    """
+
+    class Conduction:
+        """Long once, then ratchet: breakeven at +2R, then the average's extreme."""
+
+        def __init__(self) -> None:
+            self.entered = False
+            self.at_breakeven = False
+            self.refused_to_loosen = False
+
+        def on_bar(self, context: Context) -> list[Signal]:
+            position = context.position
+            if position is None:
+                if self.entered:
+                    return []
+                self.entered = True
+                return [
+                    Signal(
+                        kind=SignalKind.ENTRY,
+                        side=Side.LONG,
+                        reference_price=context.candle.close,
+                        stop_loss=Decimal("1.09000"),  # 1R = 0.01000
+                    )
+                ]
+
+            if not self.at_breakeven:
+                if context.candle.high < Decimal("1.12000"):  # +2R not touched yet
+                    return []
+                self.at_breakeven = True
+                return [
+                    Signal(
+                        kind=SignalKind.MODIFY_STOP,
+                        side=Side.LONG,
+                        reference_price=context.candle.close,
+                        stop_loss=Decimal("1.10000"),
+                        reason="breakeven at 2R",
+                    )
+                ]
+
+            wanted = Decimal("1.09950")  # where the average sits on this bar
+            current = position.stop_loss
+            if current is not None and wanted <= current:
+                self.refused_to_loosen = True
+                return []
+            return [
+                Signal(
+                    kind=SignalKind.MODIFY_STOP,
+                    side=Side.LONG,
+                    reference_price=context.candle.close,
+                    stop_loss=wanted,
+                    reason="trail to the average",
+                )
+            ]
+
+    strategy = Conduction()
+    result = run(
+        candles=[
+            bar(0, open_="1.10000", close="1.10000"),
+            bar(1, open_="1.10000", close="1.10000"),
+            # +2R touched: the stop goes to the entry price.
+            bar(2, open_="1.10000", close="1.12000", high="1.12100", low="1.10000"),
+            # Winning, and nowhere near the stop — but the average names 1.09950.
+            bar(3, open_="1.12000", close="1.12100", high="1.12200", low="1.11900"),
+            # Give it back: the breakeven stop is what closes the trade.
+            bar(4, open_="1.11000", close="1.09000", high="1.11000", low="1.09000"),
+        ],
+        timeframe=HOUR,
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=_broker(),
+        risk=FixedRisk(),
+    )
+
+    # The guard fired — meaning it compared against 1.10000, the level really in force.
+    assert strategy.refused_to_loosen is True
+
+    [trade] = result.trades
+    assert trade.exit_price == Decimal("1.10000")
+    assert trade.reason == "sl"
+    # Reported against the stop the lot was *sized* against, not the one it died at. Measured
+    # against the moved stop the distance is zero, and this would be `None` instead of a
+    # scratch — every trailed winner silently losing its R.
+    assert trade.stop_loss == Decimal("1.09000")
+    assert trade.r_multiple == Decimal(0)
+
+
+def test_a_stop_armed_on_an_unstopped_position_leaves_the_trade_without_an_r() -> None:
+    """Nothing sized this lot against a level, so the trade has no risk to be a multiple of.
+
+    The live stop exists and is the one that closes the trade; `initial_stop_loss` stays
+    `None`, and `r_multiple` follows it. Filling it in from the armed level would invent a
+    denominator out of a decision taken after the money was already on the table.
+    """
+    broker = _broker()
+    _open_a_long(broker, stop=None)
+    broker.modify_stop("EURUSD", Decimal("1.09500"), BAR_ONE)
+
+    position = _the_open_position(broker)
+    assert (position.stop_loss, position.initial_stop_loss) == (Decimal("1.09500"), None)
+
+    broker.on_bar(bar(2, open_="1.10000", close="1.09400", low="1.09400"))
+
+    [trade] = broker.trades()
+    assert trade.exit_price == Decimal("1.09500")
+    assert trade.stop_loss is None
+    assert trade.r_multiple is None
+
+
+def test_a_stop_modification_with_no_position_is_logged_not_swallowed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A strategy that trails onto an entry which has not filled yet gets `False` back, and
+    the loop drops the instruction. Harmless — but silence here is indistinguishable from a
+    trailing rule that ran and worked, which is the one thing the author is trying to see.
+
+    The message says the broker refused and nothing more. `ImmediateFillBroker` returns `False`
+    while *holding* a position — it keeps no protective level for a modification to reach — so
+    a line blaming a missing position would be flatly wrong there.
+    """
+    strategy = ScriptedStrategy(
+        script={
+            0: [
+                Signal(
+                    kind=SignalKind.MODIFY_STOP,
+                    side=Side.LONG,
+                    reference_price=Decimal("1.10000"),
+                    stop_loss=Decimal("1.09500"),
+                    reason="trail with nothing to trail",
+                )
+            ]
+        }
+    )
+    with caplog.at_level(logging.DEBUG, logger="tradeforge_engine.loop"):
+        result = run(
+            candles=[
+                bar(0, open_="1.10000", close="1.10000"),
+                bar(1, open_="1.10000", close="1.10000"),
+            ],
+            timeframe=HOUR,
+            instrument=EURUSD,
+            strategy=strategy,
+            broker=_broker(),
+            risk=FixedRisk(),
+        )
+
+    assert result.fills == ()
+    assert "broker refused the stop modification" in caplog.text
+    assert "trail with nothing to trail" in caplog.text
+
+
+def test_a_stop_moved_past_the_market_exits_at_the_next_open_and_calls_it_sl() -> None:
+    """The registered debt, pinned so it can only change on purpose (ADR-0018, `specs/backlog.md`).
+
+    Nothing checks a new stop against where price actually is — only against the stop it
+    replaces. So a long can be given a stop *above* the market: 1.13000 tightens against
+    1.09000 by the only rule there is, and the next bar leaves at its open.
+
+    No money is invented — 1.12000 is a price that really traded, and the clamp to the bar is
+    what guarantees that. The damage is the label: a **winning** trade, +2R and +$2 000, files
+    itself in the record as `reason='sl'`. A trailing rule with a sign error — naming the bar's
+    high where it meant its low — produces exactly this and nothing raises anywhere.
+
+    The mirror on `stop_loss` versus `limit_price`/`stop_price` has been open since ADR-0014;
+    they close together, because closing only this one changes the limit order's contract too.
+    """
+    broker = _broker()
+    _open_a_long(broker)  # entry 1.10000, stop 1.09000
+
+    assert broker.modify_stop("EURUSD", Decimal("1.13000"), BAR_ONE) is True
+
+    [fill] = broker.on_bar(bar(2, open_="1.12000", close="1.12100", high="1.12200", low="1.11900"))
+
+    assert fill.price == Decimal("1.12000")  # the open, not the impossible 1.13000
+    assert fill.order.reason == "sl"
+    [trade] = broker.trades()
+    assert (trade.net_pnl, trade.r_multiple) == (Decimal(2000), Decimal(2))
+
+
+def test_a_tightened_stop_beats_a_strategy_exit_waiting_on_the_same_bar() -> None:
+    """Both want to close the position on bar 2, and the stop is checked first.
+
+    That is the engine's "worst case goes first" rule doing its job: a protective level is live
+    from the bar's first tick, while a strategy's exit fills at the open. Reversing them would
+    let a trade decided on the previous close escape a stop the market had already taken.
+
+    Newly reachable, because until ADR-0018 the stop on that bar could only be the entry's. The
+    strategy's exit is then discarded rather than left lurking — bar 3 fills nothing, and the
+    run ends with one trade, not a short opened by an exit that outlived its position.
+    """
+    broker = _broker()
+    _open_a_long(broker)  # entry 1.10000, stop 1.09000
+    broker.modify_stop("EURUSD", Decimal("1.09800"), BAR_ONE)
+    broker.submit(
+        OrderRequest(
+            symbol="EURUSD",
+            side=Side.SHORT,
+            intent=SignalKind.EXIT,
+            volume=Decimal(1),
+            decided_at=BAR_ONE,
+            reason="strategy exit",
+        )
+    )
+
+    [fill] = broker.on_bar(bar(2, open_="1.10000", close="1.09750", high="1.10000", low="1.09700"))
+
+    assert fill.price == Decimal("1.09800")  # the moved stop, not the 1.10000 open
+    assert fill.order.reason == "sl"
+    assert broker.on_bar(bar(3, open_="1.09700", close="1.09700")) == []
+    assert len(broker.trades()) == 1
+
+
+def test_a_stop_trailed_past_the_target_leaves_the_target_in_charge() -> None:
+    """Nothing stops a trail from climbing over the take-profit, and nothing needs to.
+
+    Entry 1.10000, stop 1.09000, `rr=2` — the target sits at 1.12000. Trail the stop to 1.12500
+    and a long now holds a stop *above* its own target, which reads like a contradiction. It is
+    not reachable trouble: to touch a stop up there the market must first pass the target, so
+    the target fires and the trade closes at 2.6R — better than 2R only because the bar opened
+    through the level, which is ordinary gap behaviour for a target.
+
+    Worth pinning rather than arguing about, because the alternative reading — refuse the
+    modification, or drag the target along — would be a rule invented here with no method
+    behind it. The stop keeps its own instant and the target keeps the entry's, which is the
+    whole point of storing two.
+    """
+    broker = _broker(take_profit_rr=Decimal(2))
+    _open_a_long(broker)
+
+    assert broker.modify_stop("EURUSD", Decimal("1.12500"), BAR_ONE) is True
+
+    [fill] = broker.on_bar(bar(2, open_="1.12600", close="1.12800", high="1.13000", low="1.12550"))
+
+    assert fill.price == Decimal("1.12600")
+    assert fill.order.reason == "tp"
+    assert fill.order.decided_at == DECIDED  # the entry's — the target never moved
+    [trade] = broker.trades()
+    assert trade.r_multiple == Decimal("2.6")
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0022: which bar a fill is charged against                                 #
+# --------------------------------------------------------------------------- #
+
+# A bar that fills nothing, quoting a spread nothing else in these scenarios quotes.
+#
+# ⚠️ It is load-bearing, not scenery. Without it the *first* bar the broker sees is also the bar
+# the entry fills on, so `self._seen[0]` — the oldest bar the broker still holds, and the shape
+# of every plausible "charged the wrong bar" bug — happens to be the right answer. Three of the
+# four mutants below survived until this bar existed. A scenario in which the wrong answer and
+# the right one coincide cannot separate them.
+_QUIET = {"open_": "1.10000", "close": "1.10000", "high": "1.10010", "low": "1.09990", "spread": 1}
+
+
+def _charging_broker() -> BacktestBroker:
+    """A broker that prices its fills from the bar they land on, warmed up by one quiet bar."""
+    broker = _broker(cost_model=BarSpreadCostModel(), slippage_ticks=Decimal(0))
+    broker.on_bar(bar(0, **_QUIET))  # type: ignore[arg-type]
+    return broker
+
+
+def test_a_market_entry_and_its_stop_are_charged_by_their_own_bars() -> None:
+    """ADR-0022's whole point, proved by making the two bars disagree by a factor of ten.
+
+    Nothing in the type system says *which* candle the broker hands the cost model, and every
+    wrong answer produces a believable number. Measured: this scenario reports 10 and 100, and a
+    broker charging the oldest bar it holds reports 0.50 twice — while the other 769 tests stay
+    green.
+
+    The exit's spread is the larger on purpose. A news spike on the bar that stops you out is
+    not hypothetical, and it is precisely where charging the wrong bar flatters the result.
+    """
+    broker = _charging_broker()
+    _entry(broker, side=Side.LONG, stop="1.09800")
+
+    entered = broker.on_bar(
+        bar(1, open_="1.10000", close="1.10100", high="1.10150", low="1.09950", spread=20)
+    )
+    stopped = broker.on_bar(
+        bar(2, open_="1.10100", close="1.09700", high="1.10120", low="1.09650", spread=200)
+    )
+
+    assert [fill.costs for fill in entered] == [Decimal(10)]  # half of 20, one lot, tick value 1
+    assert [(fill.order.reason, fill.costs) for fill in stopped] == [("sl", Decimal(100))]
+
+    trade = broker.trades()[0]
+    assert trade.costs == Decimal(110), "both legs were charged from one bar"
+    assert trade.net_pnl == Decimal(-310)
+    assert broker.account().equity == Decimal(9_690)
+
+
+def test_a_strategy_exit_at_the_open_is_charged_by_the_bar_it_opens_on() -> None:
+    """The other exit path: the strategy closing out, rather than a stop firing. It fills at the
+    *next* bar's open, so the bar it is charged against is not the one the decision was made
+    on — and `_check_protective`'s site being right says nothing about this one."""
+    broker = _charging_broker()
+    _entry(broker, side=Side.LONG)
+    broker.on_bar(
+        bar(1, open_="1.10000", close="1.10100", high="1.10150", low="1.09950", spread=20)
+    )
+
+    _exit(broker, side=Side.LONG)
+    closed = broker.on_bar(
+        bar(2, open_="1.10100", close="1.10200", high="1.10250", low="1.10050", spread=300)
+    )
+
+    assert [(fill.order.reason, fill.costs) for fill in closed] == [("", Decimal(150))]
+
+
+def test_a_resting_limit_is_charged_by_the_bar_it_was_reached_on() -> None:
+    """The fourth site, and the one whose bar is least obvious: a limit order outlives the bar
+    that placed it and fills *inside* a later one. The bar it is charged against is the bar the
+    market reached the level on — which may be several bars after the order was submitted."""
+    broker = _charging_broker()
+    _limit(broker, limit="1.09900")
+
+    filled = broker.on_bar(
+        bar(1, open_="1.10000", close="1.10050", high="1.10100", low="1.09850", spread=60)
+    )
+
+    assert [(fill.price, fill.costs) for fill in filled] == [(Decimal("1.09900"), Decimal(30))]

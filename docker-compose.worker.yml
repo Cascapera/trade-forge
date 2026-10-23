@@ -1,0 +1,80 @@
+# Backtest workers on another machine (26/09) — nothing else. They drain the same Redis queue and
+# write to the same Postgres as the main stack, which stays on the machine that runs it.
+#
+#   docker compose -f docker-compose.worker.yml --env-file worker.env up -d --build
+#
+# Copy worker.env.example to worker.env and fill it in. The step by step, in Portuguese, is
+# docs/referencia/worker-remoto.md.
+#
+# ⚠️ **The same commit as the main stack's workers.** A run records `ENGINE_VERSION`, and two
+# engines answering the same queue would put two answers under one sweep. Check out the commit the
+# main machine's Docker was built from before building here.
+#
+# ⚠️ **The candles are read from this machine's disk**, into each worker's memory once per series
+# (`candle_cache`), then reused for every run after it. They arrive by themselves (09/10):
+# `candle-sync` pulls what is new from the main machine's API every hour, and a worker asked for a
+# series it lacks fetches it first (`candle_sync`). With the main machine off, both just wait.
+
+name: tradeforge-remote
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    # ⚠️ Not `tradeforge-api`: run here by mistake on the main machine, a build under that name
+    # would replace the image its own workers are recreated from.
+    image: tradeforge-worker-remote
+    # Not `arq tradeforge_api.worker.WorkerSettings`: the same worker on `OneTripWorker`, which
+    # claims its next job in one round trip to Redis (`claim`, 06/10). The old command still
+    # works; from across the internet it idles ~15–30 s between batches.
+    command: ['python', '-m', 'tradeforge_api.worker_main']
+    environment:
+      # The main machine, where Postgres and Redis are published (docker-compose.yml `ports:`).
+      POSTGRES_HOST: ${TRADEFORGE_HOST:?set TRADEFORGE_HOST in worker.env — the main machine's IP}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5433}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in worker.env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in worker.env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in worker.env}
+      REDIS_HOST: ${TRADEFORGE_HOST}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      PARQUET_ROOT: /data/ohlcv
+      # Where a missing series is fetched from: the main machine's API (`candle_sync`, 09/10).
+      TRADEFORGE_CANDLES_URL: http://${TRADEFORGE_HOST}:${TRADEFORGE_API_PORT:-8000}
+    # One core per worker, as on the main machine: a backtest is synchronous CPU, one at a time.
+    # The same memory ceiling as the main machine's workers, swap included (15/10, see there): a
+    # worker past it is killed alone instead of the VM swapping until Docker stops (13/10 here).
+    # It bounds one worker, not the sum — the count still has to fit `.wslconfig`: 10 workers at
+    # ~3 GB on a long M5 batch is more than its 26 GB.
+    deploy:
+      replicas: ${TRADEFORGE_WORKERS:-1}
+      resources:
+        limits:
+          cpus: '1'
+          memory: ${TRADEFORGE_WORKER_MEMORY:-5g}
+    memswap_limit: ${TRADEFORGE_WORKER_MEMORY:-5g}
+    # Long enough for the batch it holds (16/10, ADR-0036): told to stop, a worker finishes its
+    # job first (`STOP_WAIT_SECONDS`). As on the main machine; see there.
+    stop_grace_period: 15m
+    # Writable since 09/10: a worker saves the series it fetched, for every run after it.
+    volumes:
+      - ${TRADEFORGE_CANDLES:-./data/ohlcv}:/data/ohlcv
+    restart: unless-stopped
+
+  # Every hour, pull what is new or changed on the main machine (`candle_sync`, 09/10).
+  candle-sync:
+    image: tradeforge-worker-remote
+    depends_on: [worker]
+    command:
+      - python
+      - -m
+      - tradeforge_api.candle_sync
+      - --url
+      - http://${TRADEFORGE_HOST}:${TRADEFORGE_API_PORT:-8000}
+      - --root
+      - /data/ohlcv
+      - --every
+      - '3600'
+    volumes:
+      - ${TRADEFORGE_CANDLES:-./data/ohlcv}:/data/ohlcv
+    restart: unless-stopped

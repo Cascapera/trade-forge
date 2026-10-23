@@ -26,8 +26,10 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Computed,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -41,7 +43,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from tradeforge_db.base import MONEY, PRICE, RATIO, VOLUME, Base
@@ -63,6 +65,129 @@ class BacktestStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
     DONE = "done"
+    FAILED = "failed"
+
+
+class Recorded(StrEnum):
+    """What a finished run kept of itself (2026-09-23).
+
+    A sweep of hundreds of assets cannot keep everything, and what it keeps depends on the run: a
+    run judged worth reading keeps its trades, one that is not keeps only its metrics, and no run
+    of a sweep keeps the pictures or the equity curve. The engine is deterministic, so what was not
+    kept is recomputed by running the same point again.
+
+    ⚠️ **Written, never derived.** "Has a sweep_id and lost money" would say the same thing today
+    and a different thing the day the rule changes: a run judged under a 30-trade floor must not be
+    re-read under a 40-trade one and suddenly claim trades it never stored. The row says what was
+    kept on the day it was kept.
+    """
+
+    FULL = "full"
+    """Everything: metrics, trades, each entry's picture, the equity curve. A single backtest, a
+    study, a basket — anything a person reads run by run."""
+
+    TRADES = "trades"
+    """Metrics and trades, with each trade's context; no pictures, no equity curve. A sweep's run
+    that passed the bar (`tradeforge_api.retention`)."""
+
+    METRICS = "metrics"
+    """The metrics row alone. A sweep's run that did not pass the bar — kept because the losers are
+    the denominator every winner is judged against."""
+
+
+class SliceMode(StrEnum):
+    """How a reserved-window test's run is cut when it is judged in pieces (`SweepSlicing`)."""
+
+    CALENDAR = "calendar"
+    """One slice per calendar year: the regime question."""
+
+    TRADES = "trades"
+    """Blocks of the same number of trades: every slice the same strength of evidence."""
+
+
+class SelectionMetric(StrEnum):
+    """What a walk-forward fold maximises when it picks a winner from its training grid.
+
+    An enum rather than a free string because this is the one input that decides what the
+    whole experiment *means*. "The best parameters" is not a fact about a grid; it is a fact
+    about a grid **and a ranking**, and a walk-forward that could not say which ranking it
+    used would report an out-of-sample number nobody could reproduce.
+
+    All four name a column on `BacktestMetrics`, and three of them are nullable there —
+    which is the reason `walkforward.choose` refuses to treat a null as a zero. Sharpe over
+    zero trades is undefined, not flat.
+    """
+
+    NET_PROFIT = "net_profit"
+    PROFIT_FACTOR = "profit_factor"
+    SHARPE = "sharpe"
+    EXPECTANCY = "expectancy"
+
+
+class SessionMode(StrEnum):
+    """Paper or real, and the distinction the whole of sdd.md §11 hangs on.
+
+    ⚠️ `LIVE` was **refused outright by a CHECK** until `rev_0016`, because there was no kill
+    switch, no executor and no paper-first gate. All three exist now, so the blanket refusal is
+    gone and an *earned* one took its place: a trigger refuses a live session for a strategy that
+    has never completed a bar in paper.
+
+    The database enforces the **invariant** — never with a strategy nobody has watched — and the
+    application enforces the **policy**, which is how many days (`live_promotion_days`). A number
+    that needs a migration to change is not a configuration value, and a rule that lives only in
+    the code that writes the row is not an invariant. Each belongs where it can do its job.
+
+    ⚠️ The count is per **strategy**, not per strategy-and-instrument: see `rev_0016`. Paper on
+    EURUSD M15 unlocks this strategy anywhere. That is the operator's choice, and it means a live
+    session is evidence that the *strategy* has been watched — never that this *plan* has.
+    """
+
+    PAPER = "paper"
+    LIVE = "live"
+    SIGNAL = "signal"
+    """Simulated exactly like paper, and its moments posted as signals (signals PR 5). Never a
+    venue, and never counted towards a live promotion: only paper days are watched days."""
+
+
+class OrderAuditStatus(StrEnum):
+    """What became of one order. Every value is an **outcome**, never a stage.
+
+    ⚠️ There is no `requested`. `sdd.md` §5 sketched one, and a row saying "I picked this up"
+    would have to be *updated* when the outcome arrived — which the append-only trigger forbids,
+    and rightly: a mutable audit row is one somebody can quietly correct. So a row is written
+    once, when its outcome is known, and the picking-up is recorded as `requested_at` on that
+    same row.
+
+    ⚠️ `REFUSED` and `ERROR` are kept apart because their remedies are opposites. Refused is this
+    machine's own safeguards working — the switch, a cap, the window — and the response is to
+    look at the rule. Error is the venue or the terminal failing, and the response is to look at
+    MT5. A single "did not happen" would send every investigation to the wrong place half the
+    time.
+    """
+
+    SENT = "sent"
+    """Accepted by MT5. What it does next arrives as a fill, not here."""
+
+    FILLED = "filled"
+    PARTIAL = "partial"
+    """⚠️ Its own value, not a `filled` with a smaller number. A partial fill leaves the rest of
+    the order somewhere, and reading it as filled is how a position ends up half the size a
+    strategy believes it has."""
+
+    REFUSED = "refused"
+    """Stopped here, by this machine's own rules. `reason` names which."""
+
+    ERROR = "error"
+    """MT5 refused it, or could not be reached. `response` carries what it said."""
+
+
+class LiveSessionStatus(StrEnum):
+    """No `queued`, unlike `BacktestStatus`, and the absence is the point: a session is not
+    work handed to a queue, it is a process that either exists or does not. A row appears
+    when something is already running."""
+
+    RUNNING = "running"
+    STOPPED = "stopped"
     FAILED = "failed"
 
 
@@ -130,6 +255,39 @@ def _created_at() -> Mapped[dt.datetime]:
 # --------------------------------------------------------------------------- #
 
 
+class Broker(Base):
+    """A broker this system collects from: one MT5 server, one terminal, one clock (ADR-0032).
+
+    ⚠️ **Several at once** (08/10): forex, metals, indices and crypto at ActivTrades, US shares at
+    Tradeview, Brazilian shares at a third. A broker is known by its MT5 **server** — the name a
+    terminal reports when logged in — and gets a short `slug` for queues and screens.
+
+    `server_offset` is the clock the broker's agent collects with, read from here rather than from
+    an environment variable somebody has to remember to change when switching terminals.
+    """
+
+    __tablename__ = "brokers"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    slug: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    server: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    terminal_path: Mapped[str | None] = mapped_column(Text)
+    server_offset: Mapped[dt.timedelta] = mapped_column(Interval, nullable=False)
+    # The tree folders whose symbols a sync keeps (`BOVESPA\A VISTA`); null keeps them all. XP
+    # lists 51 644 symbols, 44 838 of them options nobody here analyses (08/10).
+    catalogue_paths: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        CheckConstraint("slug ~ '^[a-z0-9][a-z0-9-]*$'", name="slug_is_a_slug"),
+        CheckConstraint(
+            "server_offset BETWEEN interval '-14 hours' AND interval '14 hours'",
+            name="server_offset_is_a_clock",
+        ),
+    )
+
+
 class Instrument(Base):
     """A tradable symbol and the numbers needed to price a position in it.
 
@@ -146,6 +304,18 @@ class Instrument(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
 
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    """The internal name every part of the system keys on — candles' folder, sweeps, screens,
+    streams (ADR-0032). Usually the broker's ticker; different only when two brokers use one
+    ticker for two things (`GOLD`: the metal at ActivTrades, Barrick Gold at Tradeview)."""
+
+    # Where it comes from and what that broker calls it (ADR-0032). Null on a row with no broker
+    # behind it — the seeds and the rows tests build by hand; the collector always states both.
+    # RESTRICT: a broker is not deleted while an instrument says it comes from there.
+    broker_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("brokers.id", ondelete="RESTRICT")
+    )
+    broker_symbol: Mapped[str | None] = mapped_column(String(32))
+
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     asset_class: Mapped[AssetClass] = mapped_column(
         _enum(AssetClass, "asset_class"), nullable=False
@@ -161,6 +331,41 @@ class Instrument(Base):
     tick_value: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     contract_size: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     digits: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    # The broker's quoted spread, in ticks, as a *default* for a run's cost model — not a
+    # number the engine ever reads. Costs are plugged in per backtest (ADR-07), and this is
+    # only what the screen offers before anyone overrides it. Kept here, with the other
+    # broker-quoted specs, because that is what it is: `symbol_info` said so.
+    #
+    # Nullable, and the distinction is load-bearing. NULL means *nobody has measured this
+    # symbol's spread* — a row seeded by hand, or catalogued before this column existed.
+    # Zero would mean "this instrument is free to trade", which is a claim, and the wrong
+    # one. The screen falls back to charging nothing only when it can say why.
+    #
+    # Stored in ticks rather than in MT5 "points" because the engine's `SpreadCostModel`
+    # counts ticks, and the two are not the same quantity by definition — see the collector,
+    # which converts and refuses when a broker's point and tick disagree in a way it cannot
+    # reconcile. Storing the raw MT5 number would leave that conversion to every reader.
+    default_spread_points: Mapped[Decimal | None] = mapped_column(PRICE)
+
+    # The step a price is quoted in at the venue, when it is not the series' own tick (14/10):
+    # XP's `WIN$` is a continuous future adjusted by a ratio at each roll, so its prices fall on
+    # any point (tick 1) while every contract trades in steps of 5. A signal's levels are put on
+    # this step before anybody reads them (`SignalBroker`); the engine never sees it. NULL — the
+    # series' tick is the step, as for every instrument quoted as it trades.
+    price_step: Mapped[Decimal | None] = mapped_column(PRICE)
+
+    # How far the broker's server clock runs ahead of the stored candles' UTC — the number the
+    # collector shifted every bar by, and so where this market's day and every bar above the
+    # chart begin (`InstrumentSpec.server_offset`, his rule of 30/09). A fact about the data, which
+    # is why it lives with the instrument and not with a strategy. The migration that added it
+    # filled the rows it found with the three hours measured on every stored series; the collector
+    # states its own on every write (`upsert_instruments`). A row built by hand gets what a
+    # hand-built `InstrumentSpec` gets — zero, a broker on UTC — and no server default, so SQL
+    # that forgets the column is refused rather than handed a clock.
+    server_offset: Mapped[dt.timedelta] = mapped_column(
+        Interval, nullable=False, default=dt.timedelta(0)
+    )
 
     created_at: Mapped[dt.datetime] = _created_at()
     updated_at: Mapped[dt.datetime] = mapped_column(
@@ -186,6 +391,170 @@ class Instrument(Base):
         CheckConstraint("tick_value > 0", name="tick_value_positive"),
         CheckConstraint("contract_size > 0", name="contract_size_positive"),
         CheckConstraint("digits BETWEEN 0 AND 10", name="digits_range"),
+        # Unlike the three above, zero is *allowed*: a broker genuinely can quote a
+        # zero spread on some instruments. Negative is not — a spread is a magnitude,
+        # and a negative one would credit the account for trading.
+        CheckConstraint(
+            "default_spread_points IS NULL OR default_spread_points >= 0",
+            name="default_spread_points_non_negative",
+        ),
+        CheckConstraint("price_step IS NULL OR price_step > 0", name="price_step_positive"),
+        # A clock is a timezone: within fourteen hours of UTC (`MAX_SERVER_OFFSET`).
+        CheckConstraint(
+            "server_offset BETWEEN interval '-14 hours' AND interval '14 hours'",
+            name="server_offset_is_a_clock",
+        ),
+        # One broker's ticker is one instrument here (ADR-0032); the same ticker at two brokers
+        # is two rows, under two internal names.
+        UniqueConstraint("broker_id", "broker_symbol"),
+        # A ticker without a broker would name nothing.
+        CheckConstraint(
+            "broker_symbol IS NULL OR broker_id IS NOT NULL", name="broker_symbol_needs_a_broker"
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Broker symbols — a snapshot of what the account can see today                 #
+# --------------------------------------------------------------------------- #
+
+
+class BrokerSymbol(Base):
+    """One line of the broker's own catalogue, as MT5 last reported it.
+
+    ⚠️ **Deliberately not `Instrument`, and the split is the whole point of the table.**
+    `Instrument` is what *this system* knows and prices: it carries `tick_value` and
+    `contract_size`, it is what a `Backtest` and a `Dataset` point at with `ondelete="RESTRICT"`,
+    and a row there means somebody catalogued that symbol on purpose. This is a *photograph of
+    an account* — what the broker happens to offer right now, most of it never collected and
+    most of it never traded.
+
+    Folding the two together would make switching brokers destructive. The same terminal that
+    listed 9550 symbols with AAPL in it now lists 84 of forex and CFDs (measured 19/08/2026,
+    after the account changed), and a sync that owned `instruments` would have had to delete
+    rows that still have Parquet on disk and backtests pointing at them. Separate, a sync is
+    free to replace the whole table, because nothing points at it.
+
+    Not written by the API, which cannot reach MetaTrader at all (ADR-02, and the wheel does
+    not exist on Linux). Written by the host agent, read by `/symbols/search`.
+    """
+
+    __tablename__ = "broker_symbols"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+
+    # What the terminal calls it in a human sentence, and where it files it in its tree
+    # ("Forex\\Majors\\EURUSD"). The path is how the collector already infers an asset class,
+    # so keeping it lets the screen group results without a second round trip to the host.
+    description: Mapped[str | None] = mapped_column(String(256))
+    path: Mapped[str | None] = mapped_column(String(256))
+
+    digits: Mapped[int | None] = mapped_column(SmallInteger)
+
+    # Whether the symbol is in Market Watch. ⚠️ Kept for display only: measured on this
+    # broker, a *hidden* symbol answers `symbols_get(group=...)` and hands over history just
+    # like a visible one, so this must never be used to filter search results — it would hide
+    # 74 of 84 symbols for no reason. It matters to the live loop, which does have to select a
+    # symbol before watching it.
+    # ⚠️ Both defaults fire at **write** time, and neither at construction. `default` is what
+    # SQLAlchemy sends on an INSERT that omits the column; `server_default` is the DDL that
+    # covers a row inserted by anything else. So `BrokerSymbol(symbol="X")` has
+    # `visible = None` until it is flushed, which the `Mapped[bool]` annotation does nothing to
+    # prevent — a trap only a test that builds rows by hand ever meets, since every row this
+    # code reads came back from a NOT NULL column.
+    visible: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
+    # ⚠️ Which broker this row came from, on every row rather than in a one-row side table.
+    # A sync replaces the whole snapshot inside one transaction, so denormalising cannot drift
+    # — and it lets the screen say "84 symbols from MetaQuotes-Demo, synced 5 minutes ago"
+    # instead of showing a list with no provenance. A user who switched accounts and forgot is
+    # exactly the person a stale list would mislead.
+    server: Mapped[str | None] = mapped_column(String(64))
+    synced_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        # ⚠️ `varchar_pattern_ops`, because the only query this table answers is a prefix
+        # match. Under a non-C collation a plain btree cannot serve `LIKE 'EUR%'` and Postgres
+        # falls back to a sequential scan — an index that looks present and does nothing. It
+        # would never be noticed either, because at this table's size the scan is fast.
+        #
+        # Spelled with `postgresql_ops` rather than as a text expression so alembic can compare
+        # it: an operator clause inside an expression makes the drift check warn and skip,
+        # which is a check that reports green about something it did not look at.
+        Index(
+            "ix_broker_symbols_symbol_prefix",
+            "symbol",
+            postgresql_ops={"symbol": "varchar_pattern_ops"},
+        ),
+    )
+
+
+class SymbolHistory(Base):
+    """What one (symbol, timeframe) can offer, and what is bounding the answer.
+
+    Written by the host agent, which is the only process that can ask MetaTrader; read by the
+    screen so somebody can size a backtest window before committing to a collection.
+
+    ⚠️ **Three bounds, kept apart on purpose.** A single "available from" date would be four
+    different claims wearing one hat, and a reader can only act on the one that binds them: the
+    terminal's ceiling is fixed in a settings dialog, the filler floor by starting later, the
+    cost floor by not trusting old costs at all. Measured on EURUSD D1 they are 1971, 1972 and
+    2009 - three answers to what looks like one question.
+
+    No foreign key, for the same reason `broker_symbols` has none: a probe is about a symbol
+    *name*, and both the snapshot beside it and the instruments table are free to be replaced
+    under it when the account changes broker.
+    """
+
+    __tablename__ = "symbol_history"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    oldest: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    """The oldest bar the terminal will hand over. NULL when it has none at all."""
+
+    bar_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Positions the series holds, **including the bar still forming**.
+
+    ⚠️ Counted the way `maxbars` counts, so the two are comparable. Storing closed bars
+    instead would leave every capped series one short of its own ceiling and reading as uncapped.
+    """
+
+    terminal_maxbars: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    bar_count_is_a_ceiling: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    """⚠️ True when `bar_count` is the probe's own bound rather than the data's - seen for
+    real at exactly 10,000,000 once this machine's `maxbars` was raised. Without the flag that
+    number is indistinguishable from a measurement."""
+
+    last_fabricated: Mapped[int | None] = mapped_column(SmallInteger)
+    """The most recent year still holding bars nobody traded, or NULL if none does.
+
+    ⚠️ Not "when the instrument became real", which the bars cannot say: EURUSD's
+    fabricated bars stop in 1973 and the euro dates from 1999.
+    """
+
+    first_measured_cost: Mapped[int | None] = mapped_column(SmallInteger)
+    """The first year whose spread varied rather than being one number typed across it."""
+
+    probed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        # One row per question asked. A re-probe updates it rather than appending a second,
+        # contradictory account of the same series - the same rule `datasets` follows.
+        UniqueConstraint("symbol", "timeframe"),
+        _timeframe_check(),
+        CheckConstraint("bar_count >= 0", name="bar_count_non_negative"),
+        CheckConstraint("terminal_maxbars >= 0", name="terminal_maxbars_non_negative"),
     )
 
 
@@ -231,6 +600,174 @@ class Dataset(Base):
         CheckConstraint("date_to >= date_from", name="date_range"),
         CheckConstraint("candle_count >= 0", name="candle_count_non_negative"),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Stock splits — the events a share's stored history is adjusted for            #
+# --------------------------------------------------------------------------- #
+
+
+class StockSplit(Base):
+    """A share split (or reverse split, or bonus issue) its stored bars are adjusted for.
+
+    ⚠️ **Why this exists (14/10).** Tradeview hands over US shares' history *unadjusted*: on
+    AMZN's 20-for-1 of June 2022 its price falls from 2 446 to 125 between two bars, and a position
+    held across it took a -500 R "loss" that never happened. Ten of these across eight shares
+    were found by the gap they leave. The collector divides every bar before `effective_on` by the
+    ratio when it writes them, so every reader — the engine, the ML features, the charts, the
+    workers on other machines — sees one continuous series and none of them has to know.
+
+    ⚠️ **Only for a broker that sends raw history.** XP's Brazilian shares come already adjusted
+    (splits *and* dividends); registering one of their splits would divide the history twice. The
+    collector refuses a split its own bars show no gap for.
+
+    `shares_after` for `shares_before`: 20 for 1 is a split, 1 for 10 a reverse split, 11 for 10 a
+    10 % bonus issue. Kept as two integers, not one decimal, because a 3-for-1 is not a decimal.
+    """
+
+    __tablename__ = "stock_splits"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    # RESTRICT, as `datasets`: the split describes bars on disk, and the instrument is not
+    # deleted while a record of how its files were rewritten still points at it.
+    instrument_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    effective_on: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    """The first trading day at the new price (the ex-date), on the broker's server clock — the
+    day whose daily bar opens at the new price. Every bar before that day's midnight is adjusted."""
+    shares_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    shares_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        # One event per share per day: two would be the same split told twice.
+        UniqueConstraint("instrument_id", "effective_on"),
+        CheckConstraint("shares_after > 0 AND shares_before > 0", name="split_shares_positive"),
+        # N for N changes nothing — a row that would adjust by one is a typo.
+        CheckConstraint("shares_after <> shares_before", name="split_changes_the_count"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Collections — one request to go and fetch history                             #
+# --------------------------------------------------------------------------- #
+
+
+class Collection(Base):
+    """One request to download a symbol's history, and what became of it.
+
+    Separate from `datasets` because the two answer different questions. `datasets` says
+    **what exists** — one row per (instrument, timeframe), overwritten every time the picture
+    changes. This says **what was asked for, by whom, and how it went**, one row per request,
+    kept afterwards. Collapsing them would mean a failed collection either erasing the
+    catalogue's account of the data already on disk, or leaving no trace at all.
+
+    ⚠️ **The row exists before the work does, and that is the point.** The API returns 202 and
+    an id; the host agent picks the job up seconds or minutes later. Without a row written at
+    request time there is nothing for `GET /collections/{id}` to answer with, and the screen
+    could not tell "queued behind another job" from "the agent is not running" — which are the
+    two states a person most needs to tell apart when nothing appears to be happening.
+    """
+
+    __tablename__ = "collections"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    # No foreign key to `instruments`, on purpose and for the same reason `broker_symbols` has
+    # none: a collection is *how a symbol gets into that table*. Requiring the row to exist
+    # first would make the first collection of any new symbol impossible to record.
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The broker's ticker to ask the terminal for, when it is not `symbol` (ADR-0032): `WIN$`
+    # collected as `WIN`. Null asks for `symbol` itself — or the instrument's own ticker.
+    broker_symbol: Mapped[str | None] = mapped_column(String(32))
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    """What was **asked for**, which is not what was found.
+
+    ⚠️ Kept apart from the coverage in `datasets` deliberately. Asking for 2015 on a symbol
+    listed in 2018 is an ordinary request with an ordinary answer, and a row that stored only
+    the outcome could never explain why a window came back shorter than the one on screen.
+    """
+
+    asset_class: Mapped[AssetClass | None] = mapped_column(_enum(AssetClass, "asset_class"))
+    """The class the requester supplied, or NULL when the symbol's path already said.
+
+    ⚠️ NULL means *the path decided*, not *nobody knows*. Measured on this broker: 24 of its 84
+    symbols file under `CFDs`, `Crypto Currency` or `Metals`, and `classify.asset_class_from_path`
+    refuses to guess at three of those roots — so the screen asks, and the answer lands here as
+    provenance for a value that a person, not a string, decided.
+    """
+
+    status: Mapped[BacktestStatus] = mapped_column(
+        _enum(BacktestStatus, "collection_status"),
+        nullable=False,
+        default=BacktestStatus.QUEUED,
+    )
+    """Reusing the runs' state machine, exactly as `walk_forwards` does: the same four states
+    for the same reasons, and a second vocabulary would buy nothing but a translation table."""
+
+    years_done: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    years_total: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    """Progress in the unit the work is actually done in.
+
+    ⚠️ Two integers rather than one fraction, because 0.6 is not a sentence. A download is cut
+    at calendar years (`collect.year_slices`), so "3 of 5 years" is both what happened and what
+    a person can read — and a percentage would have to be un-computed to say it.
+    """
+
+    candles: Mapped[int | None] = mapped_column(Integer)
+    gaps: Mapped[int | None] = mapped_column(Integer)
+    """How many interruptions the finished series holds. NULL until it finishes.
+
+    ⚠️ Counted over the **whole** collected window rather than per year. A gap that straddles
+    New Year — a holiday closure, the commonest kind there is — falls in no single slice, so
+    summing per-slice counts would report a number that is always slightly too small and never
+    obviously wrong.
+    """
+
+    error: Mapped[str | None] = mapped_column(Text)
+
+    requested_at: Mapped[dt.datetime] = _created_at()
+    started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # Newest first is the only order this is ever listed in, and the id is a UUID, so
+        # there is no implicit ordering to fall back on.
+        Index("ix_collections_requested_at", "requested_at"),
+        _timeframe_check(),
+        CheckConstraint("date_to >= date_from", name="date_range"),
+        CheckConstraint("candles IS NULL OR candles >= 0", name="candles_non_negative"),
+        CheckConstraint("gaps IS NULL OR gaps >= 0", name="gaps_non_negative"),
+        CheckConstraint("years_done >= 0", name="years_done_non_negative"),
+        CheckConstraint("years_done <= years_total", name="years_done_within_total"),
+    )
+
+
+class BacktestCollection(Base):
+    """One run waiting for one collection (`rev_0019`).
+
+    ⚠️ **The wait is a row, and it stays.** A run told to collect first is enqueued like any
+    other; the worker asks this table what it is waiting for and defers itself while any of them
+    is still downloading. **A failed one ends the wait, not the run** (his rule of 22/09, which
+    replaced "half a window is a different measurement"): the run reads what is on disk, and this
+    row is what lets every screen say which download failed. Removing the row on completion would
+    make both questions depend on rows disappearing under them, and would erase why a run started
+    ten minutes after it was created.
+    """
+
+    __tablename__ = "backtest_collections"
+
+    backtest_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("backtests.id", ondelete="CASCADE"), primary_key=True
+    )
+    collection_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("collections.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[dt.datetime] = _created_at()
 
 
 # --------------------------------------------------------------------------- #
@@ -298,6 +835,127 @@ class Strategy(Base):
 # --------------------------------------------------------------------------- #
 
 
+class Basket(Base):
+    """One strategy launched over several symbols at once, to ask whether it travels.
+
+    A strategy that works on exactly one instrument is a strategy fitted to that
+    instrument's history. This table exists so that suspicion has an experiment: same
+    strategy, same window, same capital, N markets, results side by side.
+
+    **It groups runs; it is not a run.** Each symbol executes as its own `Backtest`,
+    untouched — the engine holds one instrument and one position per run by construction
+    (`loop._reject_foreign_symbol`, `Portfolio._open`), and a basket deliberately does not
+    challenge that. A shared-capital portfolio, where positions compete for one account,
+    is a different product answering a different question, and it would need the engine
+    rewritten at its most invariant-heavy point.
+
+    ⚠️ **Consequence worth stating where the data lives:** every run starts with the full
+    `initial_capital`, so the runs of a basket cannot be added up. Four runs of $10 000 are
+    neither a $10 000 account nor a $40 000 one. What a basket reports is *dispersion*
+    across markets, never a combined account curve — see `routers/baskets`.
+
+    No `cost_model` column, and the absence is the design. Each run is charged that
+    instrument's own measured spread (PR-226), so the basket has no single cost to store;
+    the concrete model lands on each `Backtest` row, which is what keeps each one
+    independently reproducible.
+    """
+
+    __tablename__ = "baskets"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    # `passive_deletes="all"`: the FK is ON DELETE SET NULL, and Postgres is the one that
+    # should apply it. Left to itself SQLAlchemy would load every run to NULL its column
+    # one by one — and, worse, would do so even when the database's rule says otherwise.
+    backtests: Mapped[list[Backtest]] = relationship(back_populates="basket", passive_deletes="all")
+
+    __table_args__ = (
+        _timeframe_check(),
+        CheckConstraint("date_to >= date_from", name="date_range"),
+        CheckConstraint("initial_capital > 0", name="initial_capital_positive"),
+    )
+
+
+class Study(Base):
+    """One strategy launched over a grid of its own parameters, to see the shape of the result.
+
+    The sibling of `Basket`, and the pair is the point: a basket varies the **market** and
+    holds the parameters still; a study varies the **parameters** and holds the market still.
+    Both exist because one number from one run cannot tell a method apart from a lucky corner,
+    and they attack that from the two directions available.
+
+    **It groups runs; it is not a run.** Each point of the grid executes as its own `Backtest`
+    against its own stored `Strategy` — so a run still answers "what did I execute?" by
+    pointing at one immutable document, exactly as every other run in the system does. The
+    alternative, one strategy plus a per-run override, would put that answer in two places
+    joined by merge logic, and nothing would raise the day they disagreed.
+
+    ⚠️ **What this table cannot do, and it is the reason the next PR exists.** A grid finds the
+    best point *in the data it searched*. That is not a prediction; it is a description, and
+    the wider the grid the more of it is description of noise. Reading the maximum of a
+    hundred runs as "the parameters to trade" is the central mistake this whole feature makes
+    easy, which is why the read side reports dispersion beside the best point and says the
+    best point is in-sample. Walk-forward (PR-204) is what turns a study into evidence: train
+    on one window, *test* on the next, and see whether the choice survives being made blind.
+
+    No `cost_model` column, and the absence is deliberate — same as `Basket`. The concrete
+    model lands on each `Backtest` row, which is what keeps every point independently
+    reproducible. Here the points do share one model by construction, since they are written
+    in a single transaction from a single request; storing it twice would create a second
+    place for it to be true.
+    """
+
+    __tablename__ = "studies"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+    )
+    instrument_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+    grid: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """The axes as declared: `{"setup.params.period": [5, 9, 20], ...}`, in order.
+
+    Kept because it is **not recoverable from the runs**. Each point's values survive as text
+    inside its strategy's name, and reading a heatmap's axes back out of parsed names is the
+    kind of reconstruction that works right up until a value contains a comma.
+    """
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    backtests: Mapped[list[Backtest]] = relationship(back_populates="study", passive_deletes="all")
+
+    __table_args__ = (
+        _timeframe_check(),
+        CheckConstraint("date_to >= date_from", name="date_range"),
+        CheckConstraint("initial_capital > 0", name="initial_capital_positive"),
+        # A study that varies nothing is a backtest. Enforced here as well as in the router
+        # because a row with an empty grid claims an experiment and describes none.
+        CheckConstraint(
+            "jsonb_typeof(grid) = 'object' AND grid <> '{}'::jsonb", name="grid_not_empty"
+        ),
+    )
+
+
 class Backtest(Base):
     """One run of one strategy version over one instrument and period.
 
@@ -312,12 +970,47 @@ class Backtest(Base):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
 
+    # Indexed, because Postgres does not index a foreign key for you — only the referenced
+    # side gets one, from its primary key. "Which runs used this strategy?" is what the
+    # strategy listing asks to leave out the strategies a grid generated, and without this it
+    # is a sequential scan of every run ever made, once per strategy.
     strategy_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     instrument_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
     )
+
+    # Nullable, and it stays nullable: a run launched on its own belongs to no basket, which
+    # is the truth for every row made before baskets existed and for every single-symbol run
+    # made after. Not a gap waiting to be backfilled.
+    #
+    # SET NULL, not CASCADE. Deleting the grouping must not delete the measurements — "I no
+    # longer care about this comparison" is not "destroy four backtests and their trades".
+    basket_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("baskets.id", ondelete="SET NULL"), index=True
+    )
+    basket: Mapped[Basket | None] = relationship(back_populates="backtests")
+
+    # The other grouping, on the same terms. A run belongs to no study unless a grid produced
+    # it, and the two columns are independent: a run carrying both would be one point of a
+    # grid that was also launched across markets, which is a coherent thing to want rather
+    # than a state to forbid.
+    study_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("studies.id", ondelete="SET NULL"), index=True
+    )
+    study: Mapped[Study | None] = relationship(back_populates="backtests")
+
+    # The third, and the one that can sit beside either of the others. A sweep is a basket and a
+    # study at once — several catalogue entries, over several timeframes, over several markets —
+    # so a run it produced is genuinely a member of all of those questions. Independent columns
+    # rather than one `group_id` with a kind, because a run belonging to a sweep *and* nothing
+    # else is the common case and a discriminator would make every reader ask which kind first.
+    sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), index=True
+    )
+    sweep: Mapped[Sweep | None] = relationship(back_populates="backtests")
+
     timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
 
     date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -336,10 +1029,54 @@ class Backtest(Base):
     )
     error: Mapped[str | None] = mapped_column(Text)
     engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    instrument_spec: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    """The instrument as this run first executed it — tick size, tick value, contract, digits —
+    written by the worker and read back on every later execution of the row (`rev_0031`).
+
+    ⚠️ **Why it is kept (25/09).** A pair quoted outside USD has a tick value that is the exchange
+    rate on the day the collector last read the symbol, and a later collection rewrites it: the
+    same run executed again then gave the same trades and another amount of money. Null for a
+    run executed before this; a run that never started has none yet."""
+
+    recorded: Mapped[Recorded] = mapped_column(
+        _enum(Recorded, "backtest_recorded"),
+        nullable=False,
+        default=Recorded.FULL,
+        server_default=Recorded.FULL.value,
+    )
+    """What this run kept — see `Recorded`. Meaningful once it is `done`; `full` before that, which
+    is what every run recorded before 2026-09-23 was."""
+
+    reused_from: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="SET NULL"), index=True
+    )
+    """The finished run this one is a copy of (`rev_0037`, 28/09): the same measurement under the
+    same engine, taken instead of run again (`reuse`). Null for a run that ran."""
+
+    @property
+    def targets(self) -> dict[str, Any] | None:
+        """The target ladder this run scored (`BacktestMetrics.targets`), or `None` before it has
+        results. A read-through for the API's `BacktestOut`, which is built from the run."""
+        return None if self.metrics is None else self.metrics.targets
 
     created_at: Mapped[dt.datetime] = _created_at()
     started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # What the run actually ate, as opposed to what it was asked for. `date_from`/`date_to`
+    # are a *request*; the dataset underneath may start later or end earlier, and then the
+    # run silently covers less ground than its own row claims. Asking for two years and
+    # backtesting five months is not a small discrepancy — it is a different experiment,
+    # and without these columns nothing in the system can tell the two apart afterwards.
+    #
+    # Nullable because a run that failed never got as far as reading a candle, and because
+    # every row that existed before this column did is honestly unknown, not zero.
+    candles_seen: Mapped[int | None] = mapped_column(Integer)
+    first_candle: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_candle: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    # The bars read before the window to warm the run up (ADR-0030, rev_0038): traded on, never
+    # booked. Null for a run recorded before; fewer than asked when the history is shorter.
+    warmup_bars: Mapped[int | None] = mapped_column(Integer)
 
     # `passive_deletes=True` pairs with ON DELETE CASCADE: Postgres removes the children
     # in one statement. Without it, SQLAlchemy would load every trade of the run into
@@ -351,6 +1088,21 @@ class Backtest(Base):
     trades: Mapped[list[Trade]] = relationship(
         back_populates="backtest", cascade="all, delete-orphan", passive_deletes=True
     )
+    waiting_for: Mapped[list[Collection]] = relationship(
+        secondary="backtest_collections",
+        order_by="Collection.date_from",
+        viewonly=True,
+    )
+    """The downloads this run was told to wait for (`rev_0019`), oldest window first.
+
+    ⚠️ **View-only.** The link rows are written by the launch, in the same transaction as the
+    run; letting this relationship write them too would give the same fact two authors.
+
+    ⚠️ **Loaded lazily, and eagerly only where it is served.** Two readers want it — the worker,
+    deciding whether to start, and `GET /backtests/{id}`, saying what the wait is for — while
+    every other read of a run (the log, a basket, a sweep, a walk-forward) would pay a second
+    query for a list it never renders. The run detail asks for it with `selectinload`.
+    """
 
     __table_args__ = (
         _timeframe_check(),
@@ -364,8 +1116,29 @@ class Backtest(Base):
         CheckConstraint(
             "finished_at IS NULL OR finished_at >= started_at", name="finished_after_started"
         ),
+        # A run that saw candles must say which ones, and a run that saw none must not
+        # claim a range. Half-filled provenance is worse than none: it reads as authoritative.
+        CheckConstraint(
+            "(candles_seen IS NULL AND first_candle IS NULL AND last_candle IS NULL)"
+            " OR (candles_seen > 0 AND first_candle IS NOT NULL AND last_candle IS NOT NULL"
+            " AND last_candle >= first_candle)",
+            name="candle_provenance_complete",
+        ),
         # The worker polls for work by status; without this it seq-scans the table.
+        CheckConstraint(
+            "instrument_spec IS NULL OR jsonb_typeof(instrument_spec) = 'object'",
+            name="an_instrument_spec_is_an_object",
+        ),
         Index("ix_backtests_status_created_at", "status", "created_at"),
+        # The worker's question before every run (`reuse`): has this measurement been made?
+        Index(
+            "ix_backtests_measurement",
+            "strategy_id",
+            "instrument_id",
+            "timeframe",
+            "date_from",
+            "date_to",
+        ),
     )
 
 
@@ -418,7 +1191,54 @@ class BacktestMetrics(Base):
 
     # The equity curve is a time series, read whole and never queried by element —
     # a JSONB array, not ten thousand rows in a table nobody joins against.
-    equity_curve: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    # `NULL` is "not kept" (`Recorded`), never "empty": a sweep's run computes its curve — the
+    # drawdown and the CAGR above come from it — and does not store it. `[]` would claim a run
+    # that saw no bars.
+    equity_curve: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+
+    # What the run's trades would have made at each target of the ladder (2026-09-23), in R net of
+    # costs: `{"2": {"trades": 40, "hits": 17, "net_r": "3.4", ...}, "3": null, ...}`. Computed by
+    # the worker from the trades **while they are in memory**, because a sweep's losing run does not
+    # keep them — and a run that loses without a target may win with one. A rung is null when some
+    # trade cannot answer it (`excursion.target_ladder`); the column is null for every run recorded
+    # before this, and for none after.
+    targets: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    # The run's risk and stability in R (2026-09-25, `r_metrics`): computed by the worker from the
+    # trades while they are in memory, for every run — a sweep's loser keeps no trades, and it is
+    # the runs a selection is judged against. All null for a run recorded before this; for one
+    # after, only `positive_year_share` can be null (fewer than two years with a trade).
+    net_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    max_drawdown_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    losing_streak: Mapped[int | None] = mapped_column(Integer)
+    losing_streak_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    positive_year_share: Mapped[Decimal | None] = mapped_column(RATIO)
+    # The close at which the equity first reached zero or below (rev_0046, 02/10): the account
+    # was ruined there and no order could be sized after it. Null for a run that never was, and
+    # for every run recorded before — none of which reached zero, or it could not be recorded.
+    ruined_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    # `{"2019": "3.25", ...}` — R per calendar year of entry, for the years that had a trade.
+    yearly_r: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # `{"2019-03": "1.5", ...}` — R per calendar month of entry, and the share of those months that
+    # ended above zero (rev_0049, 05/10). Null for every run recorded before; the share also for a
+    # run with fewer than six months with a trade (`r_metrics.MIN_MONTHS_FOR_SHARE`).
+    monthly_r: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    positive_month_share: Mapped[Decimal | None] = mapped_column(RATIO)
+    # `{"2019": {"2019": "2.5", "2020": "-1"}, ...}` — R by year of entry, then year of exit
+    # (ADR-0030, rev_0038): what a longer run gives a window of whole years. Null before 28/09.
+    r_by_years: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # `{"2019": {"equity_at_start": "10000", "smallest_volume": "0.05"}, ...}` — per calendar year
+    # of the window, the equity the run held when the year opened and the smallest lot it entered at
+    # (null in a year with no trade); with `sizing_refusals`, the signals it turned away for a lot
+    # of zero (rev_0039, `year_cut`). What says whether cutting `r_by_years` gives what a run of the
+    # cut would. Null before 29/09.
+    sizing_by_years: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    sizing_refusals: Mapped[int | None] = mapped_column(Integer)
+    # `{"2019": {"2019": 12, "2020": 1}, ...}` — how many trades make each cell of `r_by_years`
+    # (01/10, rev_0043): what a cut gives a trade floor to stand on (`year_cut`, the walk-forward by
+    # cut). ⚠️ The trades with an R only — the ones `r_by_years` sums; a trade with no stop is in
+    # `total_trades` and in no cell. Null before 01/10.
+    trades_by_years: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     backtest: Mapped[Backtest] = relationship(back_populates="metrics")
 
@@ -430,8 +1250,51 @@ class BacktestMetrics(Base):
         CheckConstraint("total_trades >= 0", name="total_trades_non_negative"),
         CheckConstraint("win_rate BETWEEN 0 AND 1", name="win_rate_is_a_fraction"),
         CheckConstraint("max_drawdown_abs >= 0", name="max_drawdown_abs_non_negative"),
-        CheckConstraint("max_drawdown_pct BETWEEN 0 AND 1", name="max_drawdown_pct_is_a_fraction"),
+        # Above 1 for an account that went below zero (rev_0046): a crypto spread wider than an M5
+        # stop lost more than the account in one trade, and the CHECK turned the run into a
+        # failure instead of the ruin it was. `ruined_at` names those runs.
+        CheckConstraint("max_drawdown_pct >= 0", name="max_drawdown_pct_non_negative"),
         CheckConstraint("max_dd_duration_days >= 0", name="max_dd_duration_non_negative"),
+        CheckConstraint(
+            "max_drawdown_r IS NULL OR max_drawdown_r >= 0", name="max_drawdown_r_non_negative"
+        ),
+        CheckConstraint(
+            "losing_streak IS NULL OR losing_streak >= 0", name="losing_streak_non_negative"
+        ),
+        CheckConstraint(
+            "losing_streak_r IS NULL OR losing_streak_r <= 0", name="losing_streak_r_non_positive"
+        ),
+        CheckConstraint(
+            "positive_year_share IS NULL OR positive_year_share BETWEEN 0 AND 1",
+            name="positive_year_share_is_a_fraction",
+        ),
+        CheckConstraint(
+            "yearly_r IS NULL OR jsonb_typeof(yearly_r) = 'object'", name="yearly_r_is_an_object"
+        ),
+        CheckConstraint(
+            "monthly_r IS NULL OR jsonb_typeof(monthly_r) = 'object'",
+            name="monthly_r_is_an_object",
+        ),
+        CheckConstraint(
+            "positive_month_share IS NULL OR positive_month_share BETWEEN 0 AND 1",
+            name="positive_month_share_is_a_fraction",
+        ),
+        CheckConstraint(
+            "r_by_years IS NULL OR jsonb_typeof(r_by_years) = 'object'",
+            name="r_by_years_is_an_object",
+        ),
+        CheckConstraint(
+            "sizing_by_years IS NULL OR jsonb_typeof(sizing_by_years) = 'object'",
+            name="sizing_by_years_is_an_object",
+        ),
+        CheckConstraint(
+            "sizing_refusals IS NULL OR sizing_refusals >= 0",
+            name="sizing_refusals_non_negative",
+        ),
+        CheckConstraint(
+            "trades_by_years IS NULL OR jsonb_typeof(trades_by_years) = 'object'",
+            name="trades_by_years_is_an_object",
+        ),
     )
 
 
@@ -463,8 +1326,15 @@ class Trade(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
-    backtest_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("backtests.id", ondelete="CASCADE"), nullable=False
+    # ⚠️ **Exactly one of these two is set** — the CHECK below, not a convention. Both were once
+    # one NOT NULL column; rev_0012 relaxed it, which is the migration this docstring predicted
+    # in phase 0. A trade with two parents or none is a row nobody can attribute, and every
+    # metric that reads this table would still count it.
+    backtest_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="CASCADE")
+    )
+    live_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("live_sessions.id", ondelete="CASCADE")
     )
     instrument_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
@@ -483,19 +1353,51 @@ class Trade(Base):
     exit_price: Mapped[Decimal | None] = mapped_column(PRICE)
     exit_reason: Mapped[ExitReason | None] = mapped_column(_enum(ExitReason, "exit_reason"))
 
+    # The stop the trade was **sized against** — the level it opened with, not the one it
+    # closed at. A strategy that trails its stop (ADR-0018) exits at a level this column never
+    # saw, so `exit_reason = 'sl'` with `exit_price != stop_loss` is correct, not a bug. It is
+    # this number that `r_multiple` divides by, and the two have to come from the same stop.
     stop_loss: Mapped[Decimal | None] = mapped_column(PRICE)
     take_profit: Mapped[Decimal | None] = mapped_column(PRICE)
 
     gross_pnl: Mapped[Decimal | None] = mapped_column(MONEY)
     costs: Mapped[Decimal | None] = mapped_column(MONEY)
     net_pnl: Mapped[Decimal | None] = mapped_column(MONEY)
+    swap: Mapped[Decimal] = mapped_column(MONEY, nullable=False, server_default="0")
+    """What holding it overnight came to, **signed** — negative charged, positive paid
+    (`rev_0025`). Part of `net_pnl`; apart from `costs`, which is a magnitude."""
     r_multiple: Mapped[Decimal | None] = mapped_column(RATIO)
+
+    # How far the trade went, both ways (2026-09-23): the most and least favourable prices it
+    # provably traded at, and the same distances in R of the stop it was sized against. Read
+    # against the trade when a bar is ambiguous, so the favourable side can only err low — which
+    # is what lets a target be derived from it (`tradeforge_engine.excursion`). NULL is "not
+    # measured": every trade recorded before this, and an R with no stop to divide by.
+    mfe_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    mae_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    mfe_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    mae_r: Mapped[Decimal | None] = mapped_column(RATIO)
 
     context: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
 
-    backtest: Mapped[Backtest] = relationship(back_populates="trades")
+    # The entry's picture: the bars the strategy had seen when it decided, carried on to the
+    # bar that filled the order, plus the rectangles drawn over them. `context` answers "under
+    # what numbers did this fire?"; this answers "did it fire where the method says?" — and
+    # that one is answered by looking, not by aggregating, which is why it is a time series
+    # and lives in its own column rather than as a key `context` readers must learn to skip.
+    #
+    # Written by the engine at the decision and never recomputed. Rebuilding the window later
+    # from the Parquet would mean charting bars that are not necessarily the ones the strategy
+    # saw — the file gets recollected, extended, corrected — and the chart would disagree with
+    # the trade drawn on it with nothing to show for it. Same argument as `candles_seen`.
+    snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+
+    backtest: Mapped[Backtest | None] = relationship(back_populates="trades")
+    live_session: Mapped[LiveSession | None] = relationship(back_populates="trades")
 
     __table_args__ = (
         CheckConstraint("entry_price > 0", name="entry_price_positive"),
@@ -512,6 +1414,1184 @@ class Trade(Base):
         # Costs are a magnitude, and net is gross minus them. Stating it here means no
         # two call sites can disagree about the sign — the same trap as gross_loss above.
         CheckConstraint("costs IS NULL OR costs >= 0", name="costs_non_negative"),
-        CheckConstraint("net_pnl IS NULL OR net_pnl = gross_pnl - costs", name="net_pnl_balances"),
+        CheckConstraint(
+            "net_pnl IS NULL OR net_pnl = gross_pnl - costs + swap", name="net_pnl_balances"
+        ),
+        # Distances, not signed moves: which way is the column's name. A negative one is a sign
+        # error upstream, and a derived target would read it as a trade that never moved.
+        CheckConstraint("mfe_r IS NULL OR mfe_r >= 0", name="mfe_r_non_negative"),
+        CheckConstraint("mae_r IS NULL OR mae_r >= 0", name="mae_r_non_negative"),
         Index("ix_trades_backtest_id_entry_time", "backtest_id", "entry_time"),
+        # `<>` on two booleans is XOR: exactly one parent, never both, never neither.
+        CheckConstraint(
+            "(backtest_id IS NULL) <> (live_session_id IS NULL)", name="exactly_one_parent"
+        ),
+        Index("ix_trades_live_session_id_entry_time", "live_session_id", "entry_time"),
+        # The correlation key a live writer updates by: the row is written when the trade opens
+        # and found again when it closes. The pair is unique because the ledger refuses a second
+        # position and a bar admits one entry — but "is unique" and "cannot be otherwise" are
+        # different claims, and an UPDATE that silently touched two rows would corrupt two trades
+        # instead of failing. Partial, so it asserts nothing about the backtest rows already there.
+        Index(
+            "uq_trades_live_session_entry",
+            "live_session_id",
+            "entry_time",
+            unique=True,
+            postgresql_where=text("live_session_id IS NOT NULL"),
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Live sessions — a run that has not ended                                      #
+# --------------------------------------------------------------------------- #
+
+
+class LiveSession(Base):
+    """One strategy trading forward, on live candles, in paper or (one day) for real.
+
+    **The shape differs from `Backtest` in ways that are not cosmetic.** A backtest has a
+    `date_to`: it ran over a window somebody chose, and the window is part of what the result
+    means. A session has `started_at` and a `last_bar_time` that advances — it has not ended,
+    and "how much has it seen" is a question only it can answer. A backtest's status reaches
+    `done`; a session's reaches `stopped`, which is somebody's decision rather than the data
+    running out.
+
+    ⚠️ **There is no `queued`.** A `Backtest` row exists before the work does, because the work
+    is a job handed to a queue. A session is a *process*: the row appears when something is
+    already running, and a row with nothing behind it would be a lie the panel repeats. That
+    also means a session that dies leaves a `running` row nobody updated — reconciling that is
+    PR-302-C's, and it is why `last_bar_time` exists.
+
+    **`mode` can say `live`, and the database refuses it.** See `SessionMode` and rev_0012: the
+    safeguards of sdd.md §11 do not exist yet, so real trading is gated by a CHECK rather than
+    by a service, and lifting the gate is a migration somebody has to write.
+    """
+
+    __tablename__ = "live_sessions"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    instrument_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+
+    mode: Mapped[SessionMode] = mapped_column(
+        _enum(SessionMode, "session_mode"), nullable=False, server_default=SessionMode.PAPER
+    )
+    status: Mapped[LiveSessionStatus] = mapped_column(
+        _enum(LiveSessionStatus, "live_session_status"),
+        nullable=False,
+        server_default=LiveSessionStatus.RUNNING,
+    )
+
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+    cost_model: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """Which model priced the fills, for the reason `Backtest.cost_model` stores it.
+
+    ⚠️ A paper session runs `BarSpreadCostModel`, whose number comes from **each bar**
+    (ADR-0022) — so this records *which model was plugged in*, and the amounts it charged live
+    in the trades. A session cannot be re-explained from a single spread here, and pretending
+    otherwise is exactly the flattening this column exists to avoid.
+    """
+
+    engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    last_bar_time: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    """The opening instant of the last bar the session **finished**, or NULL before the first.
+
+    ⚠️ Finished, not received. It advances after the engine has processed a bar, so a session
+    killed mid-bar leaves this pointing at the last one it completed — which is precisely what
+    a restart has to compare against the bar Redis re-delivers (`CandleStream` acknowledges
+    lazily, so an interrupted bar comes back). Recording receipt instead would make a bar that
+    was never processed look processed, and the hole would be silent.
+    """
+
+    warmup_bars: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    """How much history the session was driven over before it opened. A fact, not a plan.
+
+    ⚠️ **Not "was it ready".** Indicator warm-up is calculable — with `ADX` needing twice its
+    period, not once — but structure warm-up has no formula at all: measured on this project's
+    own data, the first CHoCH arrives after 38 bars on AUDCAD H1 and after **730** on BTCUSD H1.
+    There is no `N`, so there is no "enough" to store. Seeding takes everything available, which
+    measured at 38 s for a year of M1 and under a second for H1 — cheap enough that no cap earns
+    its complexity, and cheap enough that this number is simply "what there was".
+    """
+
+    started_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    stopped_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    heartbeat_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    """The last time the process said it was alive. NULL before the loop starts.
+
+    ⚠️ **`last_bar_time` cannot answer this**, which is the whole reason the column exists. A
+    session on H4 finishes a bar every four hours, so a four-hour-old stamp is indistinguishable
+    from a dead process — and `status` stays `running` for ever, because the thing that would
+    change it is the thing that died.
+
+    The collector agent already has that failure: arq's health check defaults to 3600 s and does
+    not move when a job completes, so a frozen reading means nothing within the hour
+    (`specs/backlog.md`). A liveness signal that is only true on the scale of hours is worse than
+    none, because it *looks* like a liveness signal.
+    """
+
+    error: Mapped[str | None] = mapped_column(Text)
+
+    trades: Mapped[list[Trade]] = relationship(
+        back_populates="live_session", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+    __table_args__ = (
+        _timeframe_check(),
+        CheckConstraint("initial_capital > 0", name="initial_capital_positive"),
+        CheckConstraint(
+            "stopped_at IS NULL OR stopped_at >= started_at", name="stopped_after_started"
+        ),
+        # A session that failed says why; one that did not, does not claim to have.
+        CheckConstraint("(status = 'failed') = (error IS NOT NULL)", name="error_iff_failed"),
+        CheckConstraint("warmup_bars >= 0", name="warmup_bars_non_negative"),
+        Index("ix_live_sessions_started_at", "started_at"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Walk-forward — the experiment that scores a choice it did not get to see      #
+# --------------------------------------------------------------------------- #
+
+
+class WalkForward(Base):
+    """A study re-asked honestly: choose the parameters on one window, score them on the next.
+
+    `Study` above ends its own docstring by naming the thing it cannot do, and this is that
+    thing. A grid searches and scores on **the same candles**, so its best point is the
+    luckiest arrangement of one sample — and the wider the grid, the luckier. That number is a
+    description of a past. It is not evidence about a future, and no amount of dispersion
+    reported beside it makes it one.
+
+    A walk-forward splits the period into folds. In each fold the entire grid runs over a
+    *training* window, one point is chosen by a stated rule, and **that point alone** runs over
+    the *test* window that follows it. The test window was not searched, so its result is what
+    the method would have returned to somebody making the choice blind. Stitched across folds
+    it answers the only question that matters before risking money.
+
+    **It re-runs a study rather than taking a grid of its own**, which is why the sole input
+    here is `study_id`. The comparison this table exists to support is *"the heatmap said this,
+    the blind choice got that"* — and that comparison is only sound if both used the same grid
+    over the same market. Accepting a grid again would let the two drift apart with nothing
+    able to notice, since a retyped grid that differs by one value still looks like the same
+    experiment.
+
+    ⚠️ **Its own status column, and the reason is that this row can fail on its own.** Every
+    other grouping in this schema (`Basket`, `Study`) is inert: it writes its runs, and each
+    run then succeeds or fails by itself. A walk-forward *decides* — it reads the training
+    metrics, applies `metric`, and creates the test run from the answer. A fold whose training
+    grid finished but whose choice could not be made (every point failed, or none traded) is a
+    state no `backtests` row can express, and silence there would read as a fold that was never
+    reached.
+
+    ⚠️ **The folds share one set of strategies, and that falls out of a PR-203 decision.** A
+    grid point's document contains no symbol and no dates, so the document for `period=9` is
+    byte-identical in every fold; `_strategies_for` reuses the stored row. Six folds over a
+    fifty-point grid is fifty strategies and three hundred runs, not three hundred strategies.
+    """
+
+    __tablename__ = "walk_forwards"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    # RESTRICT, like every other pointer at a study or a strategy: the walk-forward's whole
+    # meaning is "this grid, tested blind", and a row whose grid had been deleted would state a
+    # result about an experiment nobody could describe any more.
+    study_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("studies.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+
+    folds: Mapped[int] = mapped_column(Integer, nullable=False)
+    """How many train→test pairs the period is cut into.
+
+    The knob with the sharpest trade-off in the whole feature, in both directions. Few folds
+    give each test window enough bars for its result to mean something, but too few points to
+    tell a stable parameter from one that wanders. Many folds show the wandering clearly and
+    measure each fold on a sample so short that the wandering could be noise — which is the
+    very failure the experiment was built to expose, reintroduced one level up.
+    """
+
+    train_multiple: Mapped[int] = mapped_column(Integer, nullable=False)
+    """How many times longer the training window is than the test window that follows it.
+
+    Stored rather than derived because it, `folds` and the number of candles are what produced
+    every boundary in `walk_forward_folds`, and a boundary whose reasoning cannot be recovered
+    is a boundary nobody can audit later.
+    """
+
+    anchored: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    """`True`: every fold trains on **all** history before its test window, so the training set
+    grows. `False` (rolling): the training window is a fixed length that slides forward.
+
+    Not a detail — the two ask different questions. Anchored asks *"does everything I know so
+    far predict what comes next?"*, and uses more data each fold, so its later choices are the
+    steadier ones. Rolling asks *"does the recent past predict the near future?"*, which is the
+    honest question if a market's behaviour changes, and it keeps every fold's choice made from
+    a sample of the same size — so the folds are comparable to each other, which anchored's are
+    not.
+    """
+
+    metric: Mapped[SelectionMetric] = mapped_column(
+        _enum(SelectionMetric, "selection_metric"), nullable=False
+    )
+    """The ranking that decides each fold's winner. See `SelectionMetric`."""
+
+    status: Mapped[BacktestStatus] = mapped_column(
+        _enum(BacktestStatus, "walk_forward_status"),
+        nullable=False,
+        default=BacktestStatus.QUEUED,
+    )
+    """Reusing the runs' state machine, deliberately: this row goes through exactly the same
+    four states for exactly the same reasons, and a second vocabulary for `queued → running →
+    done | failed` would be two words for one idea. The enum is stored as VARCHAR + CHECK
+    (`native_enum=False`), so the constraint is this table's own and the two can diverge later
+    without a migration touching both."""
+
+    error: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[dt.datetime] = _created_at()
+    started_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+    fold_rows: Mapped[list[WalkForwardFold]] = relationship(
+        back_populates="walk_forward",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="WalkForwardFold.index",
+    )
+    """Ordered in SQL, and the ordering is not cosmetic. A fold's number *is* its position in
+    time, so folds arriving shuffled would put a later test window before an earlier one and
+    the stitched out-of-sample result would be a different experiment. The same `now()`-per-
+    transaction trap that shuffled a study's points applies here, and this is the fix that
+    costs nothing: the fold carries its own index."""
+
+    __table_args__ = (
+        # One fold is a single train/test split — a useful thing, but not a walk-forward: it
+        # cannot say whether a choice was stable, which is half of what this experiment reports.
+        CheckConstraint("folds >= 2", name="folds_at_least_two"),
+        CheckConstraint("train_multiple >= 1", name="train_at_least_as_long_as_test"),
+        CheckConstraint("status <> 'failed' OR error IS NOT NULL", name="failed_needs_error"),
+        CheckConstraint(
+            "finished_at IS NULL OR started_at IS NOT NULL", name="finished_implies_started"
+        ),
+        CheckConstraint(
+            "finished_at IS NULL OR finished_at >= started_at", name="finished_after_started"
+        ),
+    )
+
+
+class WalkForwardFold(Base):
+    """One train→test pair: the grid that was searched, and the single point that was tested.
+
+    The row records **decisions and boundaries, never results.** Every number a reader wants
+    from a fold — what the winner returned in training, what it returned out of sample, how
+    many trades either took — is already stored on the runs, and copying any of it here would
+    create a second place for it to be true.
+
+    ⚠️ **The training window is not a column, and its absence is the design.** A fold's
+    training grid *is* a `Study` — the same table `POST /studies` writes, over this fold's
+    window — so the window is that study's own `date_from`/`date_to`. Writing it here as well
+    would let a fold claim one window while the runs underneath it executed another. The test
+    window has no such owner at write time (its run does not exist until a winner is known), so
+    it does live here.
+    """
+
+    __tablename__ = "walk_forward_folds"
+
+    # A composite primary key rather than a surrogate id, because the pair *is* the identity:
+    # there is exactly one fold 3 of a given walk-forward, and no other row can be it. It also
+    # makes the ordering above free, since the index is already part of the key.
+    walk_forward_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("walk_forwards.id", ondelete="CASCADE"), primary_key=True
+    )
+    index: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    study_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("studies.id", ondelete="RESTRICT"), nullable=False, unique=True
+    )
+    """The in-sample grid over this fold's training window — a full `Study`, readable through
+    `GET /studies/{id}` with its own heatmap.
+
+    Reused rather than reinvented because that heatmap is the evidence. Fold 1's heatmap beside
+    fold 5's is what over-fitting *looks like*: if the bright region moves every fold, the grid
+    was reading noise, and no summary number states it as plainly as the two pictures do.
+
+    Unique: a study belongs to at most one fold, so the link cannot be quietly shared.
+    """
+
+    test_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    test_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    train_bars: Mapped[int] = mapped_column(Integer, nullable=False)
+    test_bars: Mapped[int] = mapped_column(Integer, nullable=False)
+    """How many candles the splitter counted into each window.
+
+    Stored because the boundaries were cut **by bars and expressed as dates**, and only these
+    two columns preserve the reasoning. A market has holidays, half-days and weekends, so equal
+    stretches of calendar hold wildly unequal amounts of trading; cutting by time would give
+    one fold twice the evidence of its neighbour while the row still read as an even split.
+    These say what was actually counted, so a reader can check the split was even instead of
+    trusting that it was.
+
+    ⚠️ Planned, not observed. What each run *read* is on the run (`candles_seen`), and the two
+    can honestly differ — a training window whose grid all failed reads nothing at all.
+    """
+
+    chosen_strategy_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT")
+    )
+    """The point this fold's training grid selected — null until the fold has been decided.
+
+    Null is also a **terminal** answer, not only a pending one: a fold whose every point failed,
+    or whose every point took no trades, has no winner to name, and the walk-forward reports it
+    as a fold that could not choose rather than inventing one. The two are told apart by the
+    walk-forward's status, not by this column.
+    """
+
+    test_backtest_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="SET NULL"), unique=True
+    )
+    """The out-of-sample run of the chosen point. The number the whole feature exists to
+    produce, stored the same way every other run in the system is stored — as a `Backtest`,
+    reproducible from its own strategy document, openable on the results screen like any other.
+
+    SET NULL, not CASCADE, on the same principle as `backtests.basket_id`: deleting a run must
+    not take the fold's record of what was decided with it.
+    """
+
+    walk_forward: Mapped[WalkForward] = relationship(back_populates="fold_rows")
+
+    study: Mapped[Study] = relationship()
+    """The training grid, reached as an object — this is where the fold's **training window**
+    is read from, since the study's `date_from`/`date_to` are that window and this table
+    deliberately does not copy them.
+
+    No `back_populates`: a `Study` has no business knowing it is part of a fold. Studies exist
+    on their own and predate this table, and a reverse link would have to be nullable on every
+    one of them to describe a relationship most of them are not in.
+    """
+
+    __table_args__ = (
+        CheckConstraint("index >= 0", name="index_non_negative"),
+        CheckConstraint("test_to >= test_from", name="test_range"),
+        # A window is cut by counting candles, so a window of none of them was never cut.
+        CheckConstraint("train_bars > 0 AND test_bars > 0", name="windows_have_bars"),
+        # A test run exists only because a choice was made. The reverse is allowed and happens:
+        # the winner is recorded, then its run is created and executed.
+        CheckConstraint(
+            "test_backtest_id IS NULL OR chosen_strategy_id IS NOT NULL",
+            name="test_run_implies_a_choice",
+        ),
+    )
+
+
+class OrderAudit(Base):
+    """Every order the executor was asked to send, and what became of it. **Append-only.**
+
+    The one table in this schema that exists for a reader who does not trust the others. When a
+    real account loses money the questions are "what was asked for", "what was actually sent",
+    "what did the venue say" and "when" — and every one of them is unanswerable from `trades`,
+    which records the round trips that *worked*. A refused order leaves no trade at all, and a
+    refusal is exactly what somebody investigating needs to see.
+
+    ⚠️ **Append-only is enforced by the database, not by discipline** (rev_0015). A trigger
+    refuses `UPDATE` and `DELETE` outright. An audit trail that depends on nobody making a
+    mistake is not an audit trail: the value of this table is precisely that it cannot be tidied
+    up afterwards, including by the person who has the most reason to want to.
+
+    ⚠️ **The session may be NULL.** An order refused before a session existed — a kill switch
+    engaged at start-up — still has to be recorded, and a foreign key that forced a parent would
+    make the executor choose between writing a false one and writing nothing.
+    """
+
+    __tablename__ = "order_audit"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    live_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("live_sessions.id", ondelete="RESTRICT"), index=True
+    )
+    """⚠️ `RESTRICT`, not `CASCADE`. Deleting a session must not take its audit trail with it —
+    that is the one deletion an audit trail exists to survive."""
+
+    client_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    """The name the strategy gave the order (ADR-0014). What correlates a request to a fill
+    across three processes, and the only handle an investigator has that spans them."""
+
+    status: Mapped[OrderAuditStatus] = mapped_column(
+        _enum(OrderAuditStatus, "order_audit_status"), nullable=False
+    )
+
+    request: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """What was asked for, verbatim, as it arrived off the queue.
+
+    ⚠️ Stored whole rather than projected into columns. A projection records the fields somebody
+    thought of; the question an incident asks is almost always about a field nobody thought of.
+    """
+
+    response: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    """What MT5 answered, verbatim. NULL when nothing was sent — a refusal never reached it."""
+
+    reason: Mapped[str | None] = mapped_column(Text)
+    """Why, when the answer is a refusal. Names the rule (`safety.Verdict.reason`).
+
+    ⚠️ NULL and empty are different statements here. NULL is "no refusal happened"; a string is
+    the rule that refused. Collapsing them would make a successful order and an unexplained
+    refusal read the same.
+    """
+
+    requested_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    """When the executor took the order off the queue. Its own clock, not the core's."""
+
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    """When it stopped being in flight — sent, filled, refused or errored.
+
+    NULL means a row written the instant the order was picked up and never updated, which
+    **cannot happen** while the trigger stands: this table has no updates. A row is written once,
+    when its outcome is already known, and a second row is written for a second outcome.
+    """
+
+    __table_args__ = (
+        CheckConstraint(
+            "(reason IS NULL) <> (status IN ('refused', 'error'))",
+            name="a_refusal_says_why",
+        ),
+        CheckConstraint(
+            "resolved_at IS NULL OR resolved_at >= requested_at",
+            name="audit_resolves_after_it_is_requested",
+        ),
+        Index("ix_order_audit_requested_at", "requested_at"),
+    )
+
+
+class CatalogEntry(Base):
+    """A shelf label: a strategy, a grid to sweep it over, and a name a person wrote.
+
+    **Why this is not a column on `strategies`.** A strategy document is immutable per version
+    and it is the DSL — the engine reads every field of it. A grid is neither: it is a question
+    *about* a document, the engine never sees it, and putting it inside would mean a
+    `schema_version` bump plus a field nulled on every strategy that is not a catalogue entry.
+    The two also disagree about cardinality: one document can be swept by several grids, and
+    `9.1 across every average` and `9.1 across every stop` are two entries over one strategy.
+
+    ⚠️ **The name here is the person's, and the strategy's is not.** `strategies.name` is a
+    generated column projected out of the document (`definition ->> 'name'`), so it is whatever
+    the builder wrote — this project's own database is full of `MME9-20260910-172055`. A
+    catalogue whose labels were those names would be a catalogue nobody can read, which is the
+    observation that produced this table.
+
+    ⚠️ **It pins a version, never a lineage.** A grid is only meaningful against the document it
+    expands: every path in it has to exist there, which `expand` checks. Following the lineage
+    would let an edit to the strategy leave the entry pointing at a document whose paths have
+    moved — and nothing would say so until a launch refused, long after the edit. Pinning costs
+    a deliberate act to move an entry forward, which is the right cost for the thing the whole
+    shelf is addressed by.
+
+    **An empty grid is a valid entry, and it is the common one.** `9.1 sem filtro` is a single
+    document with nothing to vary; `{}` says exactly that, and it needs no second table and no
+    nullable column to say it. What separates a simple entry from a swept one is how many keys
+    the grid has, which is the same fact a launch reads.
+    """
+
+    __tablename__ = "catalog_entries"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    """What the shelf calls it. Unique, because two entries with one name is a catalogue that
+    cannot be spoken about — and the failure that produces is a person running the wrong one."""
+
+    description: Mapped[str | None] = mapped_column(Text)
+    """Optional, and it is the one field here a person may reasonably leave empty. NULL means
+    nobody wrote one, which is different from `''` — see the spread column's argument."""
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+    )
+    """RESTRICT, like every other reference to a strategy here. A catalogue entry is a reason a
+    document must go on existing; deleting it out from under the shelf would leave a label
+    pointing at nothing."""
+
+    grid: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default="{}")
+    """Dotted paths into the document, and the values to try at each — the same shape
+    `studies.grid` holds, because it is the same question asked before it is launched rather
+    than after.
+
+    ⚠️ **Validated against this entry's strategy when it is written**, not when it is run. A grid
+    naming a path the document does not have is not a launch that fails later; it is an entry
+    that was never a coherent thing to save."""
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        # A grid is an object of axes, never a list or a bare value. Written down here because
+        # JSONB will happily store any of those, and the code that expands one would then meet
+        # its first surprise at launch — in a transaction that is already writing runs.
+        CheckConstraint("jsonb_typeof(grid) = 'object'", name="a_grid_is_an_object_of_axes"),
+        # Newest first is how a shelf is read, and it is the only ordering any caller asks for.
+        # Declared here as well as in the migration because the drift test compares the two and
+        # is right to: an index that exists in one and not the other is a plan that changes
+        # depending on how the database was built.
+        Index("ix_catalog_entries_created_at", "created_at"),
+    )
+
+
+class Sweep(Base):
+    """Several catalogue entries, over several timeframes, over several markets — at once.
+
+    **The product a study and a basket each refuse to take.** A study varies the parameters and
+    holds the market still; a basket varies the market and holds the parameters still. Both exist
+    because one number from one run cannot tell a method apart from a lucky corner, and each
+    attacks that from one direction. A sweep takes both directions at once and adds a third, the
+    timeframe — which is what "run every variation I care about" actually means.
+
+    ⚠️ **What this table makes easy is also the mistake it makes easy, and more so than a study
+    does.** A grid of fifty points searched over five markets and three timeframes is seven
+    hundred and fifty measurements, and the best of them is the best of *seven hundred and fifty
+    draws*. Re-running that winner returns the identical number — the engine is deterministic by
+    invariant, measured on this project's own data as three identical runs trade for trade — so
+    a second look at the same window is not a second opinion. The only honest follow-up is data
+    the winner was **not chosen on**: a walk-forward, another market, a reserved window.
+
+    ⚠️ **The timeframe is written into each point's document, not only onto its run.** Since
+    PR-238 a document and its run must agree under a higher-timeframe filter, because the filter
+    is built from the document's own bar width; a sweep that varied only the run's would produce
+    exactly the disagreement that rule exists to refuse. It also makes the documents distinct per
+    timeframe, which is what lets `strategies_for` keep deduplicating them.
+
+    No `instrument_id`, unlike `Study`: the markets are the sweep's own axis and live in
+    `symbols`. No `cost_model` column either, for the reason `Basket` and `Study` give — the
+    concrete model lands on each run, which is what keeps every point independently reproducible.
+    """
+
+    __tablename__ = "sweeps"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    entry_ids: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    """Which catalogue entries were swept, in the order they were asked for.
+
+    ⚠️ **Ids in a document rather than a join table, and it is a deliberate trade.** A join table
+    would let the database refuse a sweep naming an entry that no longer exists — and that is
+    precisely the wrong answer here: an entry is a *label*, removable by design, and a finished
+    sweep must go on being readable after somebody tidies the shelf. What the runs point at is
+    the strategy document, which is immutable and cannot be deleted out from under them."""
+
+    entry_grids: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    """Each entry's grid as this sweep expanded it, keyed by entry id (rev_0040, 29/09).
+
+    An entry's grid can be edited in place since then, and the ids alone would let two sweeps of
+    one template — launched before and after an edit — be combined as one question over two
+    grids. Every view of a sweep reads its own points, never this; it is what `combine` compares.
+    Filled for the sweeps before it from the entries as they stood, which was exact."""
+
+    symbols: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    """The markets, by symbol. Text rather than instrument ids, for the same reason: the sweep
+    records the question that was asked, and the runs record what it resolved to."""
+
+    timeframes: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    """The charts. One is the ordinary case and is not a special case — a list of one."""
+
+    skipped: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default="[]")
+    """The (market, chart) pairs asked for and left out for having no candles in the window
+    (`rev_0020`): `symbol`, `timeframe`, and `covers` — what the index held then, or null.
+
+    ⚠️ **The only record of a hole in the map.** `symbols` and `timeframes` are what was asked,
+    and a pair with no runs can also be one whose every point the DSL refused. Without this
+    column the two absences read the same, and a skipped pair passes for a measured one."""
+
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+    holdout_of: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    """The sweep whose best points this one tests on a window they were not chosen on, or null
+    for an ordinary sweep (`rev_0024`). Null too once that sweep is deleted: the test's runs are
+    measurements of their own, and what the deletion costs is the comparison."""
+
+    template_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweep_templates.id", ondelete="SET NULL"), nullable=True
+    )
+    """The template this sweep ran one market of (`SweepTemplate`, 26/09), or null for a sweep
+    launched on its own. Null too once the template is deleted: the sweep is a measurement of its
+    own."""
+
+    combines: Mapped[list[Any] | None] = mapped_column(JSONB, nullable=True)
+    """The sweeps this one reads together, when it is a combination (26/09) — of one template's
+    markets, run one at a time. A combination has no runs of its own: every read of its runs
+    reads theirs (`routers.sweeps.scope_of`). Null for a sweep that ran."""
+
+    summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    """The per-entry summary as last computed once every run had ended, and the run counts it was
+    computed at (`rev_0029`): `{"counts": {...}, "entries": [...]}`. Null until then.
+
+    ⚠️ **A cache the counts keep honest, never a record.** It is served only while the sweep's
+    counts still equal the stored ones; a run retried or deleted changes them, and the summary is
+    computed again. Measured 25/09: computing it for 51 840 runs took 6.5 s a poll."""
+
+    holdout_rule: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    """How the tested points were chosen — `metric`, `top_n` per (entry, chart, market), and the
+    trade floor per chart. "The best" means nothing without "by what"."""
+
+    paused_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    """When the sweep was paused (rev_0048, 02/10): its waiting runs were taken out of the queue
+    and stay `queued` here, so the machines can be turned off; resuming queues them again from
+    this table. Null for a sweep running, or never paused."""
+
+    trimmed: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, server_default="[]")
+    """The pairs whose runs start later than the sweep's window (rev_0047, 02/10):
+    `[{"symbol", "timeframe", "date_from"}]` — the first year of real bars, where the window
+    reached into years a broker filled with one bar a day stored as the chart (`density`)."""
+
+    keep_all_trades: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    """Every run keeps its trades, won or lost (rev_0045, 02/10) — a base for meta-labeling
+    (ADR-0031). An ordinary sweep keeps them only for the runs that passed the bar
+    (`retention`), and a model trained on those would only ever see winners."""
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    backtests: Mapped[list[Backtest]] = relationship(back_populates="sweep", passive_deletes="all")
+
+    __table_args__ = (
+        # Each axis is a JSON array, never an object or a bare value. The same argument the
+        # catalogue's grid CHECK makes: JSONB stores any of those happily, and the expansion
+        # would meet its first surprise inside the transaction that is already writing runs.
+        CheckConstraint("jsonb_typeof(entry_ids) = 'array'", name="entries_are_a_list"),
+        CheckConstraint("jsonb_typeof(symbols) = 'array'", name="symbols_are_a_list"),
+        CheckConstraint("jsonb_typeof(trimmed) = 'array'", name="trimmed_is_a_list"),
+        CheckConstraint("jsonb_typeof(timeframes) = 'array'", name="timeframes_are_a_list"),
+        CheckConstraint("jsonb_typeof(skipped) = 'array'", name="skipped_is_a_list"),
+        CheckConstraint("date_to > date_from", name="a_window_runs_forwards"),
+        CheckConstraint(
+            "holdout_rule IS NULL OR jsonb_typeof(holdout_rule) = 'object'",
+            name="a_holdout_rule_is_an_object",
+        ),
+        CheckConstraint(
+            "summary IS NULL OR jsonb_typeof(summary) = 'object'", name="a_summary_is_an_object"
+        ),
+        CheckConstraint(
+            "entry_grids IS NULL OR jsonb_typeof(entry_grids) = 'object'",
+            name="entry_grids_are_an_object",
+        ),
+        CheckConstraint(
+            "combines IS NULL OR jsonb_typeof(combines) = 'array'",
+            name="a_combination_is_a_list",
+        ),
+        Index("ix_sweeps_created_at", "created_at"),
+        Index("ix_sweeps_holdout_of", "holdout_of"),
+        Index("ix_sweeps_template_id", "template_id"),
+    )
+
+
+class SweepPoint(Base):
+    """Where one written document of a sweep sits on the axes (`rev_0035`).
+
+    ⚠️ **Stored, because the alternative is parsing a caption.** A point's document is written
+    under `{entry name} [{label}]` — that name is what a run log row shows, and it is the reason
+    the points are separate lineages at all. Recovering the *coordinates* from it would mean
+    splitting text on brackets and separators, which works until an entry is named so that
+    another's name is a prefix of it, or until a value contains a separator.
+
+    ⚠️ **A table, not the JSONB list it was until 26/09.** A grid of 435 thousand points per chart
+    made that list hundreds of megabytes in one value — past Postgres's 255 MB ceiling for a
+    whole-chart sweep — and every reader loaded all of it to find a handful of strategies. Rows
+    are written in blocks as the launch expands the grid, and read by the strategies asked for.
+
+    No foreign key to `strategies`, on the terms `Sweep.entry_ids` gives: the column records the
+    question, and the runs are what point at the immutable documents.
+    """
+
+    __tablename__ = "sweep_points"
+
+    sweep_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="CASCADE"), primary_key=True
+    )
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    """The order the launch wrote it in — launch order, which is the grid's own."""
+
+    strategy_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    """The strategy whose run answers this point: its own, or — with `same_as` — another's."""
+
+    entry_id: Mapped[str] = mapped_column(Text, nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    coordinates: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """The point's values, keyed by the grid's dotted paths, with the chart under `timeframe` —
+    what the API calls a point's `values` (a column cannot be named that in SQL)."""
+
+    same_as: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """The label of the point whose run answers this one (24/09), or null for a point that is
+    its own run."""
+
+    __table_args__ = (
+        CheckConstraint("jsonb_typeof(coordinates) = 'object'", name="coordinates_are_an_object"),
+        Index("ix_sweep_points_sweep_id_strategy_id", "sweep_id", "strategy_id"),
+        # "Is this strategy a point of any sweep?" — the strategy picker's question (rev_0041).
+        Index("ix_sweep_points_strategy_id", "strategy_id"),
+    )
+
+
+class SweepSlicing(Base):
+    """A reserved-window test judged in pieces — by year or by blocks of trades — and kept.
+
+    His ask (25/09): after a test (`Sweep.holdout_rule`), decide whether it deserves a second
+    look, and if so cut each tested point's out-of-sample run into slices and see how many made
+    money. Nothing starts it but him: a sweep that was bad needs no second analysis.
+
+    ⚠️ **Computed once and stored, not recomputed on read.** `result` is what the slicing found
+    when it was asked, under the rule written beside it (`mode`, `block_trades`, `pass_share`).
+    The rule is set *before* the result is seen, which is the point: with two ways to cut, the
+    temptation is to keep whichever looks better, and a stored rule is the record of which one
+    was decided on first.
+
+    ⚠️ **Runs nothing.** The test's runs keep their trades win or lose (`retention`), so any
+    number of slicings of one test cost queries, not engine time.
+    """
+
+    __tablename__ = "sweep_slicings"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    sweep_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="CASCADE"), nullable=False
+    )
+    """The reserved-window test that was cut. `CASCADE`: a slicing of a test that no longer
+    exists describes nothing anybody can open."""
+
+    mode: Mapped[SliceMode] = mapped_column(_enum(SliceMode, "slice_mode"), nullable=False)
+
+    block_trades: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Trades per block when cutting by trades; null — and only null — by calendar."""
+
+    pass_share: Mapped[Decimal] = mapped_column(RATIO, nullable=False)
+    """The share of counted slices that must be positive for a point to pass, as a fraction."""
+
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """Per point: its slices and its verdict; per (entry, chart): how many points passed."""
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        CheckConstraint(
+            "(mode = 'trades') = (block_trades IS NOT NULL)",
+            name="blocks_are_sized_only_when_cutting_by_trades",
+        ),
+        CheckConstraint(
+            "block_trades IS NULL OR block_trades >= 5", name="a_block_holds_five_trades_or_more"
+        ),
+        CheckConstraint("pass_share > 0 AND pass_share <= 1", name="the_bar_is_a_share_above_zero"),
+        CheckConstraint("jsonb_typeof(result) = 'object'", name="a_result_is_an_object"),
+        Index("ix_sweep_slicings_sweep_id", "sweep_id"),
+    )
+
+
+class SweepMonteCarlo(Base):
+    """A reserved-window test's points resampled (25/09, `montecarlo`), and the answer kept.
+
+    Each point's out-of-sample trades are drawn with replacement into many paths: the drawdown and
+    losing streak to expect, and how often the whole run ends below zero. Started by hand, like a
+    slicing, and computed from the trades a test keeps win or lose — nothing is run again.
+
+    ⚠️ **The seed is stored**, and each point's draws come from it and the run's id: the same
+    request always gives the same answer, which is the engine's invariant carried over to what
+    judges the engine's output.
+
+    Since 01/10 (rev_0044) every point is drawn twice — trade by trade and in blocks of trades in
+    a row — and an ordinary sweep can be resampled too, the top of its ranking (`rank_by`,
+    `top_n`). A row from before keeps reading: its points carry no draw in blocks, and its three
+    new columns are null.
+    """
+
+    __tablename__ = "sweep_montecarlos"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    sweep_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="CASCADE"), nullable=False
+    )
+    """The sweep that was resampled — a reserved-window test, or since 01/10 an ordinary sweep's
+    ranking; its answer goes with it."""
+
+    paths: Mapped[int] = mapped_column(Integer, nullable=False)
+    seed: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    block_trades: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """The block asked for (01/10). Null took each point's own (the cube root of its trades), and
+    on every row from before blocks."""
+
+    rank_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    """What the ranking was ordered by, for an ordinary sweep (01/10); null for a test."""
+    top_n: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """How many runs per entry of that ranking; null with `rank_by`."""
+
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """Per point: the simulated spreads beside what actually happened."""
+
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        CheckConstraint("paths BETWEEN 100 AND 5000", name="paths_within_bounds"),
+        CheckConstraint(
+            "block_trades IS NULL OR block_trades BETWEEN 2 AND 50",
+            name="a_block_is_two_to_fifty_trades",
+        ),
+        CheckConstraint(
+            "(rank_by IS NULL) = (top_n IS NULL)", name="a_ranking_is_named_with_its_size"
+        ),
+        CheckConstraint("top_n IS NULL OR top_n BETWEEN 1 AND 20", name="top_n_within_bounds"),
+        CheckConstraint("jsonb_typeof(result) = 'object'", name="a_montecarlo_result_is_an_object"),
+        Index("ix_sweep_montecarlos_sweep_id", "sweep_id"),
+    )
+
+
+class Cluster(Base):
+    """Several finished runs replayed on ONE account (25/09, option A — `cluster`).
+
+    The engine runs one strategy on one market with one position at a time (ADR-0019), so a
+    portfolio of setups is not run again: each member's kept trades are replayed in time on a
+    shared balance, sized by the member's risk %, under the portfolio's limits, with open
+    positions marked on the member's own bars. What the replay found is kept in `result`.
+
+    ⚠️ **Members by run, and their risk % kept here.** The member's own document gives the default
+    (`risk.sizing.params.percent`); what was used is stored, because a cluster re-read later must
+    say what it sized by, not what the documents say today.
+    """
+
+    __tablename__ = "clusters"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    max_open_positions: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_open_risk_percent: Mapped[Decimal] = mapped_column(RATIO, nullable=False)
+    """In percent, like a strategy's own risk: 5 is 5% of the balance at risk across the open."""
+
+    members: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    """`[{"backtest_id": "...", "risk_percent": "1"}, ...]` in the order they tie-break in."""
+
+    status: Mapped[BacktestStatus] = mapped_column(
+        _enum(BacktestStatus, "cluster_status"), nullable=False
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    created_at: Mapped[dt.datetime] = _created_at()
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("initial_capital > 0", name="cluster_capital_positive"),
+        CheckConstraint("max_open_positions >= 1", name="at_least_one_open_position"),
+        CheckConstraint(
+            "max_open_risk_percent > 0 AND max_open_risk_percent <= 100",
+            name="open_risk_is_a_percent",
+        ),
+        CheckConstraint("jsonb_typeof(members) = 'array'", name="members_are_a_list"),
+        CheckConstraint(
+            "result IS NULL OR jsonb_typeof(result) = 'object'", name="cluster_result_is_an_object"
+        ),
+        Index("ix_clusters_created_at", "created_at"),
+    )
+
+
+class SweepWalkForward(Base):
+    """A sweep's walk-forward (25/09, path B — `sweep_walkforward`): at each fold the whole sweep
+    runs again on a training window, its best points are chosen by `rule` — a reserved-window
+    test's own — and run on the window after. Started by hand from a finished sweep."""
+
+    __tablename__ = "sweep_walk_forwards"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    parent_sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    """The sweep whose entries, markets, charts and points each fold runs again. Null once
+    deleted: the folds' sweeps are measurements of their own."""
+
+    start_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    train_years: Mapped[int] = mapped_column(Integer, nullable=False)
+    test_years: Mapped[int] = mapped_column(Integer, nullable=False)
+    anchored: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    rule: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """How each fold chooses: a `CreateHoldout` without its window — metric, top N, floors,
+    limits in R."""
+    mode: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="rerun", server_default=text("'rerun'")
+    )
+    """`rerun` — each fold's training is a sweep run again, its test a reserved-window test — or
+    `cut` (01/10, rev_0043): every fold answered from the parent's own runs, cut to whole years in
+    R (`sweep_walkforward_cut`), with nothing run at all."""
+
+    status: Mapped[BacktestStatus] = mapped_column(
+        _enum(BacktestStatus, "sweep_walk_forward_status"), nullable=False
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = _created_at()
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    folds: Mapped[list[SweepWalkForwardFold]] = relationship(
+        back_populates="walk_forward",
+        order_by="SweepWalkForwardFold.index",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint("train_years >= 1 AND test_years >= 1", name="windows_are_whole_years"),
+        CheckConstraint("jsonb_typeof(rule) = 'object'", name="a_walk_forward_rule_is_an_object"),
+        CheckConstraint("mode IN ('rerun', 'cut')", name="a_walk_forward_mode_is_known"),
+        Index("ix_sweep_walk_forwards_parent_sweep_id", "parent_sweep_id"),
+    )
+
+
+class SweepWalkForwardFold(Base):
+    """One fold: its windows, the training sweep run on the first, the test run on the second."""
+
+    __tablename__ = "sweep_walk_forward_folds"
+
+    walk_forward_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweep_walk_forwards.id", ondelete="CASCADE"), primary_key=True
+    )
+    index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    train_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    train_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    test_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    test_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    train_sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    test_sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Why this fold has no test — nothing in its training could be ranked, say — while the
+    others go on."""
+    cut: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    """A walk-forward by cut's answer for this fold (01/10, `sweep_walkforward_cut.FoldCut`): the
+    runs it chose, each (entry, chart) read in and out of sample, and the runs left out by reason.
+    Null for a fold that re-runs its sweep, whose answer is its test sweep."""
+
+    walk_forward: Mapped[SweepWalkForward] = relationship(back_populates="folds")
+
+    __table_args__ = (
+        CheckConstraint("train_to = test_from", name="test_starts_at_training_end"),
+        CheckConstraint(
+            "train_from < train_to AND test_from < test_to", name="windows_run_forwards"
+        ),
+        CheckConstraint(
+            "cut IS NULL OR jsonb_typeof(cut) = 'object'", name="a_fold_cut_is_an_object"
+        ),
+    )
+
+
+class TemplateItemStatus(StrEnum):
+    """Where one market stands in a template's queue."""
+
+    WAITING = "waiting"
+    LAUNCHED = "launched"
+    """Its sweep exists; whether it has finished is the sweep's own runs' to say."""
+    FAILED = "failed"
+    """Its launch was refused — the reason is on the item."""
+    REMOVED = "removed"
+    """Taken out of the queue before it launched."""
+
+
+class SweepTemplate(Base):
+    """A sweep without its markets, kept to be run one market at a time (26/09).
+
+    His ask: a sweep over thirteen markets was a day and a half of queue and one poll too heavy
+    for the screen. A template fixes what makes sweeps comparable — the entries, the charts, the
+    window, the capital — and each market becomes a sweep of its own, launched from a queue one
+    after the other, today or on another day. Sweeps of one template can then be read together
+    (`Sweep.combines`) as if they were one.
+    """
+
+    __tablename__ = "sweep_templates"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
+    entry_ids: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    timeframes: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    date_from: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_to: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    """While paused, the queue launches nothing new; the market already running goes on."""
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    items: Mapped[list[SweepTemplateItem]] = relationship(
+        back_populates="template",
+        order_by="SweepTemplateItem.position",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint("jsonb_typeof(entry_ids) = 'array'", name="template_entries_are_a_list"),
+        CheckConstraint("jsonb_typeof(timeframes) = 'array'", name="template_charts_are_a_list"),
+        CheckConstraint("date_to > date_from", name="a_template_window_runs_forwards"),
+        CheckConstraint("initial_capital > 0", name="template_capital_positive"),
+    )
+
+
+class SweepTemplateItem(Base):
+    """One market in a template's queue: its costs as typed, its place, and the sweep it became."""
+
+    __tablename__ = "sweep_template_items"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    template_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sweep_templates.id", ondelete="CASCADE"), nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    """The one chart this item runs (26/09) — or `None` on an item queued before, which runs
+    every chart of the template in one sweep."""
+    cost_model: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    """The sweep's cost model for this one market, as typed at queueing — prefilled from its
+    measured spread, and his to correct."""
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[TemplateItemStatus] = mapped_column(
+        _enum(TemplateItemStatus, "template_item_status"), nullable=False
+    )
+    sweep_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sweeps.id", ondelete="SET NULL"), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    template: Mapped[SweepTemplate] = relationship(back_populates="items")
+
+    __table_args__ = (
+        CheckConstraint("jsonb_typeof(cost_model) = 'object'", name="item_costs_are_an_object"),
+        Index("ix_sweep_template_items_template_id", "template_id", "position"),
+    )
+
+
+class LiveSetup(Base):
+    """One setup the live signals follow, on the markets listed under it (09/10).
+
+    His ask: a setup is chosen once — from a run that did well, or registered by hand — and its
+    markets are added or dropped at any time. One timeframe per setup; another timeframe is
+    another setup. The strategy, timeframe and costs are this row's own copy, so a run cleaned
+    away later leaves the setup whole.
+
+    `no_target_r` is his rule of 08/10 for a setup without a target: the signal closes at that
+    many R, the stop, or the setup's own exit, whichever comes first.
+
+    Editing the setup's parameters makes a **new strategy version** (strategies are immutable,
+    AGENTS §5.5) and points `strategy_id` at it; each signal keeps the version it came from.
+    """
+
+    __tablename__ = "live_setups"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    strategy_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("strategies.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+    cost_model: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    no_target_r: Mapped[Decimal] = mapped_column(RATIO, nullable=False, server_default=text("5"))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    note: Mapped[str | None] = mapped_column(Text)
+    source_backtest_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("backtests.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    markets: Mapped[list[LiveSetupMarket]] = relationship(
+        back_populates="setup", cascade="all, delete-orphan", order_by="LiveSetupMarket.created_at"
+    )
+
+    __table_args__ = (
+        CheckConstraint("no_target_r > 0", name="no_target_r_is_positive"),
+        CheckConstraint("jsonb_typeof(cost_model) = 'object'", name="setup_costs_are_an_object"),
+        CheckConstraint("length(name) > 0", name="setup_has_a_name"),
+    )
+
+
+class LiveSetupMarket(Base):
+    """One market a live setup follows — on or off on its own."""
+
+    __tablename__ = "live_setup_markets"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    setup_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("live_setups.id", ondelete="CASCADE"), nullable=False
+    )
+    instrument_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("instruments.id", ondelete="RESTRICT"), nullable=False
+    )
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    setup: Mapped[LiveSetup] = relationship(back_populates="markets")
+
+    __table_args__ = (UniqueConstraint("setup_id", "instrument_id"),)
+
+
+class SignalRecord(Base):
+    """One signal's life, as the live signals posted it (09/10) — the setup's history.
+
+    Written by the recorder from `signals.events`, one row per signal **number**, updated as the
+    signal moves: armed → triggered → closed, or armed → cancelled. Its own copy of what it was —
+    strategy version, market, timeframe — so the history outlives a setup deleted or edited.
+    """
+
+    __tablename__ = "signals"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    number: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    setup_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("live_setups.id", ondelete="SET NULL"), index=True
+    )
+    strategy_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("strategies.id", ondelete="SET NULL")
+    )
+    instrument_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("instruments.id", ondelete="SET NULL")
+    )
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str] = mapped_column(TIMEFRAME, nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    order_type: Mapped[str | None] = mapped_column(String(16))
+    entry: Mapped[Decimal | None] = mapped_column(PRICE)
+    stop: Mapped[Decimal | None] = mapped_column(PRICE)
+    target: Mapped[Decimal | None] = mapped_column(PRICE)
+    exit_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    result_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    reason: Mapped[str | None] = mapped_column(Text)
+    armed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    triggered_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    no_target_r: Mapped[Decimal | None] = mapped_column(RATIO)
+    """The R a signal with no target closes at, as it was when the signal was armed.
+
+    ⚠️ **Its own, not read through the setup (13/10).** A setup deleted with a signal in a trade
+    nulls `setup_id`, and a value read through it went with it: the orphan watch then followed the
+    trade to its stop alone, past the R it should have closed at."""
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('armed', 'triggered', 'cancelled', 'closed')", name="signal_status"
+        ),
+        CheckConstraint("side IN ('long', 'short')", name="signal_side"),
+        Index("ix_signals_setup_id_number", "setup_id", "number"),
     )

@@ -1,17 +1,134 @@
 import { screen } from '@testing-library/react'
 
 import { App } from './App'
+import { useSession } from './store'
 import { renderWithProviders } from './test-utils'
 
+afterEach(() => {
+  useSession.getState().clear()
+})
+
 describe('App', () => {
-  it('renders the builder at the root', () => {
+  it('runs a saved strategy at the root', () => {
     renderWithProviders(<App />, '/')
     expect(screen.getByRole('heading', { name: 'TradeForge' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'New backtest' })).toBeInTheDocument()
+    // ⚠️ Building is not here any more — it moved to the catalogue.
+    expect(screen.queryByRole('heading', { name: 'Build a strategy' })).not.toBeInTheDocument()
+  })
+
+  it('redirects an unknown route to New backtest', () => {
+    renderWithProviders(<App />, '/nowhere')
+    expect(screen.getByRole('heading', { name: 'New backtest' })).toBeInTheDocument()
+  })
+
+  it('sends the launch screen’s old address on to where it lives now', () => {
+    // No route of its own: the catch-all already lands `/launch` on `/`, which is now exactly
+    // where that screen is — a dedicated redirect would be a guard nothing could tell apart.
+    renderWithProviders(<App />, '/launch')
+    expect(screen.getByRole('heading', { name: 'New backtest' })).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /run saved/i })).not.toBeInTheDocument()
+  })
+
+  it('opens a saved strategy in the catalogue, with the builder open on it', () => {
+    // ⚠️ Pinned for the same reason as the sweep's route: the catch-all makes a broken route
+    // silent, and a row's strategy link landing on New backtest would fail nothing else.
+    renderWithProviders(<App />, '/strategies/s1')
+    expect(screen.getByRole('heading', { name: 'Strategy catalogue' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Build a strategy' })).toBeInTheDocument()
   })
 
-  it('redirects an unknown route to the builder', () => {
-    renderWithProviders(<App />, '/nowhere')
-    expect(screen.getByRole('heading', { name: 'Build a strategy' })).toBeInTheDocument()
+  it('routes to the basket launcher', () => {
+    renderWithProviders(<App />, '/basket')
+    // Its own heading, which is enough to prove the route resolves to this screen rather than
+    // falling through to the catch-all redirect. It used to assert the "build a strategy first"
+    // message, and that stopped being a fact about the route when the screen learned to offer
+    // the strategies that already exist.
+    expect(screen.getByRole('heading', { name: /Basket of/ })).toBeInTheDocument()
+  })
+
+  it('routes to the study launcher', () => {
+    renderWithProviders(<App />, '/study')
+
+    expect(screen.getByRole('heading', { name: 'Parameter study' })).toBeInTheDocument()
+  })
+
+  it('routes to the strategy catalogue', () => {
+    renderWithProviders(<App />, '/catalog')
+
+    expect(screen.getByRole('heading', { name: 'Strategy catalogue' })).toBeInTheDocument()
+  })
+
+  it('routes to the sweep launcher', () => {
+    // ⚠️ Pinned because the catch-all makes a broken route **silent**: `<Route path="*">`
+    // redirects an unknown path to `/`, so renaming this one would land the reader on New
+    // backtest — with that link lit instead of "Sweep" — and nothing would fail.
+    renderWithProviders(<App />, '/sweep')
+
+    expect(screen.getByRole('heading', { name: 'Sweep' })).toBeInTheDocument()
+  })
+
+  it('routes to the sweep history, and lights its link only there', () => {
+    // Pinned for the launcher's reason: under the catch-all a renamed route fails silently. The
+    // screen's loading line is enough to name it, asserted before the request settles.
+    const { unmount } = renderWithProviders(<App />, '/sweeps')
+
+    expect(screen.getByText('Loading the sweep history…')).toBeInTheDocument()
+    const history = screen.getByRole('link', { name: 'Sweep history' })
+    expect(history).toHaveAttribute('href', '/sweeps')
+    expect(history).toHaveAttribute('aria-current', 'page')
+    unmount()
+
+    // ⚠️ One sweep being read is not the history: without `end` the link would stay lit on
+    // every `/sweeps/:id`, and the reader could not tell which of the two screens they are on.
+    renderWithProviders(<App />, '/sweeps/abc')
+    expect(screen.getByText('Loading the sweep…')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Sweep history' })).not.toHaveAttribute('aria-current')
+  })
+
+  it('routes to the sweep dashboard rather than reading it as a sweep id', () => {
+    renderWithProviders(<App />, '/sweeps/dashboard')
+
+    expect(screen.getByRole('heading', { name: 'Sweep dashboard' })).toBeInTheDocument()
+    expect(screen.queryByText('Loading the sweep…')).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Sweep dashboard' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    )
+    // The history's link is `end`, so it does not light up over a path beneath it.
+    expect(screen.getByRole('link', { name: 'Sweep history' })).not.toHaveAttribute('aria-current')
+  })
+
+  it('groups the sidebar links under headings', () => {
+    renderWithProviders(<App />, '/')
+
+    // The groups are what a column buys over a bar: the reader answers "where do strategies
+    // live?" from the heading, before reading any link. Asserted as headings rather than as
+    // text, because a `div` styled to look like one reads as nothing to a screen reader.
+    expect(screen.getByRole('heading', { name: 'Strategies' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Experiments' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Markets' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Catalogue' })).toHaveAttribute('href', '/catalog')
+  })
+
+  it('offers no Recent group until something has been launched', () => {
+    // The group heading, not the links inside it: an empty "Recent" is a promise of history to
+    // a reader who has none, and the heading is what survives when every link is absent.
+    renderWithProviders(<App />, '/')
+    expect(screen.queryByRole('heading', { name: 'Recent' })).not.toBeInTheDocument()
+  })
+
+  it('offers no link back to a basket until one has been launched', () => {
+    renderWithProviders(<App />, '/')
+    expect(screen.queryByRole('link', { name: /markets/ })).not.toBeInTheDocument()
+  })
+
+  it('leads back to the basket launched most recently', () => {
+    // There is no `GET /baskets`, so this link is the only way back that is not a pasted URL.
+    useSession.getState().setBasket('k1', 'Ponto Contínuo · 3 markets')
+    renderWithProviders(<App />, '/')
+
+    const link = screen.getByRole('link', { name: /Ponto Contínuo · 3 markets/ })
+    expect(link).toHaveAttribute('href', '/baskets/k1')
   })
 })

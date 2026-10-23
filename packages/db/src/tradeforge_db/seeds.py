@@ -10,6 +10,10 @@ The numbers below are plausible placeholders. The collector overwrites them with
 truth from MT5 `symbol_info` on the first backfill (PR-102) — through the very same
 `upsert_instruments`, which is why the seeds are not a special case with its own
 write path that nobody else exercises.
+
+⚠️ Same function, but **not** the same conflict policy, and the difference is the whole
+point. "Overwrites them" has to run one way only. Sharing the write path is good; sharing
+the authority to overwrite was the bug — see `upsert_instruments(overwrite=...)`.
 """
 
 from decimal import Decimal
@@ -73,5 +77,14 @@ INSTRUMENT_SEEDS: tuple[InstrumentSpec, ...] = (
 
 
 def seed_instruments(session: Session, seeds: tuple[InstrumentSpec, ...] = INSTRUMENT_SEEDS) -> int:
-    """Insert the example instruments. Safe to re-run; returns how many were written."""
-    return upsert_instruments(session, seeds)
+    """Insert the example instruments, never touching one that already exists.
+
+    Safe to re-run; returns how many rows were actually written, which is zero on every run
+    after the first. That number reaches the migrate log, so it has to be the truth.
+
+    `overwrite=False` is the whole fix. A seed's job is "make sure these symbols exist so a
+    fresh machine can run something" — it is not a source of facts about a market. The
+    collector is. Before this, `docker compose up` ran the seed step and handed the
+    placeholders authority over every column the collector had measured.
+    """
+    return upsert_instruments(session, seeds, overwrite=False)

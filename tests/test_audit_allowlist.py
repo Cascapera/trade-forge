@@ -10,6 +10,7 @@ anything all have their own test.
 
 import io
 import json
+from dataclasses import fields
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -399,8 +400,30 @@ def test_main_fails_when_the_allowlist_is_missing(
 
 
 def test_the_allowlist_this_repo_ships_is_valid() -> None:
-    """A typo in the committed file would only ever show up as a red CI run. Catch it here."""
+    """A typo in the committed file would only ever show up as a red CI run. Catch it here.
+
+    ⚠️ The list is **empty today, and empty is the good state** — every advisory in the report
+    has to be zero. It is not the same as the file being absent: the gate exits 2 on a missing
+    allowlist, because a gate that cannot find its own configuration must not report clean.
+
+    It held `GHSA-qwww-vcr4-c8h2` (react-router CSRF in RSC Mode) from 27/07 to 24/08/2026.
+    `react-router` 7.18.2 fixed it on the 7.x line, the entry stopped matching anything, and the
+    gate failed **on the stale entry** — which is the behaviour ADR-0017 designed and the reason
+    this file no longer silences anything.
+
+    The assertions are written to hold either way, so the day somebody adds a new exception this
+    test still says what an exception has to be, rather than needing to be rewritten first.
+    """
     allowed = gate.parse_allowlist(REAL_ALLOWLIST.read_text(encoding="utf-8"))
 
-    assert [entry.key for entry in allowed] == [(REACT_ROUTER, "react-router")]
+    assert allowed == [], (
+        "an advisory is being silenced; that is allowed, but the entry must be reviewed here: "
+        f"{[entry.key for entry in allowed]}"
+    )
     assert all(len(entry.reason) > 80 for entry in allowed), "an entry must argue, not assert"
+    assert all(entry.review_by is not None for entry in allowed), "an entry must expire"
+
+    # ⚠️ Both assertions above are vacuous while the list is empty — `all([])` is True, so a
+    # renamed field would sail through them and only fail the day somebody adds an exception.
+    # This is what keeps them honest: the names they reach for have to exist right now.
+    assert {field.name for field in fields(gate.Allowed)} >= {"reason", "review_by"}

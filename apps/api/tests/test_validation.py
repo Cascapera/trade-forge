@@ -16,7 +16,7 @@ from tradeforge_api.main import create_app
 
 
 class _FakeQueue:
-    async def enqueue_job(self, *args: object) -> None:
+    async def enqueue_job(self, *args: object, **options: object) -> None:
         return None
 
 
@@ -90,4 +90,65 @@ def test_a_backtest_request_with_an_unknown_field_is_a_422(client: TestClient) -
             "typo_field": True,
         },
     )
+    assert response.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# The one character a text column cannot hold                                   #
+# --------------------------------------------------------------------------- #
+
+_NUL = chr(0)
+"""Written as `chr(0)` rather than as an escape: an editor or a script that rewrites this file
+can turn the escape into a real NUL byte, and Python then refuses to parse its own source."""
+
+
+@pytest.mark.parametrize("symbol", [_NUL, f"EUR{_NUL}USD"])
+def test_a_symbol_carrying_a_nul_is_refused_before_the_database(
+    client: TestClient, symbol: str
+) -> None:
+    """A NUL in a symbol used to be a **500**, from `DataError` raised inside the driver.
+
+    Found by schemathesis drawing `?symbol=%00` for the first time on a route that had been
+    green for weeks — the same shape as the `offset` bigint overflow it found before. A fuzzer
+    only proves what it happened to draw, so the value it drew becomes a test that always draws
+    it.
+
+    ⚠️ The other half of this guard — that a *strange but legal* symbol still gets through — is
+    in `test_studies_integration`, and it has to be: proving a value reaches the handler means
+    letting the handler run, and the handler needs a database. Asserting it here would only
+    prove that no exception was raised before the connection failed.
+    """
+    response = client.post(
+        "/backtests",
+        json={
+            "strategy_id": "00000000-0000-0000-0000-000000000000",
+            "symbol": symbol,
+            "timeframe": "H1",
+            "date_from": "2024-01-01T00:00:00Z",
+            "date_to": "2024-02-01T00:00:00Z",
+            "initial_capital": "10000",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_a_study_refuses_a_nul_in_its_symbol_too(client: TestClient) -> None:
+    """The same guard on the route that resolves a symbol the same way. Stated separately
+    because the two request bodies are different models, and a guard applied to one of them is
+    a guard the other silently lacks."""
+    response = client.post(
+        "/studies",
+        json={
+            "strategy_id": "00000000-0000-0000-0000-000000000000",
+            "symbol": _NUL,
+            "timeframe": "H1",
+            "date_from": "2024-01-01T00:00:00Z",
+            "date_to": "2024-02-01T00:00:00Z",
+            "initial_capital": "10000",
+            "cost_model": {"type": "none"},
+            "grid": {"setup.params.period": [5, 9]},
+        },
+    )
+
     assert response.status_code == 422

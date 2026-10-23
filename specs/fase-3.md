@@ -15,14 +15,65 @@
 **Aceite:** estratégia da fase 1 roda em paper com dados ao vivo; trades persistidos idênticos em formato aos de backtest.
 **Você vai aprender:** a prova viva do ADR-01 — a MESMA classe de estratégia rodando contra outro broker; gestão de processos de longa duração.
 
+**Fatiado em A e B** (24/08/2026), como o PR-301:
+
+- **302-A — o laço que não termina** *(feito)*. `loop.iter_run()` (o laço como gerador, uma
+  `BarOutcome` por barra) + `run()` reescrito como acumulador sobre ele; `CostModel` recebendo a
+  barra do fill (ADR-0022) e o `BarSpreadCostModel`; `CandleStream`, o consumidor do stream do
+  PR-301 com ack preguiçoso. **Não existe classe `PaperBroker`**: a única diferença entre
+  backtest e paper é o custo plugado.
+- **302-B — o registro** *(a fazer)*. Migration `live_sessions` (mode=paper); `trades` relaxa
+  `backtest_id` para **exatamente um de `backtest_id` / `live_session_id`** — a migration que o
+  docstring do modelo `Trade` já previa por escrito desde a fase 0; e a tradução de `BarOutcome`
+  para linha. Testável sem processo nenhum.
+- **302-C — a vida** *(a fazer)*. Processo de sessão com start/stop e o **aquecimento**.
+  ⚠️ **Não pode ser um job do arq**: o `job_timeout` é aplicado com `asyncio.wait_for`, uma sessão
+  roda por dias, e um job que bloqueia o event loop congela a fila inteira — exatamente o que a
+  PR #133 documentou. Sessão é processo próprio; a linha no banco é o registro, não o agendador.
+
+⚠️ **Decisão de persistência (24/08, Guilherme): a linha nasce na entrada.** O trade é gravado no
+FILL com as quatro colunas de saída `NULL` — o CHECK `exit_is_all_or_nothing` já permite, e o
+docstring da coluna já diz *"An open position has no exit yet"* — e é **atualizada** quando fecha.
+A alternativa (gravar só no fechamento) daria formato idêntico ao backtest por construção e linha
+imutável, mas uma sessão com posição aberta há três dias não mostraria nada, o que é
+indistinguível de uma sessão que não operou. O preço aceito: a linha vira mutável, e uma sessão
+que morre deixa um trade aberto que ninguém fecha — **a reconciliação disso é do 302-C**, junto
+com a re-entrega de barras não confirmadas.
+
+⚠️ **Decisão de aquecimento (24/08, Guilherme): semear do banco.** Na subida, a sessão lê barras
+históricas do Parquet, alimenta a estratégia com elas, e só então liga o stream em `$`. As
+alternativas foram recusadas: começar em `0` faz a sessão "operar" barras que já são história e
+reportar isso como live; aceitar a sessão fria cega uma EMA-20 em H4 por três dias, e o sintoma é
+indistinguível de "não achou setup".
+
+⚠️ **Corrigido em 24/08 pelo PR-302-C-A, e vale ler o porquê — ver `docs/adr/0023`.** A frase
+original desta decisão dizia *"alimenta a estratégia com elas **sem permitir ordem**"*. Medido, esse
+desenho **quebra a estratégia**: um setup marca a ordem armada como colocada quando *emite* o sinal,
+e o laço nunca devolve `OrderResult` — então um veto a mata depois disso e a estratégia atravessa
+acreditando ter uma limite num broker que nunca a viu. Sondado com o setup real sobre EURUSD H1
+real: **4 de 5 viradas produziram esse fantasma**, e a região nunca é operada.
+
+O aquecimento passou a ser **um backtest de verdade cujo ledger é descartado**: a sessão abre com um
+broker novo (dinheiro intocado por construção) e as ordens em repouso são re-submetidas,
+re-dimensionadas contra a conta da sessão.
+
+⚠️ **E o `N` não existe.** Medido: o aquecimento dos indicadores é calculável (com o ADX valendo
+`2 × período`, não `período`), mas o da **estrutura não tem fórmula** — a primeira CHoCH chega em 38
+barras no AUDCAD H1 e em **730** no BTCUSD H1. A sessão registra quantas barras **usou**, não
+quantas precisaria, porque a segunda não é conhecível.
+
 ## PR-303 — Execution Service + salvaguardas
-**Escopo:** `apps/executor`: consome `orders.outbound`, executa `mt5.order_send` (conta DEMO), publica `fills.inbound`; kill switch em 3 camadas (flag Redis + arquivo local + endpoint); limites locais (perda diária, volume máx., posições máx., janela de horário); `order_audit` append-only; heartbeat com política configurável.
+**Escopo:** `apps/executor`: consome `orders.outbound`, executa `mt5.order_send` (conta DEMO), publica `venue.outcomes` (ADR-0024; era `fills.inbound`); kill switch em 3 camadas (flag Redis + arquivo local + endpoint); limites locais (perda diária, volume máx., posições máx., janela de horário); `order_audit` append-only; heartbeat com política configurável.
 **Aceite:** suíte com MT5 mockado cobrindo: rejeição, fill parcial, desconexão, kill switch em cada camada, limite estourado; execução real em CONTA DEMO.
 **Você vai aprender:** design de sistemas que falham com segurança (fail-safe vs fail-open), auditoria append-only, por que os limites vivem no executor e não no core.
 
 ## PR-304 — MT5Broker + painel live
 **Escopo:** `MT5Broker` (proxy via fila para o executor); UI: painel de sessões live (posições, P&L do dia, estado, log de eventos) com **kill switch em destaque**; promoção paper→real exige N dias de paper registrados (configurável).
-**Aceite:** fluxo completo em conta demo: ativar sessão → ordem → fill → painel atualiza via WS → kill switch encerra tudo; trava de paper prévio testada.
+**Aceite:** fluxo completo em conta demo: ativar sessão → ordem → fill → painel atualiza via WS → kill switch **impede risco novo**; trava de paper prévio testada.
+
+> ⚠️ **Corrigido em 01/09/2026, no PR-304-C4.** Este aceite dizia *"kill switch encerra tudo"* e o mecanismo não encerra nada: `safety.admits` libera `EXIT`/`CANCEL`/`MODIFY_STOP` **antes** de consultar os switches, de propósito — *"a kill switch that refuses an exit is an operator pulling the handle and staying in the trade"*. Posição aberta continua aberta, protegida pelo stop que já está no venue.
+>
+> Decisão do Guilherme (01/09): **rotular honesto**, não construir o *flatten*. A tela diz, ao lado de cada botão, o que ele não faz. Um mecanismo que fecha posição a mercado continua não existindo em camada nenhuma, e continua no `specs/backlog.md` se um dia for preciso.
 **Você vai aprender:** UX de sistemas críticos, idempotência de ordens (retry sem duplicar), reconciliação de estado (posições no MT5 vs no banco).
 
 ## PR-305 — IA: analista de backtest

@@ -4,6 +4,7 @@ import datetime as dt
 from decimal import Decimal
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.dataset as pads
 import pytest
 
@@ -11,8 +12,10 @@ from tradeforge_collector.source import Candle
 from tradeforge_collector.storage import (
     OHLCV_SCHEMA,
     dataset_path,
+    iter_candles,
     normalise,
     read_candles,
+    read_times,
     write_candles,
 )
 
@@ -116,6 +119,184 @@ def test_symbols_do_not_leak_into_each_other(tmp_path: Path) -> None:
 
 def test_reading_a_symbol_that_was_never_collected_is_empty_not_an_error(tmp_path: Path) -> None:
     assert read_candles(tmp_path, "NOPE", "H1") == []
+
+
+# --------------------------------------------------------------------------- #
+# Reading a window                                                              #
+# --------------------------------------------------------------------------- #
+
+# Five consecutive daily bars, so a window can be stated as "the middle three" and the two it
+# must exclude sit on either side of it.
+_DAYS = [dt.datetime(2024, 6, day, 9, tzinfo=dt.UTC) for day in range(1, 6)]
+
+
+def _five_days(root: Path) -> None:
+    write_candles(root, "EURUSD", "D1", [a_candle(day) for day in _DAYS])
+
+
+def test_a_window_keeps_both_of_its_edges(tmp_path: Path) -> None:
+    """Inclusive at both ends, and the `end` edge is the one that matters.
+
+    A run records `last_candle` as the final bar it *ate*. Read that window with an exclusive
+    upper bound and the chart loses exactly that bar — the one the last trade may have closed
+    on. The failure is a single missing candle at the right-hand edge of a chart, which is
+    invisible unless a test states the boundary outright.
+    """
+    _five_days(tmp_path)
+
+    window = read_candles(tmp_path, "EURUSD", "D1", start=_DAYS[1], end=_DAYS[3])
+
+    assert [candle.time for candle in window] == [_DAYS[1], _DAYS[2], _DAYS[3]]
+
+
+def test_each_bound_stands_on_its_own(tmp_path: Path) -> None:
+    """`start` alone is an open-ended tail, `end` alone an open-ended head."""
+    _five_days(tmp_path)
+
+    assert [c.time for c in read_candles(tmp_path, "EURUSD", "D1", start=_DAYS[3])] == _DAYS[3:]
+    assert [c.time for c in read_candles(tmp_path, "EURUSD", "D1", end=_DAYS[1])] == _DAYS[:2]
+
+
+def test_no_window_still_reads_everything(tmp_path: Path) -> None:
+    """The window is optional, and every caller that predates it must be unaffected."""
+    _five_days(tmp_path)
+
+    assert len(read_candles(tmp_path, "EURUSD", "D1")) == len(_DAYS)
+
+
+def test_a_window_that_spans_years_keeps_both_of_them(tmp_path: Path) -> None:
+    """The filter must prune partitions, not drop them.
+
+    Years are directories, and the bounds are pushed down into Arrow to skip the ones outside
+    the window. A predicate that interacted badly with the partition keys could return only the
+    year the boundary happens to name — a chart missing half its history, still plausible.
+    """
+    december = dt.datetime(2023, 12, 31, 9, tzinfo=dt.UTC)
+    january = dt.datetime(2024, 1, 1, 9, tzinfo=dt.UTC)
+    write_candles(tmp_path, "EURUSD", "D1", [a_candle(december), a_candle(january)])
+
+    window = read_candles(tmp_path, "EURUSD", "D1", start=december, end=january)
+
+    assert [candle.time for candle in window] == [december, january]
+
+
+def test_a_window_with_nothing_in_it_is_empty_not_an_error(tmp_path: Path) -> None:
+    _five_days(tmp_path)
+
+    assert (
+        read_candles(tmp_path, "EURUSD", "D1", start=dt.datetime(2030, 1, 1, tzinfo=dt.UTC)) == []
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Reading only the instants                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_instants_are_the_ones_the_candles_carry(tmp_path: Path) -> None:
+    """`read_times` and `read_candles` must never disagree about which bars exist.
+
+    They are two functions over one dataset, and the caller of the cheap one uses it to *count*
+    bars — a walk-forward cuts its folds by counting candles. A count taken from one function
+    and windows executed from the other would silently place a boundary on a bar that is not
+    where it was thought to be.
+    """
+    _five_days(tmp_path)
+
+    assert read_times(tmp_path, "EURUSD", "D1") == [
+        candle.time for candle in read_candles(tmp_path, "EURUSD", "D1")
+    ]
+
+
+def test_the_instants_honour_the_same_window_on_both_edges(tmp_path: Path) -> None:
+    """Inclusive at both ends, exactly as `read_candles` is — the same bars, or it is a different
+    dataset wearing the same name."""
+    _five_days(tmp_path)
+
+    assert read_times(tmp_path, "EURUSD", "D1", start=_DAYS[1], end=_DAYS[3]) == _DAYS[1:4]
+
+
+def test_the_instants_come_back_sorted_and_in_utc(tmp_path: Path) -> None:
+    """Order is the whole contract: a fold's boundaries are positions in this list.
+
+    A dataset is a set of files and the order they are listed in is the filesystem's business.
+    Instants arriving shuffled would make "the 40th bar" a different bar on a different machine
+    — and the walk-forward would be non-deterministic without a single number looking wrong.
+    """
+    written = [_DAYS[3], _DAYS[0], _DAYS[2], _DAYS[1], _DAYS[4]]
+    write_candles(tmp_path, "EURUSD", "D1", [a_candle(day) for day in written])
+
+    times = read_times(tmp_path, "EURUSD", "D1")
+
+    assert times == sorted(written)
+    assert all(moment.tzinfo is dt.UTC for moment in times)
+
+
+def test_asking_for_the_instants_of_nothing_is_empty_not_an_error(tmp_path: Path) -> None:
+    assert read_times(tmp_path, "NOPE", "H1") == []
+
+
+# --------------------------------------------------------------------------- #
+# Reading a slice at a time (a live session's warm-up, 12/10)                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_the_sliced_reader_hands_back_exactly_the_bars_of_the_whole_one(tmp_path: Path) -> None:
+    """⚠️ The warm-up is where a live session must see what its backtest saw (AGENTS.md §5.2).
+    Slices smaller than the series, and bars written out of order across two years, so a slice
+    edge or a year directory listed out of turn would show up as a bar missing, doubled or moved.
+    """
+    written = [*_DAYS[3:], *_DAYS[:3], dt.datetime(2023, 12, 29, 9, tzinfo=dt.UTC)]
+    write_candles(tmp_path, "EURUSD", "D1", [a_candle(day, close="1.10700") for day in written])
+
+    sliced = list(iter_candles(tmp_path, "EURUSD", "D1", rows_per_slice=2))
+
+    assert sliced == read_candles(tmp_path, "EURUSD", "D1")
+    assert [candle.time for candle in sliced] == sorted(written)
+
+
+def test_the_sliced_reader_keeps_the_same_window(tmp_path: Path) -> None:
+    _five_days(tmp_path)
+
+    window = iter_candles(tmp_path, "EURUSD", "D1", start=_DAYS[1], end=_DAYS[3], rows_per_slice=1)
+
+    assert [candle.time for candle in window] == [_DAYS[1], _DAYS[2], _DAYS[3]]
+
+
+def test_the_sliced_reader_reads_nothing_until_the_first_bar_is_asked_for(tmp_path: Path) -> None:
+    """A caller that sequences the read — `splice` creates its consumer group first — must be
+    able to build the reader early. Bars written after the call and before the first `next()`
+    are there, which only holds if the call itself touched no file."""
+    reader = iter_candles(tmp_path, "EURUSD", "D1")
+    _five_days(tmp_path)
+
+    assert [candle.time for candle in reader] == _DAYS
+
+
+def test_the_sliced_reader_asks_arrow_for_memory_back_only_once_the_table_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠️ A release asked while anything still holds the table gives nothing back, and what was
+    not given back stays in Arrow's cache for the life of the session. The loop's last slice is
+    such a holder: it shares the table's buffers (12/10, found writing the lesson)."""
+    _five_days(tmp_path)
+    before = pa.total_allocated_bytes()
+    held_when_released: list[int] = []
+    pool = pa.default_memory_pool()
+
+    class Watched:
+        def release_unused(self) -> None:
+            held_when_released.append(pa.total_allocated_bytes())
+            pool.release_unused()
+
+    monkeypatch.setattr(pa, "default_memory_pool", Watched)
+
+    assert len(list(iter_candles(tmp_path, "EURUSD", "D1", rows_per_slice=2))) == len(_DAYS)
+    assert held_when_released == [before], "the table was still alive when Arrow was asked"
+
+
+def test_slicing_a_series_that_was_never_collected_is_empty_not_an_error(tmp_path: Path) -> None:
+    assert list(iter_candles(tmp_path, "NOPE", "H1")) == []
 
 
 def test_writing_nothing_is_an_error_not_a_silent_no_op(tmp_path: Path) -> None:

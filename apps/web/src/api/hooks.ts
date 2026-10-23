@@ -3,22 +3,107 @@
 // a backtest is asynchronous, so the query *polls* until the run reaches a terminal status, then
 // stops on its own. That is the whole point of the 202-plus-poll contract the API exposes.
 
-import { skipToken, useMutation, useQuery } from '@tanstack/react-query'
+import {
+  type QueryClient,
+  skipToken,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import type { Strategy } from '@tradeforge/schema'
+import { useEffect, useRef } from 'react'
 
-import { api } from './client'
+import { settled } from '../sweep/progress'
+import type { RankKey } from '../sweep/ranking'
+
+import { api, type BestCellQuery } from './client'
 import type {
+  CatalogEntry,
+  CatalogPage,
+  CreateCatalogEntry,
+  UpdateCatalogEntry,
   Backtest,
+  BacktestFilters,
   BacktestStatus,
+  BacktestsPage,
+  BasketOut,
+  CandlesResponse,
+  Collection,
   CreateBacktestRequest,
+  CreateBasketRequest,
+  CreateCollection,
+  CreateStudyRequest,
+  ClusterListItem,
+  ClusterOut,
+  CreateClusterRequest,
+  CreateHoldoutRequest,
+  CreateSweepTemplateRequest,
+  QueueMarket,
+  SweepTemplateListItem,
+  SweepTemplateOut,
+  CreateSweepWalkForwardRequest,
+  CreatedSweepWalkForward,
+  SweepWalkForwardOut,
+  CreateMonteCarloRequest,
+  CreateSlicingRequest,
+  CreateSweepRequest,
+  CreateWalkForwardRequest,
   CreatedBacktest,
+  CreatedBasket,
+  CreatedStudy,
+  CreatedSweep,
+  CreatedWalkForward,
   EquityPoint,
   Instrument,
+  KillSwitch,
+  LiveSessionDetail,
+  LiveSessionsPage,
+  OverlaysResponse,
+  PlanCollectionRequest,
+  PlannedCollection,
+  SessionEventsPage,
+  Snapshot,
+  StrategiesPage,
+  StrategyFilters,
   StrategyOut,
+  SymbolHistory,
+  SymbolSearch,
+  SymbolBrowse,
+  Markets,
+  StudyOut,
+  StudyPreview,
+  PreviewSweepRequest,
+  BestCellOut,
+  SweepPauseOut,
+  BestMapOut,
+  BestMetric,
+  HoldoutOut,
+  MonteCarloOut,
+  SlicingOut,
+  SweepOut,
+  SweepPreview,
+  SweepRunsPage,
+  LaunchWindow,
+  SweepDashboard,
+  SweepsPage,
   TradesPage,
+  WalkForwardOut,
+  LiveMarketsOut,
+  LiveSetup,
+  LiveSetupNew,
+  LiveSetupPatch,
+  RestartMarketRequest,
+  SignalRow,
+  YearCut,
 } from './types'
 
 const POLL_MS = 1000
+
+// A grid is up to five hundred runs on the same worker pool, so it settles on a scale of minutes
+// rather than seconds — and every response carries every run in it. Polling a study at the
+// single-run cadence would add hundreds of requests to the queue being waited on.
+const STUDY_POLL_MS = 3000
 const TERMINAL: readonly BacktestStatus[] = ['done', 'failed']
 
 export function isTerminal(status: BacktestStatus | undefined): boolean {
@@ -26,7 +111,174 @@ export function isTerminal(status: BacktestStatus | undefined): boolean {
 }
 
 export function useInstruments() {
-  return useQuery<Instrument[]>({ queryKey: ['instruments'], queryFn: api.listInstruments })
+  return useQuery<Instrument[]>({
+    queryKey: ['instruments'],
+    queryFn: api.listInstruments,
+  })
+}
+
+/**
+ * The broker's catalogue, searched by prefix.
+ *
+ * `placeholderData` keeps the previous page on screen while the next one loads. Without it the
+ * list empties between keystrokes, and an empty list is the one thing this screen must not show
+ * casually — it is also how "nothing matches" and "no catalogue" look.
+ *
+ * The debounce is the caller's, not this hook's: React Query keys on `q`, so a hook that
+ * debounced internally would still be re-keyed on every character and would only be delaying
+ * the request it had already decided to make.
+ */
+export function useSymbolSearch(q: string) {
+  return useQuery<SymbolSearch>({
+    queryKey: ['symbols', q],
+    queryFn: () => api.searchSymbols(q),
+    placeholderData: (previous) => previous,
+  })
+}
+
+/** The market browser's tabs: every market, with how many symbols the broker lists in each. */
+export function useMarkets(enabled = true) {
+  return useQuery<Markets>({
+    queryKey: ['symbols', 'markets'],
+    queryFn: () => api.getMarkets(),
+    enabled,
+  })
+}
+
+/**
+ * One page of a market's symbols. `placeholderData` keeps the page on screen while the next one
+ * loads, for the reason `useSymbolSearch` gives.
+ */
+export function useBrowseSymbols(params: {
+  market: string
+  q: string
+  collected: boolean
+  offset: number
+  limit: number
+}) {
+  return useQuery<SymbolBrowse>({
+    queryKey: ['symbols', 'browse', params],
+    queryFn: () => api.browseSymbols(params),
+    placeholderData: (previous) => previous,
+  })
+}
+
+/**
+ * Ask the host agent to re-photograph the broker's catalogue.
+ *
+ * ⚠️ Invalidates every symbol search on success, and success here only means *queued*. The
+ * agent may be down, in which case the refetched list is the old one — which is the right
+ * outcome: the screen keeps working with a stale catalogue rather than emptying itself because
+ * a terminal on somebody's desk is closed.
+ */
+/**
+ * What is known about one series. `enabled` only once both halves of the question exist.
+ *
+ * ⚠️ A 404 here is an answer, not a failure: nobody has probed this series yet. The component
+ * reads `error.status` rather than treating every error the same, because "press measure" and
+ * "something is broken" are different sentences and only one of them is actionable.
+ */
+export function useSymbolHistory(symbol: string, timeframe: string | undefined) {
+  return useQuery<SymbolHistory>({
+    queryKey: ['symbol-history', symbol, timeframe],
+    queryFn:
+      symbol === '' || timeframe === undefined
+        ? skipToken
+        : () => api.getSymbolHistory(symbol, timeframe),
+    retry: false,
+  })
+}
+
+/**
+ * Ask the host agent to measure a series.
+ *
+ * ⚠️ Success means *queued*, not measured — a cold H4 took 207 seconds on this broker — so the
+ * invalidation below is what eventually shows the answer, once the agent has written it.
+ */
+export function useProbeSymbol() {
+  const client = useQueryClient()
+  return useMutation<{ job: string }, Error, { symbol: string; timeframe: string }>({
+    mutationFn: ({ symbol, timeframe }) => api.probeSymbol(symbol, timeframe),
+    onSuccess: () => client.invalidateQueries({ queryKey: ['symbol-history'] }),
+  })
+}
+
+/**
+ * Launch a collection and get the row to watch it with.
+ *
+ * ⚠️ The invalidations are three, and each one is a different screen catching up. `collections`
+ * is the list under the form; `instruments` is what the backtest screens offer, and a first
+ * collection is exactly what puts a symbol there; `symbols` carries the `catalogued` flag that
+ * decides whether the combobox marks it "no data".
+ */
+export function useCreateCollection() {
+  const client = useQueryClient()
+  return useMutation<Collection[], Error, CreateCollection>({
+    mutationFn: (body) => api.createCollection(body),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['collections'] })
+      void client.invalidateQueries({ queryKey: ['instruments'] })
+      void client.invalidateQueries({ queryKey: ['symbols'] })
+    },
+  })
+}
+
+/**
+ * One collection, polled while it runs.
+ *
+ * ⚠️ Polled at the **study** cadence rather than the single-run one. A collection advances once
+ * per calendar year of history and a cold year can take minutes on this broker, so a
+ * once-a-second poll would be hundreds of requests against a row that changes five times.
+ */
+export function useCollection(id: string | undefined) {
+  return useQuery<Collection>({
+    queryKey: ['collection', id],
+    queryFn: id === undefined ? skipToken : () => api.getCollection(id),
+    refetchInterval: (query) => (isTerminal(query.state.data?.status) ? false : STUDY_POLL_MS),
+  })
+}
+
+/** Every collection, newest first, refreshed while any of them is still going. */
+export function useCollections() {
+  return useQuery<Collection[]>({
+    queryKey: ['collections'],
+    queryFn: api.listCollections,
+    refetchInterval: (query) =>
+      (query.state.data ?? []).every((row) => isTerminal(row.status)) ? false : STUDY_POLL_MS,
+  })
+}
+
+/**
+ * Which markets a launch would find short — asked on the button, not while typing.
+ *
+ * A mutation rather than a query on purpose: the answer is wanted once, at the moment the person
+ * presses Run, and a cached plan from before a collection finished would say data is missing
+ * that is now there.
+ */
+export function usePlanCollections() {
+  return useMutation<PlannedCollection[], Error, PlanCollectionRequest>({
+    mutationFn: (body) => api.planCollections(body),
+  })
+}
+
+export function useSyncSymbols() {
+  const client = useQueryClient()
+  return useMutation<{ job: string }>({
+    mutationFn: () => api.syncSymbols(),
+    onSuccess: () => client.invalidateQueries({ queryKey: ['symbols'] }),
+  })
+}
+
+/**
+ * One saved strategy, by id — the endpoint that had no caller until the builder learned to open
+ * one. Immutable for its version, so it never needs refetching once it has arrived.
+ */
+export function useStrategy(id: string | undefined) {
+  return useQuery<StrategyOut>({
+    queryKey: ['strategy', id],
+    queryFn: id === undefined ? skipToken : () => api.getStrategy(id),
+    staleTime: Infinity,
+  })
 }
 
 export function useCreateStrategy() {
@@ -35,9 +287,140 @@ export function useCreateStrategy() {
   })
 }
 
+/**
+ * Every strategy lineage, for a picker to choose from.
+ *
+ * One row per lineage rather than per version, and a grid's own points are left out by the
+ * server — a hundred-point study writes a hundred strategies nobody picks by hand.
+ */
+export function useStrategies(filters: StrategyFilters = {}) {
+  return useQuery<StrategiesPage>({
+    queryKey: ['strategies', filters],
+    queryFn: () => api.listStrategies(filters),
+  })
+}
+
+/**
+ * Save a document under a lineage: a new strategy, or the next version of one already saved.
+ *
+ * `POST` always writes version 1, and (name, version) is unique, so saving the same name twice can
+ * only ever conflict. Iterating — nudge the period, run it again — is therefore not a `POST` at
+ * all; it is `PUT` on the previous version, which the API inserts as the next one, linked to its
+ * parent. Choosing between them by *name* is what lets the screen keep one button.
+ *
+ * ⚠️ **The name is looked up on the server, and that is the fix for the 409.** This used to
+ * decide from the id the screen had created in *this browser session*, so a strategy saved from
+ * any other tab, or before a reload, was invisible to it — and saving under that name was a
+ * `POST` that collided. What a name means is a fact about the database, never about what a tab
+ * remembers.
+ *
+ * `include_generated` on the lookup, because a name is taken in the database whether or not a
+ * picker chooses to show it. Hidden is not free, and conflating the two would put the 409 back
+ * for exactly the names a study had generated.
+ */
+export function useSaveStrategy() {
+  const client = useQueryClient()
+  return useMutation<StrategyOut, Error, { definition: Strategy }>({
+    // ⚠️ **The lists are invalidated, because saving no longer happens beside a run.** The builder
+    // used to save and launch in one click, and nothing read the strategy list in between. It now
+    // lives in the catalogue and only saves, and the strategy just saved is exactly what the
+    // reader goes looking for next. ⚠️ The one picker that needs this is "Add to the catalogue",
+    // which can be open on the same screen while the builder saves: mounted before the save, it
+    // would go on offering the list from before it. New backtest's picker mounts after the
+    // navigation and refetches on mount anyway (`useStrategies` sets no `staleTime`).
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['strategies'] })
+    },
+    mutationFn: async ({ definition }) => {
+      const taken = await api.listStrategies({
+        name: definition.name,
+        include_generated: true,
+      })
+      const existing = taken.items[0]
+      return existing === undefined
+        ? api.createStrategy(definition)
+        : api.updateStrategy(existing.id, definition)
+    },
+  })
+}
+
+/**
+ * The shelf, whole. Not paged: a catalogue is read all at once and a hundred rows is not a
+ * paging problem — one a person has to hunt through page by page is a catalogue that has
+ * stopped being one.
+ */
+/** Catalogue entries asked for per request — the API's own ceiling. */
+const CATALOG_PER_REQUEST = 200
+
+/**
+ * The whole shelf, read two hundred at a time (04/10): the API's first page of a hundred was the
+ * whole answer before, and an entry past it could not be found or swept. The screens page it.
+ */
+export async function wholeCatalog(): Promise<CatalogPage> {
+  const first = await api.listCatalog(CATALOG_PER_REQUEST, 0)
+  const items = [...first.items]
+  while (items.length < first.total) {
+    const next = await api.listCatalog(CATALOG_PER_REQUEST, items.length)
+    if (next.items.length === 0) break
+    items.push(...next.items)
+  }
+  return { ...first, items }
+}
+
+export function useCatalog() {
+  return useQuery<CatalogPage>({
+    queryKey: ['catalog'],
+    queryFn: wholeCatalog,
+  })
+}
+
+/**
+ * Put a strategy on the shelf.
+ *
+ * ⚠️ The list is invalidated rather than patched. A catalogue is exactly the kind of thing two
+ * tabs write to, and a locally spliced row is a guess about what the server accepted — which is
+ * wrong the moment the unique name lost a race.
+ */
+export function useCreateCatalogEntry() {
+  const client = useQueryClient()
+  return useMutation<CatalogEntry, Error, CreateCatalogEntry>({
+    mutationFn: (body) => api.createCatalogEntry(body),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
+export function useUpdateCatalogEntry() {
+  const client = useQueryClient()
+  return useMutation<CatalogEntry, Error, { id: string; body: UpdateCatalogEntry }>({
+    mutationFn: ({ id, body }) => api.updateCatalogEntry(id, body),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
+export function useDeleteCatalogEntry() {
+  const client = useQueryClient()
+  return useMutation<null, Error, string>({
+    mutationFn: (id) => api.deleteCatalogEntry(id),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
 export function useCreateBacktest() {
   return useMutation<CreatedBacktest, Error, CreateBacktestRequest>({
     mutationFn: (payload) => api.createBacktest(payload),
+  })
+}
+
+/** Run a point again, keeping everything: what a sweep's run did not keep comes back this way. */
+export function useRerunBacktest() {
+  return useMutation<CreatedBacktest, Error, string>({
+    mutationFn: (id) => api.rerunBacktest(id),
   })
 }
 
@@ -52,10 +435,77 @@ export function useBacktest(id: string | undefined) {
   })
 }
 
+/**
+ * The run log: every backtest, newest first, under the current filters.
+ *
+ * The filters are part of the query key, so switching from EURUSD to AAPL is a different cached
+ * entry rather than a refetch that blanks the table. `placeholderData` keeps the previous page on
+ * screen while the next one loads, which is what stops the layout jumping on every keystroke.
+ */
+export function useBacktests(filters: BacktestFilters) {
+  return useQuery<BacktestsPage>({
+    queryKey: ['backtests', filters],
+    queryFn: () => api.listBacktests(filters),
+    placeholderData: (previous) => previous,
+  })
+}
+
+/**
+ * The equity curves of the selected runs, fetched in parallel — one query per run, not one
+ * request for all of them.
+ *
+ * `useQueries` rather than a loop of `useQuery` because the number of selected runs changes as
+ * the user ticks boxes, and hooks cannot be called conditionally. It also gives each curve its
+ * own cache entry keyed by run id, which is what makes unticking and re-ticking a run free.
+ *
+ * `staleTime: Infinity` because a finished run's curve is frozen: the backtest wrote it once and
+ * nothing can change it. Re-polling it would be pure waste — the largest of these is 856 kB.
+ */
+export function useEquityCurves(ids: readonly string[]) {
+  return useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ['equity', id],
+      queryFn: () => api.getEquity(id),
+      staleTime: Infinity,
+    })),
+    combine: (results) => ({
+      curves: new Map(
+        results.flatMap((result, index) => {
+          const id = ids[index]
+          return result.data !== undefined && id !== undefined
+            ? ([[id, result.data]] as [string, EquityPoint[]][])
+            : []
+        }),
+      ),
+      isPending: results.some((result) => result.isPending),
+      isError: results.some((result) => result.isError),
+    }),
+  })
+}
+
+/** Trades asked for per request — the API's own ceiling. */
+const TRADES_PER_REQUEST = 1000
+
+/**
+ * Every trade of a run, read a thousand at a time (04/10). The first page alone was the whole
+ * answer before, and a run of five years on M5 has thousands: the table and the chart's markers
+ * stopped at the hundredth trade without saying so. The table pages them on screen.
+ */
+export async function allTrades(id: string): Promise<TradesPage> {
+  const first = await api.getTrades(id, TRADES_PER_REQUEST, 0)
+  const items = [...first.items]
+  while (items.length < first.total) {
+    const next = await api.getTrades(id, TRADES_PER_REQUEST, items.length)
+    if (next.items.length === 0) break
+    items.push(...next.items)
+  }
+  return { ...first, limit: items.length, items }
+}
+
 export function useTrades(id: string | undefined, enabled: boolean) {
   return useQuery<TradesPage>({
     queryKey: ['trades', id],
-    queryFn: id !== undefined && enabled ? () => api.getTrades(id) : skipToken,
+    queryFn: id !== undefined && enabled ? () => allTrades(id) : skipToken,
   })
 }
 
@@ -63,5 +513,896 @@ export function useEquity(id: string | undefined, enabled: boolean) {
   return useQuery<EquityPoint[]>({
     queryKey: ['equity', id],
     queryFn: id !== undefined && enabled ? () => api.getEquity(id) : skipToken,
+  })
+}
+
+/**
+ * A finished run cut to the whole years `[first, last]` in R (01/10).
+ *
+ * ⚠️ `retry: false` because a 422 is the answer "this run cannot stand for that window", with the
+ * reason in its detail — asked again it says the same thing. Kept for good: a finished run's cut
+ * never changes.
+ */
+export function useYearCut(id: string | undefined, first: number, last: number, enabled: boolean) {
+  return useQuery<YearCut>({
+    queryKey: ['year-cut', id, first, last],
+    queryFn: id !== undefined && enabled ? () => api.getYearCut(id, first, last) : skipToken,
+    retry: false,
+    staleTime: Infinity,
+  })
+}
+
+/**
+ * The price the run was executed over, fetched only when someone opens the chart.
+ *
+ * `enabled` carries two conditions from the caller: the run has finished, and the price tab is
+ * the one on screen. Both matter — this is the largest payload the results page can ask for
+ * (thousands of bars, against a handful of metrics), and fetching it for a reader who never
+ * leaves the metrics tab would be the page's whole cost, spent on nothing.
+ *
+ * `staleTime: Infinity` because the answer genuinely cannot change while the page is open: the
+ * window is bounded by the provenance a *finished* run recorded, and a finished run never eats
+ * another candle. Re-fetching on every window focus would re-download thousands of bars to
+ * receive the same ones back.
+ */
+/**
+ * The curves the strategy was reading, on the same terms as the candles.
+ *
+ * A query of its own rather than a field on the candles response: a strategy may have no curves
+ * at all (the structure setups draw zones, not lines), and folding an optional thing into a
+ * required one would make every caller check the same emptiness twice.
+ */
+export function useOverlays(id: string | undefined, enabled: boolean) {
+  return useQuery<OverlaysResponse>({
+    queryKey: ['overlays', id],
+    queryFn: id !== undefined && enabled ? () => api.getOverlays(id) : skipToken,
+    staleTime: Infinity,
+  })
+}
+
+export function useCandles(id: string | undefined, enabled: boolean) {
+  return useQuery<CandlesResponse>({
+    queryKey: ['candles', id],
+    queryFn: id !== undefined && enabled ? () => api.getCandles(id) : skipToken,
+    staleTime: Infinity,
+  })
+}
+
+/**
+ * The entry picture for one trade, fetched only once someone opens it.
+ *
+ * `tradeId === null` means nothing is open, and `skipToken` keeps the query from running at all —
+ * which is the whole point. Loading every snapshot with the trades list would assemble megabytes
+ * a reader never looks at; the two or three entries that look wrong are the ones that get opened.
+ *
+ * Cached per trade, so re-opening one costs nothing and closing does not throw the bars away.
+ */
+export function useCreateBasket() {
+  return useMutation<CreatedBasket, Error, CreateBasketRequest>({
+    mutationFn: (payload) => api.createBasket(payload),
+  })
+}
+
+/**
+ * Is every run in this basket over? — the basket's own version of `isTerminal`.
+ *
+ * A basket is not "done" the way a run is; it has no status of its own, only N runs that finish
+ * at their own pace. So the poll stops when the **last** one lands, not the first.
+ *
+ * ⚠️ A basket with no runs counts as settled. It cannot be created — the API refuses fewer than
+ * two symbols — but reading it as unsettled would leave `every` returning `true` for an empty
+ * list to fight a poll that never stops, and a query that polls forever over a shape that
+ * cannot happen is worse than one that quietly agrees there is nothing to wait for.
+ */
+export function isSettled(basket: BasketOut | undefined): boolean {
+  return basket?.runs.every((run) => isTerminal(run.status)) ?? false
+}
+
+/**
+ * One basket, polled until every run in it has landed.
+ *
+ * Same 202-plus-poll contract the single run uses, one level up. The interval is deliberately
+ * the same: a basket is N runs on the same worker pool, so it settles on the timescale of the
+ * slowest of them, and asking more often would only add requests to the thing being waited on.
+ */
+export function useBasket(id: string | undefined) {
+  return useQuery<BasketOut>({
+    queryKey: ['basket', id],
+    queryFn: id === undefined ? skipToken : () => api.getBasket(id),
+    refetchInterval: (query) => (isSettled(query.state.data) ? false : POLL_MS),
+  })
+}
+
+export function useTradeSnapshot(backtestId: string | undefined, tradeId: number | null) {
+  return useQuery<Snapshot>({
+    queryKey: ['snapshot', backtestId, tradeId],
+    queryFn:
+      backtestId !== undefined && tradeId !== null
+        ? () => api.getTradeSnapshot(backtestId, tradeId)
+        : skipToken,
+    // A recorded window never changes: it was frozen with the trade. Nothing to refetch.
+    staleTime: Infinity,
+  })
+}
+
+/**
+ * What this grid would produce, asked while it is still being typed.
+ *
+ * ⚠️ **The browser cannot answer this and must not try.** Whether a point can run is the DSL's
+ * semantics — `htf` coarser than the document's own timeframe and a whole number of its bars, a
+ * broker clock required beside a filter — and those live in Python, once. A screen that
+ * reimplemented them in TypeScript would be a second copy of the contract, wrong the day either
+ * changed. So it asks the authority, and the answer cannot drift from the launch's.
+ *
+ * A POST, and still a query: it writes nothing, and the question is asked over and over as the
+ * form changes. The debounce is the caller's, for the reason `useSymbolSearch` gives — keying on
+ * the grid here would re-key on every character anyway.
+ *
+ * `enabled` only once there is a strategy and at least one axis: an empty grid has no preview to
+ * ask for, and the endpoint refuses one.
+ */
+export function useStudyPreview(
+  strategyId: string | null,
+  grid: Record<string, unknown[]>,
+  timeframe: string,
+) {
+  const asked = strategyId !== null && Object.keys(grid).length > 0
+  return useQuery<{ grid: Record<string, unknown[]>; preview: StudyPreview }>({
+    // ⚠️ The timeframe is in the key, not only in the body. Leaving it out would serve the
+    // verdict for M15 after the reader switched the form to H4 — a cached answer about a study
+    // nobody is proposing, which is the same failure the grid is keyed for.
+    queryKey: ['study-preview', strategyId, grid, timeframe],
+    // ⚠️ **The answer carries the grid it is about**, rather than the caller trusting that
+    // whatever is in `data` belongs to the key it just asked on. That trust holds today only
+    // because this query has no `placeholderData` — and adding some is the obvious improvement
+    // somebody makes to stop the warning flickering, which would silently hand a caller a real
+    // verdict about a grid nobody is looking at. Carried here, that cannot happen quietly.
+    queryFn: asked
+      ? async () => ({
+          grid,
+          preview: await api.previewStudy({
+            strategy_id: strategyId,
+            grid,
+            timeframe,
+          }),
+        })
+      : skipToken,
+  })
+}
+
+export function useCreateStudy() {
+  return useMutation<CreatedStudy, Error, CreateStudyRequest>({
+    mutationFn: (payload) => api.createStudy(payload),
+  })
+}
+
+/**
+ * What this sweep would enqueue, asked while the form is still being filled in.
+ *
+ * The study's preview one axis up, and for the same reason: whether a combination can run is the
+ * DSL's semantics, and those live in Python once. What is new here is that the answer carries
+ * **three** independent noes — a combination the DSL refuses, a (symbol, timeframe) with no
+ * candles in the window, and a sweep with nothing to run — and only the first is about the strategy.
+ * A screen that pooled them would send somebody to edit a grid when the fix is a backfill.
+ *
+ * ⚠️ **The answer carries the question it is about.** Read off `asked`, never assumed from the
+ * key: the caller debounces, so for as long as the debounce lasts what is in hand is a *true*
+ * verdict about a sweep nobody is proposing any more. It carries the **whole** request, where the
+ * study's copy carries only the grid while its key also holds the strategy and the timeframe —
+ * so with `placeholderData` switched on, a study whose timeframe changed would still pass its
+ * comparison. Carrying everything the key holds leaves no field for that to slip through.
+ */
+export function useSweepPreview(request: PreviewSweepRequest | null) {
+  return useQuery<{ asked: PreviewSweepRequest; preview: SweepPreview }>({
+    queryKey: ['sweep-preview', request],
+    // ⚠️ **The signal is consumed, so a superseded preview is cancelled** (26/09). Ticking six
+    // charts asks six questions; unconsumed, all six ran to the end on the server — two minutes
+    // of CPU each over a large grid — and took the API down. Consumed, React Query aborts the
+    // request the moment its key is no longer observed, and the server stops with it.
+    queryFn:
+      request !== null
+        ? async ({ signal }) => ({
+            asked: request,
+            preview: await api.previewSweep(request, signal),
+          })
+        : skipToken,
+    // Not asked again on failure: a preview that failed under load, asked three more times, is
+    // the load.
+    retry: false,
+  })
+}
+
+export function useCreateSweep() {
+  return useMutation<CreatedSweep, Error, CreateSweepRequest>({
+    mutationFn: (payload) => api.createSweep(payload),
+  })
+}
+
+/**
+ * Whether every run of a sweep has landed — the moment its poll can stop.
+ *
+ * Its own function rather than the study's, for the reason `isStudySettled` gives: the bodies are
+ * different shapes, and one function over a union is a seam where a field added to one of them
+ * silently applies to the other. Here the status sits one level down, inside `run`.
+ */
+export function isSweepSettled(sweep: SweepOut | undefined): boolean {
+  if (sweep === undefined) return false
+  // The counts when the body carries them — it does when read without its runs, which is how the
+  // screen reads it — and the runs otherwise.
+  const counts = sweep.counts
+  if (counts !== undefined && counts !== null) return counts.running === 0 && counts.queued === 0
+  return sweep.runs.every((row) => isTerminal(row.run.status))
+}
+
+/**
+ * One sweep, polled until every run has landed.
+ *
+ * ⚠️ **At the study's cadence, not a basket's, and the sweep is where that matters most.** A sweep
+ * is up to thousands of runs drained by one worker pool, and every response carries all of them —
+ * asking every second would add requests to the very queue being waited on.
+ */
+export function useSweep(id: string | undefined) {
+  return useQuery<SweepOut>({
+    queryKey: ['sweep', id],
+    queryFn: id === undefined ? skipToken : () => api.getSweep(id, 'none'),
+    refetchInterval: (query) => (isSweepQuiet(query.state.data) ? false : STUDY_POLL_MS),
+  })
+}
+
+/**
+ * Whether nothing about this sweep will change until somebody acts: every run ended, or it is
+ * paused (05/10). A paused sweep's page polled on for hours — a sweep of 563 thousand runs, its
+ * summary 75 s a read — and the resume reads it again anyway (`usePauseSweep`).
+ */
+export function isSweepQuiet(sweep: SweepOut | undefined): boolean {
+  return isSweepSettled(sweep) || (sweep?.paused_at ?? null) !== null
+}
+
+/**
+ * One page of one entry's runs, ranked by the server — polled while the sweep runs, because a
+ * finishing run can move into the page being read. The previous page stays on screen while the
+ * next one loads, so paging never blanks the table.
+ */
+export function useSweepRuns(
+  id: string,
+  page: {
+    entryId: string
+    rankBy: RankKey
+    offset: number
+    limit: number
+    allRuns?: boolean
+    showClones?: boolean
+  },
+  polling: boolean,
+) {
+  return useQuery<SweepRunsPage>({
+    queryKey: [
+      'sweep-runs',
+      id,
+      page.entryId,
+      page.rankBy,
+      page.offset,
+      page.limit,
+      page.allRuns ?? false,
+      page.showClones ?? false,
+    ],
+    queryFn: () => api.getSweepRuns(id, page),
+    placeholderData: (previous) => previous,
+    refetchInterval: polling ? STUDY_POLL_MS : false,
+  })
+}
+
+/** Launch a reserved-window test of a sweep's best points. */
+export function useCreateHoldout(sweepId: string) {
+  return useMutation<CreatedSweep, Error, CreateHoldoutRequest>({
+    mutationFn: (payload) => api.createHoldout(sweepId, payload),
+  })
+}
+
+/** Whether every tested point has landed — the moment the comparison's poll can stop. */
+export function isHoldoutSettled(holdout: HoldoutOut | undefined): boolean {
+  return holdout?.rows.every((row) => isTerminal(row.out_of_sample.status)) ?? false
+}
+
+/**
+ * A reserved-window test read against the sweep it came from, polled until every point lands.
+ * `id` is `undefined` for a sweep that is not a test, which asks nothing.
+ */
+export function useHoldout(id: string | undefined) {
+  return useQuery<HoldoutOut>({
+    queryKey: ['holdout', id],
+    queryFn: id === undefined ? skipToken : () => api.getHoldout(id),
+    refetchInterval: (query) => (isHoldoutSettled(query.state.data) ? false : STUDY_POLL_MS),
+  })
+}
+
+/** Every slicing kept for a reserved-window test, newest first. */
+export function useSlicings(id: string) {
+  return useQuery<SlicingOut[]>({
+    queryKey: ['slicings', id],
+    queryFn: () => api.listSlicings(id),
+  })
+}
+
+/** Judge a finished test in pieces; the new slicing joins the list on success. */
+export function useCreateSlicing(id: string) {
+  const client = useQueryClient()
+  return useMutation<SlicingOut, Error, CreateSlicingRequest>({
+    mutationFn: (payload) => api.createSlicing(id, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['slicings', id] })
+    },
+  })
+}
+
+/** Whether nothing in a template's queue is waiting or running — when its poll can stop. */
+export function isTemplateSettled(template: SweepTemplateOut | undefined): boolean {
+  if (template === undefined) return false
+  return !template.items.some(
+    (one) => one.status === 'waiting' || (one.status === 'launched' && !one.finished),
+  )
+}
+
+/** Every template, newest first. */
+export function useSweepTemplates() {
+  return useQuery<SweepTemplateListItem[]>({
+    queryKey: ['sweep-templates'],
+    queryFn: api.listSweepTemplates,
+  })
+}
+
+/** One template and its queue, polled while any market is waiting or running. */
+export function useSweepTemplate(id: string | undefined) {
+  return useQuery<SweepTemplateOut>({
+    queryKey: ['sweep-template', id],
+    queryFn: id === undefined ? skipToken : () => api.getSweepTemplate(id),
+    refetchInterval: (query) => (isTemplateSettled(query.state.data) ? false : STUDY_POLL_MS * 5),
+  })
+}
+
+export function useCreateSweepTemplate() {
+  const client = useQueryClient()
+  return useMutation<SweepTemplateOut, Error, CreateSweepTemplateRequest>({
+    mutationFn: (payload) => api.createSweepTemplate(payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['sweep-templates'] })
+    },
+  })
+}
+
+/** Change a template's queue — add markets, pause, resume, remove one — and show the answer. */
+export function useTemplateQueue(id: string) {
+  const client = useQueryClient()
+  const settle = (template: SweepTemplateOut): void => {
+    client.setQueryData(['sweep-template', id], template)
+    void client.invalidateQueries({ queryKey: ['sweep-templates'] })
+  }
+  return {
+    add: useMutation<SweepTemplateOut, Error, QueueMarket[]>({
+      mutationFn: (markets) => api.queueMarkets(id, markets),
+      onSuccess: settle,
+    }),
+    pause: useMutation<SweepTemplateOut, Error, undefined>({
+      mutationFn: () => api.pauseTemplate(id),
+      onSuccess: settle,
+    }),
+    resume: useMutation<SweepTemplateOut, Error, undefined>({
+      mutationFn: () => api.resumeTemplate(id),
+      onSuccess: settle,
+    }),
+    remove: useMutation<SweepTemplateOut, Error, string>({
+      mutationFn: (itemId) => api.removeTemplateItem(id, itemId),
+      onSuccess: settle,
+    }),
+  }
+}
+
+/** Read finished sweeps together as one. */
+export function useCombineSweeps() {
+  return useMutation<CreatedSweep, Error, string[]>({
+    mutationFn: (sweepIds) => api.combineSweeps(sweepIds),
+  })
+}
+
+/** Every walk-forward of a sweep, newest first. */
+export function useSweepWalkForwards(sweepId: string) {
+  return useQuery<SweepWalkForwardOut[]>({
+    queryKey: ['sweep-walkforwards', sweepId],
+    queryFn: () => api.listSweepWalkForwards(sweepId),
+  })
+}
+
+/** One walk-forward, polled until every fold has ended. */
+export function useSweepWalkForward(id: string | undefined) {
+  return useQuery<SweepWalkForwardOut>({
+    queryKey: ['sweep-walkforward', id],
+    queryFn: id === undefined ? skipToken : () => api.getSweepWalkForward(id),
+    refetchInterval: (query) => (isTerminal(query.state.data?.status) ? false : STUDY_POLL_MS * 5),
+  })
+}
+
+/** Launch a sweep's walk-forward. */
+export function useCreateSweepWalkForward(sweepId: string) {
+  const client = useQueryClient()
+  return useMutation<CreatedSweepWalkForward, Error, CreateSweepWalkForwardRequest>({
+    mutationFn: (payload) => api.createSweepWalkForward(sweepId, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({
+        queryKey: ['sweep-walkforwards', sweepId],
+      })
+    },
+  })
+}
+
+/** The latest clusters first. */
+export function useClusters() {
+  return useQuery<ClusterListItem[]>({
+    queryKey: ['clusters'],
+    queryFn: api.listClusters,
+  })
+}
+
+/** One cluster, polled until its replay has ended. */
+export function useCluster(id: string | undefined) {
+  return useQuery<ClusterOut>({
+    queryKey: ['cluster', id],
+    queryFn: id === undefined ? skipToken : () => api.getCluster(id),
+    refetchInterval: (query) => (isTerminal(query.state.data?.status) ? false : STUDY_POLL_MS),
+  })
+}
+
+/** Keep a cluster and queue its replay. */
+export function useCreateCluster() {
+  const client = useQueryClient()
+  return useMutation<ClusterOut, Error, CreateClusterRequest>({
+    mutationFn: (payload) => api.createCluster(payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['clusters'] })
+    },
+  })
+}
+
+/** Every resampling kept for a reserved-window test, newest first. */
+export function useMonteCarlos(id: string) {
+  return useQuery<MonteCarloOut[]>({
+    queryKey: ['montecarlos', id],
+    queryFn: () => api.listMonteCarlos(id),
+  })
+}
+
+/** Resample a finished test; the new answer joins the list on success. */
+export function useCreateMonteCarlo(id: string) {
+  const client = useQueryClient()
+  return useMutation<MonteCarloOut, Error, CreateMonteCarloRequest>({
+    mutationFn: (payload) => api.createMonteCarlo(id, payload),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['montecarlos', id] })
+    },
+  })
+}
+
+/** How many sweeps the history shows at once. */
+export const SWEEPS_PER_PAGE = 10
+
+/**
+ * Whether every sweep on a history page has stopped moving — the moment its poll can stop.
+ *
+ * Read off the server's counts, not off runs: a history line carries none. Not yet arrived is
+ * not settled, as for a single sweep.
+ */
+export function isHistorySettled(page: SweepsPage | undefined): boolean {
+  return page?.items.every((item) => settled(item.runs)) ?? false
+}
+
+/**
+ * Every sweep launched in a window, summarised — read once, refreshed by hand.
+ *
+ * ⚠️ **Not polled, unlike the history.** A run left `queued` by a worker that never picked it up
+ * stays queued for ever, and a poll that waited for everything to settle would re-read every run
+ * of every sweep every few seconds, indefinitely. The screen offers a refresh instead.
+ */
+export function useSweepDashboard(launched: LaunchWindow | null) {
+  return useQuery<SweepDashboard>({
+    queryKey: ['sweep-dashboard', launched],
+    queryFn: launched === null ? skipToken : () => api.getSweepDashboard(launched),
+    placeholderData: (previous) => previous,
+  })
+}
+
+/**
+ * One page of the sweep history, newest first, polled while any sweep on it is still draining.
+ *
+ * The page keeps showing while the next one loads (`placeholderData`), so paging does not blank
+ * the screen between clicks. ⚠️ The data can then be a different page from the one asked for:
+ * a screen must number the page from `data.offset`, never from the offset it requested. The poll reads counts, not runs — the server sums them — so
+ * it stays cheap however large the sweeps on the page are.
+ */
+export function useSweeps(offset: number) {
+  return useQuery<SweepsPage>({
+    queryKey: ['sweeps', offset],
+    queryFn: () => api.listSweeps({ limit: SWEEPS_PER_PAGE, offset }),
+    placeholderData: (previous) => previous,
+    refetchInterval: (query) => (isHistorySettled(query.state.data) ? false : STUDY_POLL_MS),
+  })
+}
+
+/**
+ * Has every point of this grid landed? — the study's version of `isTerminal`.
+ *
+ * A study has no status of its own, only N runs finishing at their own pace, so the poll stops
+ * when the **last** one does. Separate from a basket's `isSettled` because the two read different
+ * bodies: one function over a union would be a seam where a future field on one shape silently
+ * applies to the other.
+ */
+export function isStudySettled(study: StudyOut | undefined): boolean {
+  return study?.runs.every((run) => isTerminal(run.status)) ?? false
+}
+
+/**
+ * One study, polled until every point has landed.
+ *
+ * ⚠️ **The interval is longer than a basket's, and the reason is arithmetic.** A basket is a
+ * handful of runs; a grid is up to five hundred, drained by the same worker pool one after
+ * another. Polling a five-minute study at a basket's cadence would add hundreds of requests to
+ * the very queue being waited on, and each response carries every run in the study.
+ */
+export function useCreateWalkForward() {
+  return useMutation<CreatedWalkForward, Error, CreateWalkForwardRequest>({
+    mutationFn: (payload) => api.createWalkForward(payload),
+  })
+}
+
+/**
+ * One walk-forward, polled until the orchestrating job stops.
+ *
+ * ⚠️ **This one has a status of its own, unlike a study or a basket**, and the poll reads it
+ * rather than inspecting the runs. That is not a shortcut — it is the only correct source. A
+ * walk-forward's runs do not all exist yet while it is working: a fold's out-of-sample run is
+ * created *after* its training grid has finished and a winner has been picked, so "every run I
+ * can see has landed" is true several times over the course of one experiment, and each time it
+ * would stop the poll on a screen that is still filling in.
+ *
+ * The interval matches a study's, and for the same arithmetic: the folds run one grid after
+ * another inside a single worker slot, so this settles on a scale of minutes.
+ */
+export function useWalkForward(id: string | undefined) {
+  return useQuery<WalkForwardOut>({
+    queryKey: ['walkforward', id],
+    queryFn: id === undefined ? skipToken : () => api.getWalkForward(id),
+    refetchInterval: (query) => (isTerminal(query.state.data?.status) ? false : STUDY_POLL_MS),
+  })
+}
+
+export function useStudy(id: string | undefined) {
+  return useQuery<StudyOut>({
+    queryKey: ['study', id],
+    // `skipToken` rather than `enabled` plus a cast: it narrows the type for real, which is the
+    // idiom the rest of this file already uses.
+    queryFn: id === undefined ? skipToken : () => api.getStudy(id),
+    refetchInterval: (query) => (isStudySettled(query.state.data) ? false : STUDY_POLL_MS),
+  })
+}
+
+/**
+ * What has already been measured about each chosen symbol, fetched in parallel.
+ *
+ * `useQueries` for the same reason `useEquityCurves` uses it: the number of chosen symbols
+ * changes as the user picks, and hooks cannot be called conditionally. Each answer gets its own
+ * cache entry keyed by (symbol, timeframe), so re-picking a symbol is free.
+ *
+ * ⚠️ **Read-only, and a missing entry is not an error.** A symbol nobody has probed answers 404
+ * and lands here as absent — which is a fact the screen has to show ("nobody has measured this
+ * one") rather than a failure. `retry: false` keeps a 404 from being asked four times.
+ */
+export function useSymbolHistories(symbols: readonly string[], timeframe: string) {
+  return useQueries({
+    queries: symbols.map((symbol) => ({
+      queryKey: ['symbol-history', symbol, timeframe],
+      queryFn: () => api.getSymbolHistory(symbol, timeframe),
+      retry: false,
+    })),
+    combine: (results) => ({
+      // A Map rather than an array: the caller asks "what do we know about EURUSD", never
+      // "what is the third answer", and an index-keyed answer would silently shift when a
+      // symbol is removed from the middle of the list.
+      known: new Map(
+        results.flatMap((result, index) => {
+          const symbol = symbols[index]
+          return result.data !== undefined && symbol !== undefined
+            ? ([[symbol, result.data]] as [string, SymbolHistory][])
+            : []
+        }),
+      ),
+      /**
+       * Symbols whose query has come back with **nothing** — a 404, meaning nobody has probed
+       * this pair yet.
+       *
+       * ⚠️ Deliberately not "symbols without data", which would also include the ones still in
+       * flight. Anything that acts on this list acts once per symbol, and firing while a query
+       * is still pending would fire again the moment it lands.
+       */
+      missing: results.flatMap((result, index) => {
+        const symbol = symbols[index]
+        return !result.isPending && result.data === undefined && symbol !== undefined
+          ? [symbol]
+          : []
+      }),
+    }),
+  })
+}
+
+/**
+ * Measure the chosen symbols that nobody has measured yet — once each, ever.
+ *
+ * ## Why the "already asked" set is not optional
+ *
+ * ⚠️ A probe is queued on the **same single-job queue the collection will use**, and a cold H4
+ * took 207 seconds on this broker. Without the set below, every invalidation, re-render or
+ * re-pick would queue the same measurement again, and twenty symbols could put hours of work
+ * in front of the first candle. The set is what makes the price "once per pair" rather than
+ * "once per click", and it is the mitigation the feature's DD-04 depends on.
+ *
+ * ⚠️ It also has to be a ref, not state: writing it during the effect would re-render, and the
+ * re-render would run the effect again. This project has already shipped an auto-selection that
+ * kept re-offering what the user had removed, for want of exactly this set.
+ *
+ * `missing` only ever names symbols whose query has already come back empty, so nothing is
+ * probed while its own measurement is still in flight.
+ */
+export function useAutoProbe(args: { missing: readonly string[]; timeframe: string }): {
+  queued: number
+} {
+  const { missing, timeframe } = args
+  const { mutate } = useProbeSymbol()
+  const asked = useRef(new Set<string>())
+  // Joined into a string so the effect's dependency is the *content* of the list, not the
+  // identity of an array rebuilt on every render.
+  const key = missing.join(',')
+
+  useEffect(() => {
+    for (const symbol of missing) {
+      const pair = `${symbol}|${timeframe}`
+      if (asked.current.has(pair)) continue
+      asked.current.add(pair)
+      mutate({ symbol, timeframe })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `key` stands in for `missing`
+  }, [key, timeframe, mutate])
+
+  // What is still ahead of the collection: everything asked for that has not come back. The
+  // screen says this so a wait reads as a queue rather than as nothing happening.
+  return { queued: missing.length }
+}
+
+// --------------------------------------------------------------------------- //
+// Live sessions                                                                //
+// --------------------------------------------------------------------------- //
+
+/**
+ * Every live session.
+ *
+ * ⚠️ Polled on a slow cadence **even while a socket is open**, and the two are not redundant: the
+ * socket watches one session, this watches the arrival of *another* one. A session started from a
+ * terminal on the trading box would otherwise never appear until somebody reloaded the page.
+ */
+export function useLiveSessions(status?: string) {
+  return useQuery<LiveSessionsPage>({
+    queryKey: ['live-sessions', status ?? null],
+    queryFn: () => api.listLiveSessions(status),
+    refetchInterval: STUDY_POLL_MS,
+  })
+}
+
+/**
+ * One session in full.
+ *
+ * ⚠️ **`live` turns the polling off, and losing the socket turns it back on.** A screen that
+ * simply stopped updating when a socket dropped would look exactly like a quiet market, which is
+ * the one thing a live panel must never be mistakable for.
+ */
+export function useLiveSession(id: string | undefined, live: boolean) {
+  return useQuery<LiveSessionDetail>({
+    queryKey: ['live-session', id],
+    queryFn: id === undefined ? skipToken : () => api.getLiveSession(id),
+    refetchInterval: live ? false : POLL_MS,
+  })
+}
+
+export function useSessionEvents(id: string | undefined, live: boolean) {
+  return useQuery<SessionEventsPage>({
+    queryKey: ['session-events', id],
+    queryFn: id === undefined ? skipToken : () => api.listSessionEvents(id, 50),
+    refetchInterval: live ? false : STUDY_POLL_MS,
+  })
+}
+
+/**
+ * Ask a session to stop.
+ *
+ * ⚠️ The response still says `running`, and that is correct rather than a lag to paper over: only
+ * the session writes `stopped_at`, when it has actually finished. The screen reports the *request*
+ * landing (`stop_requested_at`), never the outcome it cannot observe.
+ */
+export function useStopLiveSession() {
+  const client = useQueryClient()
+  return useMutation<LiveSessionDetail, Error, string>({
+    mutationFn: (id: string) => api.stopLiveSession(id),
+    onSuccess: (session) => {
+      client.setQueryData(['live-session', session.id], session)
+      void client.invalidateQueries({ queryKey: ['live-sessions'] })
+    },
+  })
+}
+
+/**
+ * The kill switch, polled — because this API can only see one of its three layers.
+ *
+ * The file layer lives on the executor's own disk and the endpoint layer in its memory; either one
+ * engaged stops everything while this reports `false`. Nothing pushes a change, and somebody at a
+ * shell can engage it, so a screen that read this once would go on showing a machine as armed
+ * after it had been stopped by hand.
+ */
+export function useKillSwitch() {
+  return useQuery<KillSwitch>({
+    queryKey: ['kill-switch'],
+    queryFn: api.getKillSwitch,
+    refetchInterval: STUDY_POLL_MS,
+  })
+}
+
+export function useEngageKillSwitch() {
+  const client = useQueryClient()
+  return useMutation<KillSwitch>({
+    mutationFn: api.engageKillSwitch,
+    onSuccess: (state) => {
+      client.setQueryData(['kill-switch'], state)
+    },
+  })
+}
+
+/** Every (market, setup, chart)'s best run by `metric` (02/10). Polled slowly: sweeps land runs
+ *  for hours, and the map is read while they do. */
+export function useBestMap(metric: BestMetric, everyRun: boolean) {
+  return useQuery<BestMapOut>({
+    queryKey: ['best-map', metric, everyRun],
+    queryFn: () => api.getBestMap(metric, everyRun),
+    placeholderData: (previous) => previous,
+    // Sooner while a stale map is being computed again: about three minutes, not one more.
+    refetchInterval: (query) => (query.state.data?.refreshing === true ? 15_000 : 60_000),
+  })
+}
+
+/** One cell's top runs, without clones or near-clones — `undefined` until a cell is chosen. */
+export function useBestCell(cell: BestCellQuery | undefined) {
+  return useQuery<BestCellOut>({
+    queryKey: [
+      'best-cell',
+      cell?.symbol,
+      cell?.entryId,
+      cell?.timeframe,
+      cell?.metric,
+      cell?.everyRun,
+    ],
+    queryFn: cell === undefined ? skipToken : () => api.getBestCell(cell),
+  })
+}
+
+/** Pause or resume a sweep (02/10); the sweep is read again either way. */
+export function usePauseSweep(id: string) {
+  const client = useQueryClient()
+  return useMutation<SweepPauseOut, Error, 'pause' | 'resume'>({
+    mutationFn: (action) => (action === 'pause' ? api.pauseSweep(id) : api.resumeSweep(id)),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['sweep', id] })
+    },
+  })
+}
+
+/** The setups the live signals follow (09/10). Polled: a signal's history grows by itself. */
+export function useLiveSetups() {
+  return useQuery<LiveSetup[]>({
+    queryKey: ['live-setups'],
+    queryFn: () => api.listLiveSetups(),
+    refetchInterval: 30_000,
+  })
+}
+
+/** Both readings of the live setups, by setup and by asset, read again after any change. */
+function refreshLive(client: QueryClient): void {
+  void client.invalidateQueries({ queryKey: ['live-setups'] })
+  void client.invalidateQueries({ queryKey: ['live-markets'] })
+}
+
+/** Follow what a finished run was. A setup of the same strategy and chart gains its market. */
+export function useWatchBacktest() {
+  const client = useQueryClient()
+  return useMutation<LiveSetup, Error, string>({
+    mutationFn: (backtestId: string) => api.watchBacktest(backtestId),
+    onSuccess: () => {
+      refreshLive(client)
+    },
+  })
+}
+
+type LiveChange =
+  | { kind: 'setup'; id: string; patch: LiveSetupPatch }
+  | { kind: 'remove-setup'; id: string }
+  | { kind: 'add-market'; id: string; instrumentId: string }
+  | { kind: 'market'; id: string; instrumentId: string; active: boolean }
+  | { kind: 'remove-market'; id: string; instrumentId: string }
+
+/** Every change a live setup takes, through one mutation so the screen has one busy flag. */
+export function useChangeLive() {
+  const client = useQueryClient()
+  return useMutation<LiveSetup | null, Error, LiveChange>({
+    mutationFn: (change) => {
+      switch (change.kind) {
+        case 'setup':
+          return api.changeLiveSetup(change.id, change.patch)
+        case 'remove-setup':
+          return api.removeLiveSetup(change.id)
+        case 'add-market':
+          return api.addLiveMarket(change.id, change.instrumentId)
+        case 'market':
+          return api.changeLiveMarket(change.id, change.instrumentId, change.active)
+        case 'remove-market':
+          return api.removeLiveMarket(change.id, change.instrumentId)
+      }
+    },
+    onSuccess: () => {
+      refreshLive(client)
+    },
+  })
+}
+
+/** Register a setup from scratch — its strategy, chart and markets — and start following it. */
+export function useRegisterLiveSetup() {
+  const client = useQueryClient()
+  return useMutation<LiveSetup, Error, LiveSetupNew>({
+    mutationFn: (body) => api.registerLiveSetup(body),
+    onSuccess: () => {
+      refreshLive(client)
+    },
+  })
+}
+
+/** Edit a setup's parameters: a new version of its strategy, which the setup then runs. */
+export function useEditLiveSetup() {
+  const client = useQueryClient()
+  return useMutation<LiveSetup, Error, { id: string; definition: Record<string, unknown> }>({
+    mutationFn: ({ id, definition }) => api.editLiveSetup(id, definition),
+    onSuccess: () => {
+      refreshLive(client)
+    },
+  })
+}
+
+/** One setup's signals, newest first — fetched only while its history is open. */
+export function useLiveSignals(setupId: string | undefined) {
+  return useQuery<SignalRow[]>({
+    queryKey: ['live-signals', setupId],
+    queryFn: setupId === undefined ? skipToken : () => api.listLiveSignals(setupId),
+    refetchInterval: 30_000,
+  })
+}
+
+/** The setups by asset (ADR-0033). Polled twice as often as the setups: the supervisor takes a
+ *  restart within its next round (≤ 15 s), and the screen should see it land. */
+export function useLiveMarkets() {
+  return useQuery<LiveMarketsOut>({
+    queryKey: ['live-markets'],
+    queryFn: () => api.listLiveMarkets(),
+    refetchInterval: 15_000,
+  })
+}
+
+/** Ask the supervisor to restart one market's sessions together, in one process. */
+export function useRestartMarket() {
+  const client = useQueryClient()
+  return useMutation<{ requested: boolean }, Error, RestartMarketRequest>({
+    mutationFn: (body) => api.restartMarket(body),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['live-markets'] })
+    },
   })
 }

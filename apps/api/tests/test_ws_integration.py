@@ -27,7 +27,7 @@ pytestmark = pytest.mark.integration
 
 
 class _FakeQueue:
-    async def enqueue_job(self, *args: Any) -> None:
+    async def enqueue_job(self, *args: Any, **options: Any) -> None:
         return None
 
 

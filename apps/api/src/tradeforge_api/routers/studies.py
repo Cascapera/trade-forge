@@ -1,0 +1,616 @@
+"""`/studies` — one strategy over a grid of its own parameters, to see the shape of the result.
+
+The sibling of `/baskets`, and the pair is the point. A basket varies the **market** and holds
+the parameters still: *does this method survive outside the instrument it was built on?* A study
+varies the **parameters** and holds the market still: *is this result a property of the method,
+or of the corner I happened to pick?* Both exist because a single number from a single run
+cannot answer either.
+
+`POST` does what `POST /backtests` does, N times, in one transaction, and runs nothing itself.
+Each combination becomes its own stored `Strategy` and its own queued `Backtest` — so every run
+still answers "what did I execute?" by pointing at one immutable document, exactly like every
+other run in the system.
+
+⚠️ **The read side deliberately refuses to headline the winner.** A grid always has a best
+point; a grid of pure noise has a best point. See `StudyAggregate`.
+"""
+
+import json
+import uuid
+from collections.abc import Mapping, Sequence
+from decimal import Decimal
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import defer, selectinload
+
+from tradeforge_api.coverage import describe, to_collect, uncovered_markets
+from tradeforge_api.deps import CollectorDep, QueueDep, SessionDep
+from tradeforge_api.grid import (
+    GridError,
+    GridPoint,
+    coordinates,
+    expand,
+    label_for,
+    named,
+    read_point,
+)
+from tradeforge_api.queue import COLLECT_RANGE, RUN_BACKTEST, collect_queue_for
+from tradeforge_api.routers.backtests import list_item
+from tradeforge_api.routers.strategies import refusal_of, validate_document
+from tradeforge_api.runner import ENGINE_VERSION
+from tradeforge_api.schemas import (
+    CreatedStudy,
+    CreateStudyRequest,
+    GridRefusal,
+    PreviewStudyRequest,
+    StudyAggregate,
+    StudyOut,
+    StudyPointOut,
+    StudyPreview,
+)
+from tradeforge_collector import step
+from tradeforge_collector.collect import year_slices
+from tradeforge_db.collections import create_collection
+from tradeforge_db.models import (
+    Backtest,
+    BacktestCollection,
+    BacktestMetrics,
+    BacktestStatus,
+    Instrument,
+    Strategy,
+    Study,
+)
+
+router = APIRouter(tags=["studies"])
+
+_Responses = dict[int | str, dict[str, Any]]
+_NOT_FOUND: _Responses = {status.HTTP_404_NOT_FOUND: {"description": "not found"}}
+_BAD_BODY: _Responses = {status.HTTP_400_BAD_REQUEST: {"description": "malformed request body"}}
+
+
+def points_for(
+    base: Strategy, grid: Mapping[str, Sequence[Any]], timeframe: str
+) -> list[GridPoint]:
+    """Expand the grid, drop the points that cannot run at this timeframe, or refuse.
+
+    Public because `/walkforwards` runs the same grid over each of its folds, and it has to
+    produce *identical* documents to the ones the study ran: the whole comparison is between a
+    heatmap and a blind choice over the same parameter space. A second expansion written next
+    door would be the same code until the day one of them was fixed.
+
+    `expand` rejects a grid that cannot be applied to *this* document at all (an unreachable
+    path, an empty axis, a repeated value) — that refuses the request. Then each resulting
+    document is asked, at the study's timeframe, whether it can run, because a substituted value
+    can be individually legal and still produce a strategy that cannot: a higher timeframe no
+    coarser than the chart, a period of zero.
+
+    ⚠️ **A point that cannot run is dropped, not a reason to refuse the grid** (his request,
+    18/09). Sweeping the higher timeframe from M5 to W1 over an M30 chart makes M5 and M15
+    impossible by the DSL's own rule, and refusing the whole study for them made the axis
+    unusable — while the sweep, over the very same rule, already left such points out. The
+    preview names every one of them (`preview_of`), so none disappears without a word; and a
+    point that *could* run is never dropped. Only when nothing is left is the request refused,
+    with the first point's reason in the validator's own body.
+
+    Dropped here, once, for the walk-forward too: it runs the same points the study ran, and a
+    second rule next door would be the same code until one of them was fixed.
+    """
+    try:
+        points = _prepared(base, grid)
+    except GridError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+
+    # ⚠️ **Asked at the timeframe the study will actually run**, which is not the one the
+    # document carries. The two are different fields and the engine reads each by a different
+    # road (`runner.timeframe_refusal`); a point whose `htf` filter is legal on the saved document
+    # can be a filter that quietly stops filtering at the study's timeframe.
+    #
+    # Substituted for the check only — **not** written into the point. The stored document is
+    # what `strategies_for` deduplicates on, and a timeframe in it would make the same grid at two
+    # timeframes collide on `(name, version)`.
+    runnable = [
+        point for point in points if refusal_of({**point.document, "timeframe": timeframe}) is None
+    ]
+    if not runnable:
+        # Raises the same 422 the strategy endpoint raises, carrying the same error body — so a
+        # client already able to explain why a strategy was rejected can explain this one too.
+        validate_document({**points[0].document, "timeframe": timeframe})
+    return runnable
+
+
+def _prepared(base: Strategy, grid: Mapping[str, Sequence[Any]]) -> list[GridPoint]:
+    """The grid expanded and every point named — everything that happens before validating.
+
+    ⚠️ **Shared with the preview, and it has to be.** A preview that answered about *nearly* the
+    documents the launch would run is worse than none: it agrees with the right answer and with
+    the wrong one. Naming is part of it and not a flourish — the name is written **into the
+    document**, because `strategies.name` is a generated column (`definition ->> 'name'`) and the
+    document is the only place a name can be set. It is a field the DSL checks, so a point is not
+    the document that will be validated until it has one.
+
+    What is *not* shared is what comes next. See `refusal_of`.
+    """
+    points = expand(base.definition, grid)
+    for point in points:
+        point.document["name"] = named(base.name, point)
+    return points
+
+
+def strategies_for(session: SessionDep, points: list[GridPoint]) -> list[Strategy]:
+    """One stored strategy per point, reusing an identical one where it already exists.
+
+    Public for `/walkforwards`, where the reuse stops being a nicety and becomes the mechanism:
+    a point's document carries no symbol and no dates, so `period=9` is byte-identical in every
+    fold, and six folds over fifty points write fifty strategies rather than three hundred.
+
+    ⚠️ **Reuse is not an optimisation here; without it the second study fails outright.** A
+    point's document contains no symbol and no dates — those live on the run — so launching the
+    same grid over a different market, or a different period, produces byte-identical
+    documents. Written blindly at version 1 they would collide on the unique `(name, version)`
+    the moment anyone ran a grid twice, and the failure would arrive as a 500 from an integrity
+    error rather than as anything a caller could act on.
+
+    Reused only when the document **matches**, never on the name alone. A name is a label and
+    could have been used by hand for something else; running that instead would silently
+    execute a different strategy under a caption saying otherwise. When the name is taken by a
+    different document the point becomes the next version of it, which is exactly what the
+    strategies endpoint means by an edit.
+
+    ⚠️ **A fresh point carries no parent, and a successor must.** `strategies` enforces
+    `(version = 1) = (parent_version_id IS NULL)` — a lineage starts at version 1 with nothing
+    behind it, and every later version has to name what it succeeds. A point's name is normally
+    a name nothing has used, so it *is* a new lineage; the link back to the strategy the grid
+    was built from is not lost, it lives on `studies.strategy_id`, the row whose whole job is
+    to say these hundred came from that one. Recording it twice would be two answers to one
+    question. Only when the name is already taken by a *different* document does a point become
+    version N+1 — and then it must point at the version it follows, or the same constraint
+    refuses it.
+    """
+    names = {str(point.document["name"]) for point in points}
+    existing = list(session.scalars(select(Strategy).where(Strategy.name.in_(names))))
+
+    identical = {(row.name, _key(row.definition)): row for row in existing}
+    # The tip of each lineage: the version a successor would follow, and the row it points at.
+    tip: dict[str, Strategy] = {}
+    for row in existing:
+        if row.name not in tip or row.version > tip[row.name].version:
+            tip[row.name] = row
+
+    built: list[Strategy] = []
+    for point in points:
+        name = str(point.document["name"])
+        found = identical.get((name, _key(point.document)))
+        if found is not None:
+            built.append(found)
+            continue
+        # No bookkeeping for a second new row under the same name, because there cannot be
+        # one: every point of a grid is a distinct combination, and a name is built from all of
+        # its values, so within one call the names are distinct by construction.
+        parent = tip.get(name)
+        built.append(
+            Strategy(
+                definition=point.document,
+                version=1 if parent is None else parent.version + 1,
+                parent_version_id=None if parent is None else parent.id,
+            )
+        )
+    return built
+
+
+def _key(document: dict[str, Any]) -> str:
+    """A document as a comparable string: sorted keys, so ordering is not part of the identity.
+
+    Two documents that differ only in the order their keys were written are the same strategy,
+    and JSONB does not preserve that order anyway — comparing the raw dicts would work by
+    accident today and stop working the day one of them makes a round trip through Postgres.
+    """
+    return json.dumps(document, sort_keys=True, default=str)
+
+
+@router.post("/studies/preview", response_model=StudyPreview, responses={**_NOT_FOUND, **_BAD_BODY})
+def preview_study(request: PreviewStudyRequest, session: SessionDep) -> StudyPreview:
+    """What this grid would produce, without producing any of it.
+
+    ⚠️ **The browser cannot answer this question and must not try.** Whether a point can run is
+    the DSL's semantics — `htf` has to be coarser than the document's own timeframe and a whole
+    number of its bars, a clock is required beside a filter — and those live in Python, once. A
+    screen that reimplemented them in TypeScript would be a second copy of the contract, drifting
+    from the first the day either changed. So the screen asks the authority instead of imitating
+    it, and the answer cannot be wrong for long.
+
+    Nothing is written and nothing is queued. The strategy is read to expand the grid against it,
+    which is why a missing one is a 404 rather than an empty preview.
+
+    ⚠️ **Not `points_for`.** That one decides — it drops what cannot run and refuses only when
+    nothing is left. This one reports, so it walks every point and names each one the launch will
+    drop, with the reason. Both ask `refusal_of` at the study's timeframe, over the same
+    `_prepared` points, so the list a person reads is the list the launch leaves out.
+    """
+    base = session.get(Strategy, request.strategy_id)
+    if base is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="strategy not found")
+    return preview_of(base, request.grid, request.timeframe)
+
+
+def preview_of(base: Strategy, grid: Mapping[str, Sequence[Any]], timeframe: str) -> StudyPreview:
+    """The preview itself, with the database left at the door.
+
+    Separated from the route because everything worth being wrong about is here — which points
+    exist, which of them cannot run, and whether that answer matches what a launch would decide.
+    A test driving this through HTTP and a real Postgres would run the same walk behind three
+    layers that can only obscure which one was wrong.
+    """
+    try:
+        points = _prepared(base, grid)
+    except GridError as exc:
+        # Not a 422: the caller asked what this grid would do, and "it cannot be applied to this
+        # strategy at all" is the answer to that question rather than a malformed request.
+        return StudyPreview(points=0, refusals=[], grid_error=str(exc))
+
+    return StudyPreview(
+        points=len(points),
+        refusals=[
+            GridRefusal(label=point.label, values=dict(point.values), reason=reason)
+            for point in points
+            # At the study's timeframe, exactly as `points_for` decides — a preview that
+            # answered about the document's own would disagree with the launch on precisely
+            # the points a person most needs warning about.
+            if (reason := refusal_of({**point.document, "timeframe": timeframe})) is not None
+        ],
+    )
+
+
+@router.post(
+    "/studies",
+    response_model=CreatedStudy,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={**_NOT_FOUND, **_BAD_BODY},
+)
+async def create_study(
+    request: CreateStudyRequest,
+    session: SessionDep,
+    queue: QueueDep,
+    collector: CollectorDep,
+) -> CreatedStudy:
+    """Validate once, write the study, its strategies and its runs in one transaction, enqueue.
+
+    The strategies are written here rather than referenced because each point *is* a different
+    strategy. Each is its own lineage at version 1, named for its own values — `MME9
+    [period=9]` — rather than versions 1..N of the base one: both keep a run pointing at the
+    exact document it executed, but only one produces a run log a human can read, and the run
+    log is where a study's result actually gets looked at.
+    """
+    base = session.get(Strategy, request.strategy_id)
+    if base is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="strategy not found")
+
+    try:
+        step(request.timeframe)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+
+    if request.date_to < request.date_from:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="date_to precedes date_from"
+        )
+
+    instrument = session.scalar(select(Instrument).where(Instrument.symbol == request.symbol))
+    if instrument is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"unknown symbol: {request.symbol}",
+        )
+
+    # ⚠️ **Asked of the index before anything is written.** Without it, a window with no data
+    # queues every point and each one fails in a worker, learning in turn what the `datasets`
+    # index already knew — what the first real sweep did to nine runs of twelve. One market, so
+    # no pair to skip — a window with nothing in it
+    # is refused, unless the caller answered "collect it first" and there is something to fetch.
+    # An empty plan is not "covered": a window wholly in the future, or a symbol this broker does
+    # not list (`to_collect`), has nothing to download and still no candle.
+    planned = (
+        to_collect(
+            session,
+            symbols=[instrument.symbol],
+            timeframes=[request.timeframe],
+            date_from=request.date_from,
+            date_to=request.date_to,
+        )
+        # Nothing is planned while the host agent is off: the run reads what is on disk (26/09).
+        if request.collect_missing and collector.alive()
+        else []
+    )
+    if not planned:
+        missing = uncovered_markets(
+            session, [instrument.symbol], [request.timeframe], request.date_from, request.date_to
+        )
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"no candles in this window for {describe(missing[0])}",
+            )
+
+    points = points_for(base, request.grid, request.timeframe)
+
+    study = Study(
+        strategy_id=base.id,
+        instrument_id=instrument.id,
+        timeframe=request.timeframe,
+        date_from=request.date_from,
+        date_to=request.date_to,
+        initial_capital=request.initial_capital,
+        grid=dict(request.grid),
+    )
+    session.add(study)
+
+    # ⚠️ Each point is its own lineage, never a version of the base one. Versioning into the
+    # base would march its number forward by the size of the grid, leaving the next honest edit
+    # of the strategy at v101 — and a run log row reading `MME9 v37` says nothing about which
+    # combination it was. The ancestry lives on the study, which is what `studies.strategy_id`
+    # is for.
+    strategies = strategies_for(session, points)
+    session.add_all(strategies)
+    # Flushed, not committed: `Backtest` reaches its strategy by id and there is no relationship
+    # to defer the resolution — the ids have to exist before the runs are built. Still one
+    # transaction, so a failure anywhere below still leaves nothing behind.
+    session.flush()
+
+    runs = [
+        Backtest(
+            study=study,
+            strategy_id=strategy.id,
+            instrument_id=instrument.id,
+            timeframe=request.timeframe,
+            date_from=request.date_from,
+            date_to=request.date_to,
+            initial_capital=request.initial_capital,
+            cost_model=request.cost_model,
+            status=BacktestStatus.QUEUED,
+            engine_version=ENGINE_VERSION,
+        )
+        for strategy in strategies
+    ]
+    session.add_all(runs)
+    # The runs' ids, for the links below. Said here rather than left to `create_collection`'s own
+    # flush: that one is an implementation detail of another package, and without it every link
+    # would carry a null run id — and meet the database as an `IntegrityError` that the `except`
+    # below would report as two studies colliding.
+    session.flush()
+
+    # ⚠️ **One collection per window, linked to every point.** A collection per run would download
+    # the same window once per point of the grid — five hundred times for a grid of five hundred.
+    # Written in the same transaction as the runs: a collection committed without its links is a
+    # download nothing waits for, and a run committed without them starts on a half-written window.
+    collections = [
+        create_collection(
+            session,
+            symbol=instrument.symbol,
+            timeframe=request.timeframe,
+            date_from=window.date_from,
+            date_to=window.date_to,
+            # The class the catalogue already decided, as the other launches do: the broker's
+            # tree path must not refuse a collection the launch itself asked for.
+            asset_class=instrument.asset_class,
+            years_total=len(year_slices(window.date_from, window.date_to)),
+        )
+        for market in planned
+        for window in market.windows
+    ]
+    session.add_all(
+        BacktestCollection(backtest_id=run.id, collection_id=collection.id)
+        for collection in collections
+        for run in runs
+    )
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        # ⚠️ Two identical grids launched at the same moment. Both read `existing` before either
+        # wrote, so both build the same `(name, version)` and the loser blocks on the unique
+        # index until the winner commits — then raises. Measured, not theorised: the window runs
+        # from the SELECT to the COMMIT, which is about half a second for five hundred points.
+        #
+        # The rollback is total, so nothing is left half-written; what was missing was a reply a
+        # caller can act on. 409 is the same answer `strategies._persist` gives to the same
+        # collision one layer down, which is why this is the shape rather than a retry: the
+        # honest thing to tell a client is that the strategies it needs were created a moment
+        # ago by someone else, and asking again will find and reuse them.
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="another study created these strategies at the same time; try again",
+        ) from exc
+
+    # ⚠️ No `session.refresh` loop here, and its absence is deliberate. The session is built with
+    # `expire_on_commit=False` and the ids are UUIDs generated in Python, so every field this
+    # response reads — `id`, `strategy_id`, `status` — is already on the object. Refreshing would
+    # be one SELECT per point: five hundred sequential round trips, on the event loop, buying
+    # nothing.
+
+    # After the commit, exactly as the single-run endpoint does it: a worker is fast enough to
+    # claim a job before an uncommitted row is visible, and would then fail looking up a
+    # backtest that does exist.
+    #
+    # ⚠️ `_job_id` is the run's own id, which makes the enqueue **idempotent**. This loop is the
+    # one part of the request that is not inside the transaction: if it dies at point k, the
+    # study and all N runs are committed while the rest sit `queued` for ever. With the job id
+    # derived from the run, re-sending the same study's jobs is safe — arq drops a duplicate —
+    # so recovery is a retry rather than an archaeology exercise.
+    # The downloads carry no job id, as the other launches' do not: re-sending them queues each
+    # window again. The idempotency claim above is the runs' alone.
+    for collection in collections:
+        await queue.enqueue_job(
+            COLLECT_RANGE,
+            str(collection.id),
+            _queue_name=collect_queue_for(session, collection.symbol),
+        )
+    for run in runs:
+        await queue.enqueue_job(RUN_BACKTEST, str(run.id), _job_id=str(run.id))
+
+    return CreatedStudy(
+        id=study.id,
+        points=[
+            StudyPointOut(
+                backtest_id=run.id,
+                strategy_id=run.strategy_id,
+                label=point.label,
+                values=dict(point.values),
+                status=run.status,
+            )
+            for point, run in zip(points, runs, strict=True)
+        ],
+    )
+
+
+def aggregate_points(runs: list[tuple[Backtest, str]], initial_capital: Decimal) -> StudyAggregate:
+    """Dispersion across the finished points. Never the maximum alone — see `StudyAggregate`.
+
+    A run counts as finished only when it has metrics. `status == done` is not enough on its
+    own, and the difference is not pedantry: a run is marked done an instant before its metrics
+    row is written, and reading `net_profit` off that gap would be an exception raised by a
+    reporting endpoint.
+
+    The **median**, not the mean. On a grid the mean is worse than uninformative — one
+    spectacular corner drags it upward, which is precisely the corner a reader most needs to
+    see reported as an outlier rather than baked into the summary.
+    """
+    return aggregate_scored(
+        [
+            (run.status, None if run.metrics is None else run.metrics.net_profit, label)
+            for run, label in runs
+        ],
+        initial_capital,
+    )
+
+
+def aggregate_scored(
+    points: Sequence[tuple[BacktestStatus, Decimal | None, str]], initial_capital: Decimal
+) -> StudyAggregate:
+    """`aggregate_points` over plain values: each run's status, its net profit — `None` while it
+    has no metrics — and its label. What a reader that never loads the runs whole can hand over
+    (a sweep's summary, 25/09: 51 thousand runs read as four columns, not as ORM rows)."""
+    failed = sum(1 for status, _net, _label in points if status == BacktestStatus.FAILED)
+
+    # Fractions of the capital every point starts with — fixed by the study, so these are
+    # comparable by construction rather than by the reader remembering to check.
+    returns = sorted(
+        (net / initial_capital, label) for _status, net, label in points if net is not None
+    )
+
+    if not returns:
+        return StudyAggregate(
+            points_total=len(points),
+            points_finished=0,
+            points_failed=failed,
+            points_profitable=0,
+            best_label=None,
+            best_return=None,
+            worst_label=None,
+            worst_return=None,
+            median_return=None,
+        )
+
+    middle, odd = divmod(len(returns), 2)
+    median = returns[middle][0] if odd else (returns[middle - 1][0] + returns[middle][0]) / 2
+
+    return StudyAggregate(
+        points_total=len(points),
+        points_finished=len(returns),
+        points_failed=failed,
+        points_profitable=sum(1 for value, _ in returns if value > 0),
+        worst_return=returns[0][0],
+        worst_label=returns[0][1],
+        best_return=returns[-1][0],
+        best_label=returns[-1][1],
+        median_return=median,
+    )
+
+
+@router.get("/studies/{study_id}", response_model=StudyOut, responses=_NOT_FOUND)
+def get_study(study_id: uuid.UUID, session: SessionDep) -> StudyOut:
+    """The study, every point in it, and how far apart those points landed.
+
+    The equity curve is deferred for the same reason `/backtests` and `/baskets` defer it: a
+    large JSONB column no field of this response can reach, and a grid has a hundred of them.
+    """
+    study = session.get(Study, study_id)
+    if study is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="study not found")
+
+    base = session.get(Strategy, study.strategy_id)
+    instrument = session.get(Instrument, study.instrument_id)
+    if base is None or instrument is None:  # pragma: no cover — both FKs are RESTRICT
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="study references nothing"
+        )
+
+    # Joined to `strategies` because each point has its own, and that document is what says
+    # which point a row is.
+    #
+    # ⚠️ **Not ordered in SQL, and the obvious ordering is a trap.** `created_at` defaults to
+    # `now()`, which in Postgres is the *transaction's* start — so every run of one study
+    # carries the identical timestamp, the tiebreaker falls to a random UUID, and the rows come
+    # back shuffled. Measured, not assumed: a six-point grid came back 20, 20, 9, 5, 9, 5.
+    rows = session.execute(
+        select(Backtest, Strategy)
+        .join(Strategy, Strategy.id == Backtest.strategy_id)
+        .where(Backtest.study_id == study.id)
+        .options(
+            selectinload(Backtest.metrics).options(
+                defer(BacktestMetrics.equity_curve), defer(BacktestMetrics.targets)
+            )
+        )
+    ).all()
+
+    grid: dict[str, list[Any]] = dict(study.grid)
+    # Each run's coordinates, read back out of the document that actually ran. Not parsed from
+    # the strategy's name: a name is a caption, and splitting one on commas and equals signs
+    # works until a value contains either.
+    # ⚠️ `read_point` rather than `value_at` directly: `coordinates` tolerates a value the grid
+    # no longer lists, and `value_at`, which runs first, would have raised for the same class of
+    # hand-edited row. Two guards over one hazard have to agree, so both defend. Shared with the
+    # walk-forward read, which names the point a fold chose by exactly this rule.
+    placed = [(run, strategy, read_point(strategy.definition, grid)) for run, strategy in rows]
+    placed.sort(key=lambda row: coordinates(grid, row[2]))
+
+    return StudyOut(
+        id=study.id,
+        strategy_id=study.strategy_id,
+        strategy_name=base.name,
+        symbol=instrument.symbol,
+        timeframe=study.timeframe,
+        date_from=study.date_from,
+        date_to=study.date_to,
+        initial_capital=study.initial_capital,
+        created_at=study.created_at,
+        grid=grid,
+        # ⚠️ `label_for(values)`, not `strategy.name`. The stored name carries the base
+        # strategy's name in front of the values — `MME9 [period=20]` — and serving that here
+        # while `points[].label` serves `period=20` leaves a client unable to match the best
+        # point to any point. It is the same defect `label_for` was extracted to close, reopened
+        # one call site over, and neither suite saw it: the unit tests pass the label *into*
+        # `aggregate_points`, so they prove the function rather than its caller.
+        aggregate=aggregate_points(
+            [(run, label_for(values)) for run, _, values in placed], study.initial_capital
+        ),
+        points=[
+            StudyPointOut(
+                backtest_id=run.id,
+                strategy_id=strategy.id,
+                label=label_for(values),
+                values=values,
+                status=run.status,
+            )
+            for run, strategy, values in placed
+        ],
+        runs=[
+            list_item(run, instrument.symbol, strategy.name, strategy.version)
+            for run, strategy, _ in placed
+        ],
+    )

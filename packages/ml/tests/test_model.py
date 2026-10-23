@@ -1,0 +1,349 @@
+"""The first meta-label (ADR-0031): split by time with an embargo, judged by the R it keeps."""
+
+import datetime as dt
+import json
+import math
+import re
+from dataclasses import replace
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+from tradeforge_ml.cli import span
+from tradeforge_ml.features import FEATURE_NAMES
+from tradeforge_ml.model import (
+    Floor,
+    Market,
+    Rows,
+    Split,
+    evaluate,
+    executable,
+    fit,
+    kept,
+    probabilities,
+    rows_of,
+    split,
+    with_target,
+)
+from tradeforge_ml.train import name_of, train
+
+UTC = dt.UTC
+PLAN = Split(dt.datetime(2023, 1, 1, tzinfo=UTC), dt.datetime(2025, 1, 1, tzinfo=UTC))
+SIGNAL = FEATURE_NAMES.index("ret5_atr")
+COST_R = 0.05
+
+
+def _us(instant: dt.datetime) -> int:
+    return int(instant.timestamp() * 1_000_000)
+
+
+def synthetic(count: int, *, signal: bool, seed: int = 3) -> Rows:
+    """Entries from 2016 to 2024; with `signal`, a trade wins when `ret5_atr` is high, mostly."""
+    rng = np.random.default_rng(seed)
+    start, end = _us(dt.datetime(2016, 1, 1, tzinfo=UTC)), _us(dt.datetime(2025, 1, 1, tzinfo=UTC))
+    entry = np.sort(rng.integers(start, end, count))
+    features = rng.normal(size=(count, len(FEATURE_NAMES)))
+    features[rng.random((count, len(FEATURE_NAMES))) < 0.05] = math.nan  # some empty values
+    chance = 1 / (1 + np.exp(-3 * np.nan_to_num(features[:, SIGNAL]))) if signal else 0.3
+    won = rng.random(count) < chance
+    return Rows(
+        features=features,
+        timeframe=rng.choice(["M15", "H1"], count).astype(np.str_),
+        symbol=rng.choice(["EURUSD", "GBPUSD"], count).astype(np.str_),
+        entry_us=entry,
+        exit_us=entry + 3_600_000_000,
+        r=np.where(won, 2.0, -1.0),
+        # A winner went at least as far as it made; a loser got part of the way, or none.
+        mfe_r=np.where(won, rng.uniform(2.0, 6.0, count), rng.uniform(0.0, 1.5, count)),
+        cost_r=np.full(count, COST_R),
+    )
+
+
+class TestSplit:
+    def test_training_is_before_validation_and_an_open_trade_across_it_is_embargoed(self) -> None:
+        boundary = _us(PLAN.validation_from)
+        rows = synthetic(2000, signal=False)
+        rows.exit_us[0] = boundary + 1  # 2016's first trade still open in 2023
+        training, validation, embargoed = split(rows, PLAN)
+
+        assert embargoed == 1
+        assert training.entry_us.max() < boundary
+        assert training.exit_us.max() < boundary
+        assert validation.entry_us.min() >= boundary
+        assert len(training.r) + len(validation.r) + embargoed == len(rows.r)
+
+    def test_an_excluded_span_leaves_training_and_only_training(self) -> None:
+        rows = synthetic(4000, signal=False)
+        left, right = dt.datetime(2020, 3, 1, tzinfo=UTC), dt.datetime(2020, 7, 1, tzinfo=UTC)
+        cut = Split(PLAN.validation_from, PLAN.validation_to, ((left, right),))
+
+        training, validation, _ = split(rows, cut)
+        whole, same_validation, _ = split(rows, PLAN)
+
+        inside = (training.entry_us >= _us(left)) & (training.entry_us < _us(right))
+        assert not inside.any()
+        assert len(whole.r) > len(training.r)
+        assert np.array_equal(validation.entry_us, same_validation.entry_us)
+
+
+class TestTheModel:
+    def test_it_finds_a_planted_signal_and_keeps_more_r(self) -> None:
+        _, report = evaluate(synthetic(6000, signal=True), PLAN)
+
+        assert report.validation_auc is not None
+        assert report.validation_auc > 0.8
+        everything, *_, third = report.validation
+        assert third.mean_r > everything.mean_r + 0.5
+        assert report.weights[0][0] == "ret5_atr"
+        assert report.weights[0][1] > 0
+        # Every input by its name, the empty flags too: never the pipeline's `x31`.
+        assert not [name for name, _ in report.weights if re.search(r"x\d", name)]
+        assert any(name.startswith("empty: ") for name, _ in report.weights)
+
+    def test_without_a_signal_it_ranks_no_better_than_a_coin(self) -> None:
+        _, report = evaluate(synthetic(6000, signal=False), PLAN)
+
+        assert report.validation_auc is not None
+        assert abs(report.validation_auc - 0.5) < 0.06
+
+    def test_validation_outcomes_never_reach_the_fit(self) -> None:
+        """Rule 5: what validation's trades did cannot change the model judged on them."""
+        rows = synthetic(3000, signal=True)
+        training, validation, _ = split(rows, PLAN)
+        flipped = replace(
+            rows, r=np.where(rows.entry_us >= _us(PLAN.validation_from), -rows.r, rows.r)
+        )
+        again, _, _ = split(flipped, PLAN)
+
+        assert np.allclose(
+            probabilities(fit(training), validation), probabilities(fit(again), validation)
+        )
+
+    def test_the_symbol_is_not_an_input(self) -> None:
+        rows = synthetic(3000, signal=True)
+        renamed = replace(rows, symbol=np.full(len(rows.r), "NOPE", dtype=np.str_))
+        model = fit(rows)
+
+        assert np.array_equal(probabilities(model, rows), probabilities(fit(renamed), renamed))
+
+
+def test_the_best_share_is_taken_by_probability() -> None:
+    rows = synthetic(10, signal=False)
+    rows.r[:] = np.arange(10, dtype=np.float64)
+    probability = np.arange(10, dtype=np.float64) / 10
+
+    half = kept(rows, probability, 0.5)
+
+    assert half.entries == 5
+    assert half.mean_r == pytest.approx(7.0)  # the five most probable: R 5 to 9
+    assert half.win_rate == 1.0
+
+
+def _tables(rows: Rows) -> tuple[pa.Table, pa.Table]:
+    count = len(rows.r)
+    key = {
+        "entry_id": [f"e{n}" for n in range(count)],
+        "symbol": rows.symbol.tolist(),
+        "timeframe": rows.timeframe.tolist(),
+        "side": ["long"] * count,
+        "entry_time": pa.array(rows.entry_us, type=pa.timestamp("us", tz="UTC")),
+    }
+    events = pa.table(
+        {
+            **key,
+            "exit_time": pa.array(rows.exit_us, type=pa.timestamp("us", tz="UTC")),
+            "r_multiple": rows.r,
+            # Risk 0.1 a unit, and an exit that is the R plus what was paid: the cost comes back.
+            "entry_price": np.full(count, 1.0),
+            "stop_loss": np.full(count, 0.9),
+            "exit_price": 1.0 + (rows.r + rows.cost_r) * 0.1,
+            "mfe_r": rows.mfe_r,
+        }
+    )
+    features = pa.table(
+        {**key, **{name: rows.features[:, n] for n, name in enumerate(FEATURE_NAMES)}}
+    )
+    return events, features
+
+
+class TestTheFiles:
+    def test_rows_are_joined_one_to_one_and_mismatched_files_refused(self) -> None:
+        rows = synthetic(50, signal=False)
+        events, features = _tables(rows)
+
+        joined = rows_of(events, features)
+        assert np.array_equal(joined.r, rows.r)
+        assert np.array_equal(joined.features, rows.features, equal_nan=True)
+
+        with pytest.raises(ValueError, match="49 rows"):
+            rows_of(events, features.slice(1))
+        reordered = features.take(list(reversed(range(50))))
+        with pytest.raises(ValueError, match="disagree"):
+            rows_of(events, reordered)
+        with pytest.raises(ValueError, match="spread_rel"):
+            rows_of(events, features.drop_columns(["spread_rel"]))
+
+    def test_training_writes_a_report_that_names_what_it_read(self, tmp_path: Path) -> None:
+        events, features = _tables(synthetic(3000, signal=True))
+        pq.write_table(events, tmp_path / "events.parquet")
+        pq.write_table(features, tmp_path / "features.parquet")
+
+        name, report = train(tmp_path, PLAN)
+
+        assert name == name_of(PLAN) == "logistic-v2-val2023-2024"
+        written = json.loads((tmp_path / "models" / name / "report.json").read_text())
+        assert written["manifest"]["features_version"] == 2
+        assert written["manifest"]["seed"] == 20261006
+        assert len(written["manifest"]["events_sha256"]) == 64
+        assert written["report"]["validation_entries"] == report.validation_entries
+        text = (tmp_path / "models" / name / "report.md").read_text(encoding="utf-8")
+        assert "ret5_atr" in text
+
+
+def test_a_span_is_two_days_the_second_after_the_first() -> None:
+    left, right = span("2023-01-01:2025-01-01")
+
+    assert (left, right) == (PLAN.validation_from, PLAN.validation_to)
+    assert name_of(Split(left, right, ((left, right),))).endswith("-excl")
+
+
+class TestTargets:
+    def test_a_target_the_mfe_reached_closes_there_less_what_was_paid(self) -> None:
+        rows = synthetic(6, signal=False)
+        rows.r[:] = [-1.0, -1.0, 2.0, 0.4, -1.0, 3.5]
+        rows.mfe_r[:] = [0.5, 2.0, 4.0, 1.9, 0.0, 3.5]
+
+        assert with_target(rows, None) is rows.r
+        assert with_target(rows, 2.0).tolist() == pytest.approx(
+            [-1.0, 2.0 - COST_R, 2.0 - COST_R, 0.4, -1.0, 2.0 - COST_R]
+        )
+
+    def test_the_cost_in_r_is_read_back_from_the_files(self) -> None:
+        events, features = _tables(synthetic(40, signal=False))
+
+        joined = rows_of(events, features)
+
+        assert joined.cost_r == pytest.approx(np.full(40, COST_R))
+
+    def test_every_target_is_scored_for_validation_and_each_symbol(self) -> None:
+        _, report = evaluate(synthetic(4000, signal=True), PLAN)
+
+        assert list(report.targets) == ["as run", "1R", "2R", "3R", "5R"]
+        assert report.targets["as run"][0].mean_r == report.validation[0].mean_r
+        assert set(report.targets_by_symbol) == {"EURUSD", "GBPUSD"}
+        assert list(report.targets_by_symbol["EURUSD"]) == list(report.targets)
+
+
+class TestBoosting:
+    def test_it_finds_the_planted_signal_and_says_it_leans_on_it(self) -> None:
+        _, report = evaluate(synthetic(6000, signal=True), PLAN, "boosting")
+
+        assert report.kind == "boosting"
+        assert report.validation_auc is not None
+        assert report.validation_auc > 0.8
+        assert report.weights[0][0] == "ret5_atr"
+        assert report.weights[0][1] > 0.1
+
+    def test_it_reads_empty_values_without_filling_them(self) -> None:
+        rows = synthetic(3000, signal=True)
+        rows.features[:, SIGNAL][:500] = math.nan
+
+        probability = probabilities(fit(rows, "boosting"), rows)
+
+        assert not np.isnan(probability).any()
+
+
+def test_the_chart_is_an_input_by_name() -> None:
+    _, report = evaluate(synthetic(3000, signal=True), PLAN)
+
+    names = {name for name, _ in report.weights}
+    assert {"timeframe_M15", "timeframe_H1"} <= names
+
+
+# --------------------------------------------------------------------------------------------
+# The stop floor (14/10)
+# --------------------------------------------------------------------------------------------
+
+CENT = Market(tick_size=0.01, tick_value=1.0)
+"""A market with a tick of 0.01 worth 1 a lot: a stop 0.1 away risks 10."""
+
+
+def _with_stops(rows: Rows, stops: list[float], costs: list[float]) -> tuple[pa.Table, pa.Table]:
+    """`_tables`, entered at 1.0 with these stops and these costs, on one lot."""
+    events, features = _tables(rows)
+    events = events.set_column(
+        events.schema.get_field_index("stop_loss"), "stop_loss", pa.array(stops)
+    )
+    events = events.append_column("costs", pa.array(costs))
+    return events.append_column("volume", pa.array([1.0] * len(stops))), features
+
+
+class TestTheFloor:
+    def test_a_stop_is_read_in_ticks_and_in_what_it_paid(self) -> None:
+        # 4 ticks, 5 ticks, then 10 ticks paying half the risk (two spreads), and 0.6 of it.
+        events, features = _with_stops(
+            synthetic(4, signal=False), [0.96, 0.95, 0.9, 0.9], [0.0, 0.0, 5.0, 6.0]
+        )
+
+        rows = rows_of(events, features, {"EURUSD": CENT, "GBPUSD": CENT})
+
+        assert rows.risk_ticks is not None
+        assert rows.paid_r is not None
+        assert rows.risk_ticks.tolist() == pytest.approx([4, 5, 10, 10])
+        assert rows.paid_r.tolist() == pytest.approx([0, 0, 0.5, 0.6])
+        assert executable(rows, Floor()).tolist() == [False, True, True, False]
+
+    def test_before_a_split_a_tick_was_a_fraction_of_todays(self) -> None:
+        """NVDA's 4-for-1 of 2021 and 10-for-1 of 2024: a 2020 tick is 1/40 of today's."""
+        splits = ((_us(dt.datetime(2021, 7, 20, tzinfo=UTC)), 4.0),
+                  (_us(dt.datetime(2024, 6, 10, tzinfo=UTC)), 10.0))  # fmt: skip
+        nvda = Market(tick_size=0.01, tick_value=0.01, splits=splits)
+        entries = [dt.datetime(year, 1, 2, tzinfo=UTC) for year in (2020, 2022, 2025)]
+
+        ticks = nvda.ticks_of_the_day(np.asarray([_us(when) for when in entries], dtype=np.int64))
+
+        assert ticks.tolist() == pytest.approx([0.01 / 40, 0.01 / 10, 0.01])
+
+    def test_a_market_without_its_tick_is_refused(self) -> None:
+        events, features = _with_stops(synthetic(4, signal=False), [0.9] * 4, [0.0] * 4)
+
+        with pytest.raises(ValueError, match="no tick for"):
+            rows_of(events, features, {"XAUUSD": CENT})
+        with pytest.raises(ValueError, match="tick"):
+            evaluate(rows_of(events, features), PLAN, floor=Floor())
+
+    def test_entries_below_it_leave_training_and_validation_and_are_counted(self) -> None:
+        rows = synthetic(4000, signal=True)
+        rows.risk_ticks = np.where(np.arange(4000) % 4 == 0, 3.0, 50.0)
+        rows.paid_r = np.zeros(4000)
+        _, whole = evaluate(replace(rows, risk_ticks=None, paid_r=None), PLAN)
+
+        _, floored = evaluate(rows, PLAN, floor=Floor())
+
+        assert floored.below_floor_training > 0
+        assert floored.below_floor_validation > 0
+        assert (
+            floored.validation_entries + floored.below_floor_validation == whole.validation_entries
+        )
+        assert floored.training_entries + floored.below_floor_training == whole.training_entries
+
+    def test_training_names_the_floor_and_the_markets_it_read(self, tmp_path: Path) -> None:
+        count = 3000
+        stops = [0.98 if n % 5 == 0 else 0.9 for n in range(count)]
+        events, features = _with_stops(synthetic(count, signal=True), stops, [0.0] * count)
+        pq.write_table(events, tmp_path / "events.parquet")
+        pq.write_table(features, tmp_path / "features.parquet")
+        markets = {"EURUSD": CENT, "GBPUSD": CENT, "USDJPY": Market(0.001, 1.0)}
+
+        name, report = train(tmp_path, PLAN, floor=Floor(), markets=markets)
+
+        assert name == "logistic-v2-val2023-2024-floor5t2s"
+        assert report.below_floor_validation > 0
+        written = json.loads((tmp_path / "models" / name / "report.json").read_text())
+        assert written["manifest"]["floor"] == {"min_ticks": 5.0, "min_spreads": 2.0}
+        assert sorted(written["manifest"]["markets"]) == ["EURUSD", "GBPUSD"]
+        text = (tmp_path / "models" / name / "report.md").read_text(encoding="utf-8")
+        assert "Stop floor: 5 ticks and 2 spreads" in text

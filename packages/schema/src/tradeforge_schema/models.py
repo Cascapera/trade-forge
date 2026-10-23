@@ -11,6 +11,7 @@ and tell whether a 2:1 take-profit means anything without a stop-loss to measure
 risk against. JSON Schema validates *shape*, never *meaning*.
 """
 
+from collections.abc import Mapping
 from typing import Annotated, Final, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -24,15 +25,73 @@ SCHEMA_VERSION = "1.0"
 REF_PATTERN = (
     r"^(?:"
     r"[a-z_][a-z0-9_]*"  # an indicator id
+    # One component of a multi-output indicator: `bb.upper`. ⚠️ This alternative also matches
+    # `price.clsoe` and `candle.high`, which the two dedicated forms below exist to refuse — and it
+    # **cannot** be narrowed here. See the note under this pattern.
+    r"|[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*"
     r"|price\.(?:open|high|low|close)"  # the candle being decided on
     r"|candle\[-[1-9][0-9]*\]\.(?:open|high|low|close)"  # a closed candle, N back
     r")$"
 )
+# ⚠️ **Widening this pattern is how a typo becomes a backtest of nothing, and it happened twice
+# while this PR was being written.** The forms it accepts are the only thing standing between a
+# misspelled ref and a condition that is false on every bar for ever: the engine resolves an
+# unknown name through `indicator_at`, which answers `None` for anything it has no channel for,
+# and a comparison against `None` is false. Nothing raises, nothing logs, and the run reports a
+# rule that was never evaluated.
+#
+# The component alternative broke that twice over:
+#   1. `bb.uppper` — well-formed, and `semantic.py` used to decide "is this an indicator ref?" by
+#      asking whether the string contained a dot, so it skipped every component ref. Fixed by
+#      deciding on the NAMESPACE (`price`, `candle`) and checking the component against the
+#      indicator's declared type.
+#   2. `price.clsoe` — well-formed *because of the same alternative*, since `price` is a perfectly
+#      good identifier and `clsoe` a perfectly good component name. `semantic.py` then saw a
+#      reserved head and returned "not an indicator ref" without ever looking at the tail.
+#
+# ⚠️ **The second one cannot be fixed here, and the reason is worth knowing: this pattern is
+# compiled by Rust, not by Python.** Pydantic v2 validates `pattern=` with the `regex` crate, which
+# has no look-around at all — `(?!(?:price|candle)\.)` fails to compile with "look-around,
+# including look-ahead and look-behind, is not supported", and the failure is at import time, so
+# the whole package stops loading. Excluding two literal names from an identifier without
+# look-around means enumerating character prefixes, which is unreadable and goes stale.
+#
+# So the shape stays permissive here and `semantic.py` refuses the tail — which is the boundary
+# this project already documents: shape is what a schema can say, meaning is not, and a document
+# that passed in the browser is never assumed executable (`test_fixtures.py`). The consequence to
+# know: `price.clsoe` reaches the API as a **422 from the semantic layer**, not as a schema error,
+# and the frontend validator alone will accept it.
+#
+# The rule for anyone widening this again: any alternative that can reach a namespace with
+# enumerated fields must be matched by a check in `semantic.py`, and `test_semantic.py` holds the
+# cases that prove it. `expressions.py` refuses the same shape a third time, on the layer that
+# executes.
 
 INDICATOR_ID_PATTERN = r"^[a-z_][a-z0-9_]*$"
 
 type Timeframe = Literal["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"]
 type PriceSource = Literal["open", "high", "low", "close"]
+
+# Which sides a setup may trade, "both" included — his request of 18/09 for every setup. The
+# structure family reads it as a filter on the zones it would otherwise arm on either side. The
+# swing family (the MME9 setups and the Ponto Contínuo) is written for one side, so there "both"
+# is two of them over one account, one position at a time (`BothSides` in the engine).
+type TradeSide = Literal["long", "short", "both"]
+type ZoneEntryPoint = Literal[
+    "edge",
+    "midpoint",
+    "return_pass",
+    "botinha",
+    "fffd",
+    "martelo",
+    "martelo_forca",
+    "gift",
+    "barra_ignorada",
+]
+type GiftStop = Literal["gift", "forca"]
+type HtfRegions = Literal["any", "with_trend"]
+type AverageEntryPoint = Literal["classic", "martelo", "martelo_forca", "gift", "barra_ignorada"]
+type AverageKind = Literal["EMA", "SMA"]
 
 # The same list, as a runtime value. The database needs it for a CHECK constraint
 # and the engine will need it to parse a bar interval; deriving both from the type
@@ -106,6 +165,45 @@ class Comparison(_Node):
     right: Operand
 
 
+class Between(_Node):
+    """Three operands: is `value` inside the band `[low, high]`?
+
+    ⚠️ **Both bounds are inclusive**, and it is written down here because "between" is the kind
+    of word every reader is sure they already know. Exclusive would make `between 0 and 100`
+    reject the two values a bounded oscillator can actually reach.
+
+    A node of its own rather than an `op` on `Comparison`, because it takes three operands and
+    `Comparison` takes two. Folding it in would make `right` mean one thing for seven operators
+    and another for this one — and the untagged union below discriminates on *shape*, so the
+    distinct shape is what keeps a document unambiguous.
+
+    The bounds are operands, not numbers, so a band can be drawn between two indicators — a
+    price inside its own channel is `between(price.close, lower, upper)`.
+    """
+
+    op: Literal["between"]
+    value: Operand
+    low: Operand
+    high: Operand
+
+
+class Trend(_Node):
+    """Has `of` moved in one direction on each of the last `bars` bars?
+
+    ⚠️ **Monotonic over the window, not "higher than it was N bars ago".** The looser reading
+    calls a series that fell for four bars and jumped on the fifth "rising", which is the
+    opposite of what anybody writing the rule meant. Matching the reading used by the charting
+    platforms this project's indicators were transcribed from is the point: a rule that means
+    something different here than on his chart is a rule he cannot check.
+
+    `bars: 1` is the base case and the default — "higher than the previous bar".
+    """
+
+    op: Literal["rising", "falling"]
+    of: Operand
+    bars: Annotated[int, Field(ge=1, le=100)] = 1
+
+
 class AllOf(_Node):
     """Logical AND."""
 
@@ -126,7 +224,12 @@ class NotOf(_Node):
 
 # Untagged union: the shape of the object decides which node it is. `extra="forbid"`
 # is what makes that unambiguous — exactly one member can accept any given object.
-type Condition = Comparison | AllOf | AnyOf | NotOf
+#
+# ⚠️ The three leaf shapes are distinguished by their *field names*, not by `op` alone:
+# `left`/`right`, `value`/`low`/`high`, `of`. `extra="forbid"` is what makes that a proof
+# rather than a hope — a `between` carrying a `left` matches nothing and is refused, instead
+# of being read as a comparison with a stray key.
+type Condition = Comparison | Between | Trend | AllOf | AnyOf | NotOf
 
 
 # --------------------------------------------------------------------------- #
@@ -137,7 +240,8 @@ type Condition = Comparison | AllOf | AnyOf | NotOf
 class PeriodSourceParams(_Node):
     """A window length and which price it reads — shared by every single-period indicator
     (SMA, EMA, RSI, and ATR to come). Named for its shape, not for one indicator, because a
-    period over a price source is exactly what they all take."""
+    period over a price source is exactly what they all take. ATR is *not* one of them — see
+    `PeriodParams`."""
 
     period: Annotated[int, Field(ge=1, le=1000)]
     source: PriceSource = "close"
@@ -165,12 +269,177 @@ class RSI(_Node):
     params: PeriodSourceParams
 
 
+class PeriodParams(_Node):
+    """A window length and nothing else — for the indicators that read the whole candle.
+
+    ⚠️ Deliberately **not** `PeriodSourceParams` with the source defaulted. ATR is defined over
+    high, low and the previous close together; a channel is defined over highs and lows. An
+    "ATR of the close" is not a variant of ATR, it is a different measurement — and a parameter
+    the engine would have to ignore is a request the document believes was honoured.
+    """
+
+    period: Annotated[int, Field(ge=1, le=1000)]
+
+
+class ATR(_Node):
+    """Average True Range (Wilder) — the size of a typical bar, in price.
+
+    True Range counts the gap: a bar that opens away from the previous close travelled further
+    than its own high minus its low. Used to size stops and to ask whether a market is moving
+    at all.
+    """
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["ATR"]
+    params: PeriodParams
+
+
+class Highest(_Node):
+    """The highest **high** of the N bars that closed *before* this one — a breakout's rail.
+
+    ⚠️ **The current bar is not in the window**, and that is what makes the level breakable:
+    include it and `HIGHEST(20) >= high` holds on every bar of every market, so a comparison
+    against it is constantly false and a band drawn with it is constantly true. A charting
+    platform's `ta.highest` does include the current bar and is read shifted (`[1]`); the DSL
+    has no shift for an indicator ref, so the level is defined where it can be used.
+
+    Highs, not closes, so the level is where price actually traded. A breakout of it therefore
+    fires on the wick, which is the classical reading and the more sensitive one; comparing
+    against `price.close` instead is how the same channel is made to require a close beyond it.
+    """
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["HIGHEST"]
+    params: PeriodParams
+
+
+class Lowest(_Node):
+    """The lowest **low** of the N bars that closed before this one — the lower rail."""
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["LOWEST"]
+    params: PeriodParams
+
+
+class BollingerParams(_Node):
+    """A window, the price it reads, and how many deviations wide the envelope is.
+
+    `deviations` is a float rather than an int because 1.5 and 2.5 are ordinary settings, and it
+    is bounded above 0 exclusively: a multiplier of zero collapses the three bands onto the
+    average, which is an SMA spelled in a way that hides that it is one. The upper bound is
+    generous — a band ten deviations out is useless, not malformed.
+    """
+
+    period: Annotated[int, Field(ge=1, le=1000)]
+    source: PriceSource = "close"
+    deviations: Annotated[float, Field(gt=0, le=10, allow_inf_nan=False)] = 2.0
+
+
+class Bollinger(_Node):
+    """Bollinger Bands — an average with a volatility envelope, read by component.
+
+    ⚠️ **One indicator with three readings, not three indicators.** Declared once as `bb`, its
+    bands are referenced as `bb.upper`, `bb.middle` and `bb.lower`. Three separate declarations
+    would let a document give the upper band a period of 20 and the lower one 50, and nothing
+    could object: for this schema they would be two well-formed indicators. What came out would
+    be a band whose rails describe different markets, and it would look exactly like a band.
+    """
+
+    # ⚠️ **The component names belong in the schema, as data.** They used to live only in the
+    # `COMPOSITE_COMPONENTS` map below and in the prose above, which meant a consumer without a
+    # Python runtime — the web builder — could not offer `bb.upper` without writing a third copy
+    # of the list by hand. `json_schema_extra` puts them in this node's schema, and the map below
+    # is now *read back* from here, so this class is the one place they are written.
+    model_config = ConfigDict(json_schema_extra={"components": ["middle", "upper", "lower"]})
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["BOLLINGER"]
+    params: BollingerParams
+
+
+class ADX(_Node):
+    """Average Directional Index (Wilder) — how strongly a market trends, read by component.
+
+    Referenced as `adx.adx` for the strength line and `adx.plus_di` / `adx.minus_di` for the two
+    direction lines. ⚠️ **The `adx` component has no direction**: it rises in a hard sell-off
+    exactly as it does in a rally, so a rule meaning "trending up" needs the `DI` pair as well.
+    Reads the whole candle, so there is no price source to name — same argument as `PeriodParams`.
+    """
+
+    model_config = ConfigDict(json_schema_extra={"components": ["adx", "plus_di", "minus_di"]})
+
+    id: Annotated[str, Field(pattern=INDICATOR_ID_PATTERN, max_length=40)]
+    type: Literal["ADX"]
+    params: PeriodParams
+
+
 # Discriminated on `type`: the generated JSON Schema gets a proper `oneOf` with a
-# discriminator, and a new indicator (phase 2: ATR, ADX, MACD...) is a new member —
-# an additive change that leaves every strategy already saved still valid. That is
-# ADR-03 working as designed: new blocks without touching the core (and ADR-13:
-# additive members keep the schema_version, they do not bump it).
-type Indicator = Annotated[SMA | EMA | RSI, Field(discriminator="type")]
+# discriminator, and a new indicator is a new member — an additive change that leaves
+# every strategy already saved still valid. That is ADR-03 working as designed: new
+# blocks without touching the core (and ADR-13: additive members keep the
+# schema_version, they do not bump it).
+type Indicator = Annotated[
+    SMA | EMA | RSI | ATR | Highest | Lowest | Bollinger | ADX,
+    Field(discriminator="type"),
+]
+
+
+def _declared_components(model: type[BaseModel]) -> tuple[str, ...]:
+    """The component names a model publishes in its own schema, or `()` for a single-valued one.
+
+    Read off `json_schema_extra` rather than a list kept beside it, so the names reach three
+    consumers from one place: this map, the generated JSON Schema, and — through the schema — a
+    frontend with no Python runtime. The type check is not ceremony: a `json_schema_extra` given
+    as a *callable* is legal Pydantic and would silently answer "no components", which reads as
+    "this indicator is single-valued" and quietly makes every `bb.upper` a reference error.
+    """
+    extra = model.model_config.get("json_schema_extra")
+    if extra is None:
+        return ()
+    if not isinstance(extra, dict):
+        raise TypeError(f"{model.__name__} publishes a json_schema_extra no reader can inspect")
+    components = extra.get("components", ())
+    if not isinstance(components, list | tuple):
+        raise TypeError(f"{model.__name__} declares components that are not a list")
+    # Built by comprehension rather than `tuple(components)` behind an `all(isinstance(...))`
+    # guard: the guard convinces a reader and not the type checker, and `json_schema_extra` is
+    # typed loosely enough that anything at all can be in there.
+    names = tuple(name for name in components if isinstance(name, str))
+    if len(names) != len(components):
+        raise TypeError(f"{model.__name__} declares a component that is not a name")
+    return names
+
+
+def _composite_components() -> Mapping[str, tuple[str, ...]]:
+    """Walk the indicator union and collect what each member answers to, keyed by its DSL type."""
+    # `Indicator` is a PEP-695 alias, so the annotation is behind `__value__`; `get_args` on the
+    # alias itself answers `()`, which would make this map silently empty — every composite
+    # indicator reclassified as single-valued, and every `bb.upper` a reference error.
+    union, *_ = get_args(Indicator.__value__)
+    found: dict[str, tuple[str, ...]] = {}
+    for member in get_args(union):
+        declared = _declared_components(member)
+        if declared:
+            (dsl_type,) = get_args(member.model_fields["type"].annotation)
+            found[dsl_type] = declared
+    return found
+
+
+# Which component names each multi-output indicator answers to. A reference to one of these
+# indicators must name a component, and a reference to any other indicator must not.
+#
+# ⚠️ **Derived from the classes, not written here.** It used to be a literal map, which made the
+# names exist twice inside this file alone — and the copy the *schema* carried was prose, so the
+# web builder could not read it at all. A new composite indicator now appears here by declaring
+# its components on itself, and nothing in this file needs editing.
+#
+# ⚠️ Still duplicated in `tradeforge_engine.indicators.COMPOSITE_COMPONENTS` — the two packages do
+# not import each other — and pinned equal by a test in `apps/api`, which depends on both. Drift is
+# the silent kind of failure: this layer would accept `bb.uppper`, the engine would resolve it to
+# `None`, and a comparison against `None` is simply false on every bar for ever.
+# ⚠️ Ordered **primary first**: a consumer with no idea what a band is uses this order to tell
+# the subject from its envelope, and the chart draws the first solid and the rest dashed.
+COMPOSITE_COMPONENTS: Final[Mapping[str, tuple[str, ...]]] = _composite_components()
 
 
 # --------------------------------------------------------------------------- #
@@ -209,6 +478,478 @@ class Exit(_Node):
     stop_loss: CandleExtremeStop | None = None
     take_profit: RiskMultipleTakeProfit | None = None
     conditions: list[Condition] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Setups — the strategies the DSL *names* instead of describing                  #
+# --------------------------------------------------------------------------- #
+#
+# Everything above this line describes a strategy as a tree of conditions: this
+# indicator crossed that price, so buy. A setup cannot be written that way, and the
+# reason is not expressive power — it is memory. A condition sees one closed candle
+# and answers yes or no. A setup remembers: which order is resting and on which bar's
+# high, whether this turn already gave its trade, how many breaks of structure this
+# position has seen. That is a state machine, and no amount of `all`/`any` nesting
+# reaches it. See ADR-0019.
+#
+# So the DSL names the setup and hands it parameters. The defaults below are the
+# author's own rules, and they are duplicated from the engine classes deliberately:
+# a default that lives only in Python is invisible to the builder, the generated
+# TypeScript, and the phase-3 LLM. The drift is caught by a test that constructs each
+# engine class and compares.
+
+
+AVERAGE_FLOOR = 3
+"""The shortest average a setup in this DSL may be built on. His call, 2026-09-10.
+
+⚠️ **A narrowing, and a deliberate one.** The engine classes still accept any period from 1 — the
+mechanism is sound there — so this is the published grammar refusing what the mechanism would
+happily run.
+
+⚠️ **Only `period = 1` is broken by arithmetic**, and the floor is deliberately one above what that
+alone would justify. At 1 the exponential average *is* the close (`alpha = 2/(period+1) = 1`), so
+`mme9_breakout` — whose rule is a bar closing across the average — can never arm, and answers a
+valid document with zero trades and no complaint. **At 2 it arms identically to 3** (measured). So
+3 is his judgement about the shortest average worth trading, not a consequence of the formula, and
+writing it down that way is what stops the next reader from "fixing" it to 1.
+
+The floor does **not** reach the indicator nodes (`PeriodSource`, `PeriodParams`), where an EMA of 1
+is a price series rather than a broken setup. Whether the same argument should apply there is a
+question in `specs/backlog.md`; it is a different surface and it is his to answer.
+
+Nothing saved is invalidated: all 267 strategies in the database use 9, 20 or 200 — and that
+measurement is what lets the narrowing keep `schema_version` at `"1.0"` instead of orphaning every
+one of them. ADR-0028, revisiting ADR-0013.
+"""
+
+NAME_MAX_LENGTH = 120
+"""How long a document's `name` may be.
+
+Exported because a **generated** name has to fit it and the generator lives a layer up: a study
+and a sweep both write `{base} [{label}]`, and the label grows with the number of axes. Measured
+on this project's own shelf — a five-axis entry expanded to 120 documents whose generated names
+all ran past this limit, and every one was refused for the length of a caption, with a message
+about strings that says nothing about the strategy. (That the entry had 120 points and the limit
+is 120 characters is a coincidence.) `grid.fit_name` is what keeps that from happening, and it is
+what asks this."""
+
+
+class Mme9BreakoutParams(_Node):
+    """The break of the candle that closed across the MME9 (ADR-0016).
+
+    `entry_point` chooses how the turn is entered. `classic` is the breakout as it has always
+    been: the bar that closed across the average is the reference, the order rests at its high and
+    the stop at its low (plus `stop_buffer_ticks`). The other four are the author's bar patterns
+    (2026-09-07) and they **replace** that entry: the bar that touches the average, or the one
+    after it, has to print a *martelo* (stop past its high), a *martelo* followed by a *barra de
+    força* (limit thirty percent between their highs), a *barra de força* followed by a *gift*, or
+    one followed by a *barra ignorada* (stop past the higher of the two highs). The stop is then
+    the pattern's own — twenty percent of the bar — and `stop_buffer_ticks` says nothing about it.
+
+    ⚠️ No ceiling, and nothing is spent: the only thing that ends a pattern before its order fills
+    is a bar closing across the average, which ends the turn as it always did. A pattern that fails
+    simply waits for the next touch. The order lives two bars. Conduction is the 9.1's own — the
+    average tightening the stop, `breakeven_at_r` — whichever entry was chosen.
+
+    `gift_stop` and `volume_filter` are the gift's dials, the same as on the structure setups, and
+    are read only when `entry_point` is `gift` (both) or `barra_ignorada` (the filter alone).
+
+    `long_average_period` is his direction filter (2026-09-09), and `null` — the default — is the
+    filter off (*"os filtros são opcionais"*). Named, an order is placed only when the price it
+    would **enter** at is beyond an exponential average of that period: above it for a buy, below
+    it for a sell. ⚠️ The entry price, not the bar's close, and that is his answer rather than the
+    obvious reading — a bar closing under the long average whose break carries price over it is a
+    buy above the long average. It gates placing and never withdraws (*"ela fica, só retira se o
+    setup desconfigurar"*), and an open trade is conducted exactly as before.
+    """
+
+    side: TradeSide
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
+    stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
+    breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = 2.0
+    entry_point: AverageEntryPoint = "classic"
+    gift_stop: GiftStop = "gift"
+    volume_filter: bool = False
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
+
+
+class Mme9BreakoutSetup(_Node):
+    type: Literal["mme9_breakout"]
+    params: Mme9BreakoutParams
+
+
+class Mme9TurnParams(_Node):
+    """The published 9.1: enter on the break of the bar whose close bent the MME9.
+
+    ⚠️ **This is not `mme9_breakout`, and the two are both called 9.1.** That one is the author's
+    own reading — a bar *closes across* the average — and this one is the literature's: the
+    average's own **slope** changes sign, and where price closed is not part of the question.
+
+    Three rules follow, and each is the opposite of its neighbour's:
+
+    * **The order does not follow price.** It rests at the high of the bar that bent the line (the
+      low, for a sell) and stays there while the line keeps pointing that way. `mme9_breakout`
+      re-prices to the newest bar of the turn.
+    * **What cancels it is the line bending back**, not a close on the far side of the average.
+    * **Arming is a one-bar event**, so a turn that lands while a trade is open is simply lost.
+
+    `breakeven_at_r` defaults to `null` — **off** — because the published setup names an entry and
+    a protective stop and says nothing about moving it. It is a parameter rather than a constant
+    so that "what would this earn with his 2x1 on top" stays askable.
+
+    No `entry_point`: the bar patterns are the author's graft onto his own setups, and this one is
+    here to say what the book says.
+
+    `long_average_period` is his direction filter, offered here since 22/09 (*"nos setups da MME9
+    aqueles que ainda não tem vamos pôr opção de filtro de média móvel igual no MME9 breakout"*)
+    and `null` — the default — is the filter **off**, which is the published setup unchanged. Named,
+    an order is placed only when the price it would **enter** at is beyond an exponential average
+    of that period: above it for a buy, below it for a sell. It gates placing and never withdraws,
+    and an open trade is conducted as before — the same rule as on his own 9.1.
+    """
+
+    side: TradeSide
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
+    stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
+    breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
+
+
+class Mme9TurnSetup(_Node):
+    type: Literal["mme9_turn"]
+    params: Mme9TurnParams
+
+
+class Mme9FailedTurnParams(_Node):
+    """The published 9.4: the average dips for one bar, comes straight back, and that is the trade.
+
+    A 9.1 that failed and recovered. For a buy: the MME9 is rising, **one** bar turns it down, and
+    the **very next** bar turns it back up without taking that bar's low. The order rests at the
+    high of the recovery bar and does **not** chase; the stop clears the failure bar's low, which
+    is the deeper of the two because a recovery bar that went under it is refused outright.
+
+    ⚠️ That refusal is part of the arming, not a later cancellation: the literature says a recovery
+    bar breaking the failure bar's low is *"um Setup 9.1 de VENDA"*, so arming there would be
+    trading a reversal as a continuation.
+
+    Two bars down and it is not this setup: whatever turns the line back up later is a 9.1.
+
+    `breakeven_at_r` defaults to `null` — off — like the rest of the published family.
+
+    `long_average_period` is his direction filter, offered on the published family since 22/09 and
+    `null` — the default — is it **off**, which is this setup exactly as the book states it. Named,
+    an order is placed only when the price it would **enter** at is beyond an exponential average
+    of that period. It gates placing, never withdraws, and leaves an open trade alone.
+    """
+
+    side: TradeSide
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
+    stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
+    breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
+
+
+class Mme9FailedTurnSetup(_Node):
+    type: Literal["mme9_failed_turn"]
+    params: Mme9FailedTurnParams
+
+
+class Mme9PullbackParams(_Node):
+    """The published 9.2 and 9.3: buy the break of the bar that corrected against the leg's anchor.
+
+    **`corrections` is the only thing that separates the two.** One corrective close is 9.2, two
+    consecutive ones are 9.3, and every other rule is identical — so they are one type with a
+    count rather than two, which also makes *"is the stricter one worth it"* a single study axis.
+    Nothing above 2 is offered: the literature names these two and a third would be a setup nobody
+    published.
+
+    The rule, for a buy:
+
+    * The MME9 is **rising**, and it bending down undoes everything.
+    * The **anchor** is the highest *close* of the leg, and it moves up with every better close.
+      ⚠️ The highest close, not the highest high.
+    * A **corrective** close is one strictly below the anchor's close. `corrections` in a row arm.
+    * The order rests at the **high of the last corrective bar** and follows the bars after it,
+      which is the opposite of `mme9_turn`, where the reference is frozen.
+    * The stop goes under the **low of the whole correction**, not under the trigger bar.
+    * A close back **above** the anchor is the leg resuming: new anchor, count to zero, order
+      withdrawn.
+
+    `breakeven_at_r` defaults to `null` — off — for the same reason as the other published setups:
+    the source names an entry and a protective stop and nothing about moving one.
+
+    `long_average_period` is his direction filter, offered on the published family since 22/09 and
+    `null` — the default — is it **off**, which is this setup exactly as the book states it. Named,
+    an order is placed only when the price it would **enter** at is beyond an exponential average
+    of that period. It gates placing, never withdraws, and leaves an open trade alone.
+    """
+
+    side: TradeSide
+    corrections: Annotated[int, Field(ge=1, le=2)] = 1
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 9
+    stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
+    breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = None
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
+
+
+class Mme9PullbackSetup(_Node):
+    type: Literal["mme9_pullback"]
+    params: Mme9PullbackParams
+
+
+class PontoContinuoParams(_Node):
+    """Two corrections back to the average, then the bar that touches it and closes back.
+
+    `entry_point` replaces that last bar and leaves the rest of the setup standing (2026-09-07).
+    `classic` is the rule as always: the bar that touches the average and closes back above it is
+    the whole setup, entering at its high and protected at its low. The other four are the
+    author's bar patterns — the same values the MME9 carries, and the same meanings — and when one
+    is chosen the touching bar (or the one after it) has to print the pattern, whose own levels
+    then place the order.
+
+    ⚠️ What does **not** change: the two corrections still qualify the pullback first, and without
+    them nothing arms; a bar closing **below** the average still erases the order and the
+    qualification together; and the trade is still conducted structurally, never by the average.
+    `stop_buffer_ticks` says nothing about a pattern's stop, which is twenty percent of its own bar.
+
+    `gift_stop` and `volume_filter` are the gift's dials, read only under `gift` (both) or
+    `barra_ignorada` (the filter alone).
+
+    `long_average_period` is his direction filter (2026-09-09), and `null` — the default — is the
+    filter off (*"os filtros são opcionais"*). Named, an order is placed only when the price it
+    would **enter** at is beyond an exponential average of that period: above it for a buy, below
+    it for a sell. ⚠️ The entry price, not the bar's close, and that is his answer rather than the
+    obvious reading — a bar closing under the long average whose break carries price over it is a
+    buy above the long average. It gates placing and never withdraws (*"ela fica, só retira se o
+    setup desconfigurar"*), and an open trade is conducted exactly as before.
+
+    ⚠️ The filter's average is always exponential, whatever `average` says: `average` is the mean
+    the *corrections* are counted against, which is the setup, and the filter is a second question
+    about direction. His answer named an exponential one for it.
+    """
+
+    side: TradeSide
+    period: Annotated[int, Field(ge=AVERAGE_FLOOR, le=1000)] = 20
+    average: AverageKind = "EMA"
+    stop_buffer_ticks: Annotated[int, Field(ge=0, le=10_000)] = 0
+    breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = 2.0
+    entry_point: AverageEntryPoint = "classic"
+    gift_stop: GiftStop = "gift"
+    volume_filter: bool = False
+    long_average_period: Annotated[int | None, Field(ge=AVERAGE_FLOOR, le=1000)] = None
+
+
+class PontoContinuoSetup(_Node):
+    type: Literal["ponto_continuo"]
+    params: PontoContinuoParams
+
+
+class StructureParams(_Node):
+    """Shared by every setup that arms a limit order on a zone market structure left behind.
+
+    Not directional by itself: which side is traded follows the structure. `side` only narrows
+    that — `both`, the default, is the behaviour every recorded result has.
+    `stop_buffer` is a *fraction of the zone's width*, not ticks — the zone is the unit.
+
+    `entry_point` chooses which of the author's activations the setup uses. `edge` and `midpoint`
+    are his chapter 11.4 and both rest a *limit* inside the region, waiting for price to come
+    back: `edge` on the near edge, costing a stop the full width of the region, and `midpoint` at
+    50%, roughly halving the stop so the same risk buys more size. The trade-off between those two
+    is his — "muitas vezes o preço não chega aos 50% e acaba indo em direção ao nosso alvo sem nos
+    ativar". `edge` is the default because changing it would move every result already recorded.
+
+    `return_pass` is his chapter 11.5 and a different shape of trade. Nothing is placed when the
+    zone is marked; price coming back to the 50% is what *places* the order, as a stop on the far
+    side of the near edge, and it fills only if price then resumes its move and passes back out
+    through the region. It carries the widest stop of the three, and its order is cancelled — not
+    filled — if price instead reaches the level that stop would occupy.
+
+    `botinha` is his chapter 11.2, and the only one whose order is not arithmetic on the
+    region at all. The zone marks the territory; the entry comes from a *formation* inside it —
+    the reaction's extreme anchors two volume-weighted averages, one on the typical price and
+    one on the lows, and a bar closing in the trade's direction confirms them. The order then
+    rests a tenth of the way up the band from the lower line, with its stop a whole band below,
+    and it has seven bars to fill. Two things follow that no other value does: the level is
+    **re-priced** on every close, because both averages move, and the region is **not** retired
+    by price touching it — entering the region is where the setup begins, so a zone spent by its
+    own first touch could never form one. What retires it instead is the window running out.
+
+    `fffd` is his other entry of the same chapter, and it inverts this one. The formation is the
+    same; what arms the order is a bar that **crosses the central line and closes beyond it** —
+    the seller pushing through and the push failing. The order is then a **stop** above that
+    bar's high rather than a limit below the market, it lives **two bars**, and the bar's own low
+    is a third level: losing it ends the region rather than the trade, while the stop sits three
+    ticks further out. Two bars passing unfilled take the order back and reset the reading — the
+    region survives and must configure itself again from nothing.
+
+    ⚠️ "Crosses" is read strictly: the bar has to have traded on the far side first. A bar that
+    lives entirely beyond the line and closes there arms nothing, because buying the break of its
+    high would be buying into a decline rather than the failure of a push.
+
+    `martelo` is his chapter 11.1, and it is the first entry point whose order is not priced off
+    the region at all. Price touches the region and has **five bars** — the touching one and four
+    more — to print a *martelo*: a bar whose shadow on the far side is more than half its height,
+    under a body, however small, that closed the right way. The order is a **stop** one tick past
+    that bar's extreme and the protective stop is **twenty percent of the bar's own height** past
+    the other one, so a small hammer is a small stop and a large position.
+
+    ⚠️ Two limits are the region's rather than the bar's. The hammer's extreme may reach past
+    the near edge by at most **half the region's height** -- region [90, 100] gives a ceiling of
+    105, and a hammer topping there still arms with its order at 106, because the ceiling measures
+    the hammer and not the order. And any bar losing the region's far edge before a hammer appears
+    ends the setup.
+
+    ⚠️ Every ending spends the region, which is the opposite of `fffd`. Two bars passing
+    unfilled, the hammer's own extreme being lost, the window closing empty — all of them retire
+    the zone, and a second hammer inside the same window does not re-arm. His words:
+    *"desarma tudo e tem que esperar um novo contexto"*.
+
+    `martelo_forca` is his second variation on the same hammer, and it is the same setup wearing
+    the opposite order. The region, the five bars and the arming ceiling are unchanged; what
+    differs is that the hammer alone places nothing. The bar **immediately after** it has to close
+    as a *barra de forca* — at least seventy percent body in the trade's direction — whose extreme
+    clears the hammer's, and the order is then a **limit** thirty percent of the way from the
+    hammer's extreme towards the force bar's. Below the market, waiting for the pullback, where
+    `martelo` waits above it for a break.
+
+    ⚠️ Its cancel reads on a **close**, not a touch, and only on the bar after the force bar: a
+    bar finishing beyond the force bar's extreme is the market saying the pullback is not coming.
+    On the bar after that the question cannot arise — either the limit filled and there is a trade
+    to conduct, or the two bars ran out and the order is withdrawn regardless.
+
+    ⚠️ Every ending retires the region here too, and the force bar failing is one of them. There
+    is no waiting for a better second bar and no second hammer inside the window: *"se a barra de
+    forca falha a regiao deixa de valer, tem que esperar configurar tudo de novo"*.
+
+    `gift` and `barra_ignorada` (2026-09-07) are the *barra de forca* off the region with no
+    hammer required — one before it is welcome — and the **bar after it** deciding the entry.
+    While bars keep touching the region a force bar may come on any of them; once a whole bar
+    trades above it, the force bar must be that bar or the next. If the bar after the force bar
+    is a **gift** — at most a third of the force bar's height, sitting entirely in its upper
+    third — or a **barra ignorada** — a body over a third of the force bar that did not break its
+    low — a **stop** order goes one tick past the higher of the two highs when that bar closes,
+    and lives two bars, or until price reaches the force bar's low, whichever comes first. The
+    entry may sit at most **two region heights** above the near edge:
+    region [90, 100] puts the ceiling at 120, measured on the entry rather than on the bar.
+
+    ⚠️ Every failure after the force bar spends the region — the wrong follower, a follower
+    louder than the filter allows, an entry past the ceiling, and the region's low being lost
+    even by a wick, at any moment, resting order included. His words: *"cancelou, região não
+    vale"*. A region price merely wandered away from is not spent; it waits for the next touch.
+
+    `gift_stop` is the gift's choice of protective stop, his two alternatives: twenty percent of
+    the **gift's** height under its low, or twenty percent of the **force bar's** height under
+    its low. The ignored bar always uses the force bar's, and no other entry point reads this.
+    `volume_filter` switches on his optional volume rule for both: the follower may carry at
+    most seventy percent of the force bar's volume, real volume where the venue reports it and
+    ticks elsewhere. With the filter on, a force bar reporting no volume at all fails it rather
+    than passing it, so a feed without volume shows as a setup that never arms.
+
+    ⚠️ The stop buffer says nothing about `botinha`, `martelo`, `martelo_forca`, `gift` or
+    `barra_ignorada`: the first takes its stop from the band and the others from a bar, none of
+    them from the region. Their own numbers —
+    the botinha's window and tenth and which volume its averages use, the hammer's five bars, two
+    bars, twenty percent and half a region, the gift's thirds and the seventy percent of volume —
+    are not on this document yet and run on the engine's defaults.
+
+    ⚠️ **Named values, not a fraction.** A free number would let an entry approach the far edge,
+    where risk collapses to the stop buffer alone and position sizing divides by nearly nothing.
+    His model 2 — the marking candle's body limit — is absent for a different reason: the region
+    records only that candle's high and low, so the body is not there to read.
+
+    `htf` is his higher-timeframe filter (2026-09-08), and `null` — the default — is the filter
+    off. Named, the setup runs his structure and region detectors on bars of that timeframe too,
+    assembled from its own, and may arm nothing until price reaches a region above that nobody
+    has touched. That touch releases **one** entry on this timeframe: the first zone armed spends
+    it, whatever becomes of the order, and the side is shut until price reaches another untouched
+    region above. Released and still without an entry, the search ends when price runs two
+    heights past the region or closes through it. The zone traded may sit outside the region
+    above; the break that qualifies it must confirm after the touch. Serves the change of
+    character and the continuation alike. The value must be coarser than the document's own
+    `timeframe` and a whole number of its bars — `semantic.py` refuses the rest.
+
+    `htf_offset` is kept only as `null`, and read by nobody (his rule of 2026-09-30: *"htf offset
+    não vamos usar em nenhum time frame, vamos adotar o horário do servidor mt5 como real"*). The
+    higher bars close on the broker's server clock, which is the **instrument's** — the number the
+    collector stored its candles under — and not a strategy's to state. It held hours ahead of UTC
+    from 2026-09-09, and from 2026-09-26 its `null` meant UTC, which put a broker's 21:00 H4 bar
+    across the UTC midnight of the D1 above. Narrowed rather than removed so every saved document,
+    all of which carry `null`, stays valid under `schema_version` 1.0.
+
+    `htf_regions` and `htf_allow_secondary` choose which untouched regions above may release
+    (his choice, 2026-09-29). `any`, the default, is any region, whichever way the structure above
+    points; `with_trend` is only a region the **last break** above offered — in favour of the
+    structure it left, an older one of the same side not counting — and a side released and still
+    without an entry is shut when the structure above turns against it. `htf_allow_secondary`
+    false keeps an impulse's primary region alone. A region that does not qualify still dies at
+    its first touch and releases nothing. Both are read only with an `htf`; the defaults are the
+    rule every recorded result ran under.
+    """
+
+    side: TradeSide = "both"
+    """Which zones may be traded: demand (`long`), supply (`short`) or `both`.
+
+    `both` is the default because it is what the structure family always did — which way it trades
+    follows the zone it reads — so a document written before this field runs exactly as it did.
+    A side only narrows it (his request, 18/09)."""
+    allow_secondary: bool = False
+    stop_buffer: Annotated[float, Field(ge=0, le=10)] = 0.1
+    entry_point: ZoneEntryPoint = "edge"
+    breakeven_at_r: Annotated[float | None, Field(gt=0, le=100)] = 2.0
+    gift_stop: GiftStop = "gift"
+    volume_filter: bool = False
+    htf: Timeframe | None = None
+    # Only `null` (2026-09-30): the broker's clock is the instrument's, never the document's.
+    htf_offset: None = None
+    htf_regions: HtfRegions = "any"
+    htf_allow_secondary: bool = True
+    min_bars_to_touch: Annotated[int, Field(ge=1, le=500)] = 7
+    """How many bars a region must stand before it may be traded, the bar that confirmed its gap
+    counting as the first (his rule of 29/09, against micro breakouts): the order may be put at the
+    close of that bar, and a touch on it or before cancels the trade. `1` switches it off."""
+    opening_gap: bool = False
+    """His Profit indicator's opening gap (15/10, ADR-0035): after a pause in the chart — no bars
+    for longer than one bar and at least 30 minutes — an opening bar wholly beyond the last bar
+    before the pause (its low over that bar's high, or its high under its low) marks that bar as a
+    region, on the opening bar itself. Every other rule of a region
+    applies to it unchanged, `min_bars_to_touch` included. Read from M1 to H4, on this chart and on
+    the `htf` above it; off, the default, is the rule every recorded result ran under."""
+
+
+class StructureChochSetup(_Node):
+    """Trade the zone the change of character left behind."""
+
+    type: Literal["structure_choch"]
+    params: StructureParams = Field(default_factory=StructureParams)
+
+
+class ContinuationParams(StructureParams):
+    """`max_bos` caps how many breaks after a change of character may still be traded.
+
+    `null` is uncapped, which is the default and not a degenerate setting: "every favourable
+    break re-arms" is a real reading of the method, and capping it is the experiment.
+    """
+
+    max_bos: Annotated[int | None, Field(ge=1, le=100)] = None
+
+
+class StructureContinuationSetup(_Node):
+    """Trade the zone a break in the trend's favour leaves behind, after a change of character."""
+
+    type: Literal["structure_continuation"]
+    params: ContinuationParams = Field(default_factory=ContinuationParams)
+
+
+type Setup = Annotated[
+    Mme9BreakoutSetup
+    | Mme9FailedTurnSetup
+    | Mme9PullbackSetup
+    | Mme9TurnSetup
+    | PontoContinuoSetup
+    | StructureChochSetup
+    | StructureContinuationSetup,
+    Field(discriminator="type"),
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -258,12 +999,21 @@ class Strategy(_Node):
     # Pinned, not free-form: a saved strategy is immutable for its version, and the
     # engine must be able to refuse a document it was not built to interpret.
     schema_version: Literal["1.0"]
-    name: Annotated[str, Field(min_length=1, max_length=120)]
+    name: Annotated[str, Field(min_length=1, max_length=NAME_MAX_LENGTH)]
     description: str = ""
     timeframe: Timeframe
     indicators: Annotated[list[Indicator], Field(max_length=20)] = Field(default_factory=list)
-    entry: Entry
-    exit: Exit
+    # A document describes its strategy *either* as conditions (`indicators` + `entry`) *or* by
+    # naming a `setup`, never both and never neither. The schema cannot say that — it is a rule
+    # about which fields may coexist, not about any one field's shape — so `semantic.py` says it,
+    # which is the same boundary that already owns "no entry side" and "target without a stop".
+    #
+    # `entry` and `exit` became optional to make this possible, and that is additive: every saved
+    # document supplied them, and one that does not is a setup document. `schema_version` stays at
+    # "1.0" (ADR-0013 — additive changes do not bump it).
+    setup: Setup | None = None
+    entry: Entry = Field(default_factory=Entry)
+    exit: Exit = Field(default_factory=Exit)
     risk: Risk
 
 

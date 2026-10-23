@@ -27,12 +27,66 @@ def ddl(name: str) -> str:
 
 
 EXPECTED_TABLES = {
+    "live_setups",
+    "live_setup_markets",
+    "signals",
     "instruments",
+    # The brokers collected from, several at once (rev_0050, ADR-0032).
+    "brokers",
+    # Which collections a run is waiting for before it may start (rev_0019). A table rather than
+    # a column, because one run can wait for several downloads.
+    "backtest_collections",
+    # The broker's own catalogue, photographed. Deliberately beside `instruments`
+    # rather than merged into it: nothing references this table, which is what lets a
+    # sync replace it wholesale when the account changes broker (ADR-0021).
+    "broker_symbols",
+    # What a probe found about one (symbol, timeframe), including the bounds on the answer.
+    "symbol_history",
     "datasets",
+    # The splits a share's stored bars are adjusted for (rev_0059): Tradeview sends them raw.
+    "stock_splits",
+    # One request to fetch a range, kept after it finishes. Beside `datasets` and not folded
+    # into it: that one says what exists, this one says what was asked for and how it went.
+    "collections",
     "strategies",
+    # The shelf: a label a person wrote, and the sweep saved beside the strategy. Beside
+    # `strategies` rather than columns on it, because the name here is written by a person
+    # while `strategies.name` is generated out of the document, and one document can be
+    # swept by several grids.
+    "catalog_entries",
+    "baskets",
+    "studies",
+    # Several entries, over several timeframes, over several markets — the product a
+    # study and a basket each refuse to take. Beside them rather than folded into either,
+    # because a run can belong to a sweep and to nothing else.
+    "sweeps",
+    "sweep_points",
+    # A reserved-window test judged in pieces, kept with the rule it was judged by (rev_0026).
+    # Beside `sweeps` rather than a column on it, because one test can be cut several ways.
+    "sweep_slicings",
+    # A test's points resampled, kept with the seed that makes it repeatable (rev_0028).
+    "sweep_montecarlos",
+    # Several finished runs replayed on one shared account (rev_0030).
+    "clusters",
+    # A sweep run again fold by fold, its choices tested after each (rev_0032).
+    "sweep_walk_forwards",
+    "sweep_walk_forward_folds",
+    # A sweep without its markets, and its queue of markets run one at a time (rev_0033).
+    "sweep_templates",
+    "sweep_template_items",
+    "walk_forwards",
+    "walk_forward_folds",
     "backtests",
     "backtest_metrics",
+    # A run that has not ended: no `date_to`, a `last_bar_time` that advances, and a status
+    # that stays `running` for days. Beside `backtests` rather than a flag on it, because the
+    # two answer different questions and a nullable half of each would answer neither.
+    "live_sessions",
     "trades",
+    # Every order the executor was asked to send, and what became of it. Append-only, enforced
+    # by a trigger (rev_0015) — the one table here that exists for a reader who does not trust
+    # the others, and the only one whose contents survive a `TRUNCATE` aimed at the schema.
+    "order_audit",
 }
 
 # Anything holding a price, a quantity or an amount of money. If a column below ever
@@ -42,6 +96,12 @@ MONETARY_COLUMNS = {
     ("instruments", "tick_value"),
     ("instruments", "contract_size"),
     ("backtests", "initial_capital"),
+    # The two groupings carry the capital their runs are launched with. `baskets` was missing
+    # here since it was added — caught while adding `studies`, and worth closing rather than
+    # matching: this list is the specific check that a money column is an exact decimal of the
+    # right scale, and a rule this file calls absolute cannot have two rows exempt from it.
+    ("baskets", "initial_capital"),
+    ("studies", "initial_capital"),
     ("backtest_metrics", "net_profit"),
     ("backtest_metrics", "gross_profit"),
     ("backtest_metrics", "gross_loss"),
@@ -145,15 +205,44 @@ def test_enums_are_check_constraints_not_native_types() -> None:
     assert "'forex'" in instruments
 
 
-def test_trades_cascade_from_their_backtest_and_restrict_their_instrument() -> None:
+def test_trades_cascade_from_their_parent_and_restrict_their_instrument() -> None:
     """Delete a run and its trades go with it. Delete a symbol and the database says no.
 
     Derived data cascades; referenced history does not. Getting these two backwards is
     how a cleanup script silently deletes six months of results.
+
+    Since rev_0012 there are **two** parents a trade can have, and both cascade on the same
+    argument: the trades of a run are part of the run, whether that run finished or is still
+    going. The instrument is neither's — it is referenced history, and it restricts.
     """
     foreign_keys = {fk.column.table.name: fk.ondelete for fk in table("trades").foreign_keys}
 
-    assert foreign_keys == {"backtests": "CASCADE", "instruments": "RESTRICT"}
+    assert foreign_keys == {
+        "backtests": "CASCADE",
+        "live_sessions": "CASCADE",
+        "instruments": "RESTRICT",
+    }
+
+
+def test_a_trade_has_exactly_one_parent() -> None:
+    """Both parent columns are nullable now, so the rule that stops an orphan — or a trade
+    claiming two runs — is a CHECK and not a NOT NULL. Asserted here as well as against a real
+    Postgres, because the models are what every unit test in this package reads."""
+    trades = table("trades")
+    checks = {constraint.name for constraint in trades.constraints if constraint.name}
+
+    assert "ck_trades_exactly_one_parent" in checks
+    assert trades.c.backtest_id.nullable
+    assert trades.c.live_session_id.nullable
+
+
+def test_a_live_session_restricts_the_strategy_and_the_instrument_it_ran() -> None:
+    """Neither RESTRICT is decoration: deleting a strategy must not erase the record of it
+    having traded, which is exactly what PR-304's promotion gate reads to decide whether a
+    strategy has enough paper behind it to go real."""
+    foreign_keys = {fk.column.table.name: fk.ondelete for fk in table("live_sessions").foreign_keys}
+
+    assert foreign_keys == {"strategies": "RESTRICT", "instruments": "RESTRICT"}
 
 
 def test_metrics_are_keyed_by_their_backtest() -> None:

@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -49,16 +49,13 @@ jobs:
       - name: Mypy (strict)
         run: uv run mypy
 
-      - name: 'Pytest (coverage gate: 90%)'
+      # No coverage gate here, and that is deliberate. This job has no Postgres and no Redis,
+      # so it cannot run the tests that cover a live session at all — and a gate measured over
+      # this suite alone counted those modules as uncovered, which is how it came to demand
+      # unit tests for code that has no honest unit test. The authoritative number is measured
+      # over the WHOLE suite in the integration job below.
+      - name: Pytest (unit — the fast loop)
         run: uv run pytest
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          files: coverage.xml
-          flags: python
-          fail_ci_if_error: true
-          token: ${{ secrets.CODECOV_TOKEN }}
 
   # The unit suite proves the health-check logic against fakes. This job proves the
   # wiring: that psycopg and redis-py actually reach the images we pin. Nothing here
@@ -70,21 +67,30 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16.14-alpine
+        # ⚠️ Must match `docker-compose.yml`. Dependabot's docker-compose ecosystem does not
+        # watch this file, so a bump lands there and not here — `tests/test_service_image_pins.py`
+        # is what turns that into a red build instead of a green one that tested nothing.
+        image: postgres:18.6-alpine
         env:
-          POSTGRES_DB: tradeforge
+          # ⚠️ The `_test` suffix is not decoration: `tradeforge_db.testing.truncate` refuses to
+          # empty a database whose name lacks it, so this job does not run without it. The rule
+          # exists because a run pointed at the developer's own `tradeforge` twice and emptied it.
+          POSTGRES_DB: tradeforge_test
           POSTGRES_USER: tradeforge
           POSTGRES_PASSWORD: tradeforge # throwaway, for an ephemeral container
         ports: ['5432:5432']
         # GitHub holds the steps until these report healthy — the same reason the
         # compose file has healthchecks: "started" is not "ready".
         options: >-
-          --health-cmd "pg_isready -U tradeforge -d tradeforge"
+          --health-cmd "pg_isready -U tradeforge -d tradeforge_test"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
       redis:
-        image: redis:7.4.9-alpine
+        # ⚠️ Must match `docker-compose.yml`. Dependabot's docker-compose ecosystem does not
+        # watch this file, so a bump lands there and not here — `tests/test_service_image_pins.py`
+        # is what turns that into a red build instead of a green one that tested nothing.
+        image: redis:8.10.1-alpine
         ports: ['6379:6379']
         options: >-
           --health-cmd "redis-cli ping"
@@ -95,7 +101,7 @@ jobs:
     env:
       POSTGRES_HOST: localhost
       POSTGRES_PORT: 5432
-      POSTGRES_DB: tradeforge
+      POSTGRES_DB: tradeforge_test
       POSTGRES_USER: tradeforge
       POSTGRES_PASSWORD: tradeforge
       REDIS_HOST: localhost
@@ -105,7 +111,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -113,10 +119,21 @@ jobs:
       - name: Install workspace
         run: uv sync --locked
 
-      # --no-cov: this run exercises a couple of connection paths, so its coverage
-      # number would be meaningless. The 90% gate lives in the unit job.
-      - name: Pytest (integration only)
-        run: uv run pytest -m integration --no-cov
+      # ⚠️ The whole suite, not `-m integration`, and this is where the 90% gate lives now.
+      # The old comment here said integration "exercises a couple of connection paths, so its
+      # coverage number would be meaningless" — true when it was a handful of tests, and no
+      # longer: it is now 233 of them covering whole modules. A live session cannot be driven
+      # without a database, so measuring coverage without one measures the wrong thing.
+      - name: 'Pytest (whole suite, coverage gate: 90%)'
+        run: uv run pytest -m "" --cov-fail-under=90
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: coverage.xml
+          flags: python
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   web:
     name: Web — lint, types, tests, build
@@ -154,6 +171,37 @@ jobs:
       - name: Build
         run: npm run build
 
+      # ⚠️ The e2e suite exists since long before this step, and this is why the step exists.
+      # Nothing ran playwright, so the specs drifted until one waited on a heading that had been
+      # renamed and clicked a button from a flow that had been merged into another — and no
+      # signal anywhere said so. A test nobody runs is not coverage; it is a file that ages while
+      # asserting things that stopped being true.
+      #
+      # Only `happy-path`. `screenshot.spec.ts` writes into `docs/assets/`, so running it here
+      # would either commit a picture nobody asked for or fail on a dirty tree; it is a tool, run
+      # by hand when the results screen changes.
+      #
+      # `--with-deps` because the runner has the browser's system libraries for nothing, and
+      # `chromium` alone because that is the one project the config declares.
+      - name: Install the browser playwright drives
+        run: npx playwright install --with-deps chromium
+        working-directory: apps/web
+
+      # No server to start here: `playwright.config.ts` brings up `npm run dev` itself, and every
+      # API call is fulfilled from a fixture — the journey under test is the UI's wiring, and the
+      # backend has its own end-to-end test in the integration job.
+      - name: 'Playwright (the journey, end to end)'
+        run: npx playwright test happy-path.spec.ts
+        working-directory: apps/web
+
+      - name: Upload the playwright report when the journey fails
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report
+          path: apps/web/playwright-report/
+          retention-days: 7
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
@@ -189,7 +237,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -217,6 +265,26 @@ jobs:
           # ("could not run") rather than pretending the tree is clean.
           npm audit --json > npm-audit.json || true
           uv run --no-project --python 3.12 scripts/check_js_audit.py < npm-audit.json
+
+  engine-version:
+    name: Engine version moves with its results
+    # A finished run is reused only under the same engine version (`tradeforge_api.reuse`), so a
+    # pull request that changes the engine must raise it, or say in a commit that no result
+    # moves: `Engine-Results: unchanged — <why>` (scripts/check_engine_version.py). Feature PRs
+    # only, for the reason `commitlint` gives below.
+    if: github.event_name == 'pull_request' && github.base_ref != 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: The engine's version, or its declared unchanged results
+        run: >-
+          uv run --no-project --python 3.12 scripts/check_engine_version.py
+          ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }}
 
   commitlint:
     name: Conventional commits

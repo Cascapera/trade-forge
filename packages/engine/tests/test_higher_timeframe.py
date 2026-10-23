@@ -1,0 +1,1366 @@
+"""His higher-timeframe filter: a region above releases one entry below.
+
+Two layers, tested apart and then together. `BarAggregator` is arithmetic on bars and is tested
+on hand-made hourly candles. `HigherTimeframeGate` is fed a real stream and asked its questions
+directly. Then `StructureStrategy` is driven with the filter on and off over the *same* stream,
+because the filter's whole claim is about the difference between the two.
+
+**The stream is built from the golden, twice.** The order-block golden (`BULLISH_START` +
+`GAPPING_IMPULSE`) is played first as the *higher* timeframe — each of its bars expanded into
+four hourly ones that assemble back into it exactly, so the H4 detector reads the golden it was
+validated on — and then again as the hourly stream, shifted up two so that its impulse breaks
+the high the prefix left. The higher run leaves the author's demand region at [80, 100] (bar 3
+dug down to 80, which moves nothing else: it is already the leg's origin); the hourly run comes
+back to touch it and marks its own zone at [88, 92], which is the one the filter releases.
+
+⚠️ **Every number below was read off a probe, not reasoned** (`docs/aulas/PR-205`). The two
+detectors share the hourly stream, so the hourly structure's state is coloured by the prefix,
+and the first expansion tried — flat sub-bars — gave the hourly machine nothing to arm on at all.
+The stepped expansion is what makes it produce breaks; which bars they land on is the probe's
+answer, and the tests assert those bars.
+"""
+
+import datetime as dt
+import random
+from dataclasses import dataclass, field
+from decimal import Decimal, localcontext
+
+import pytest
+
+from tradeforge_engine.domain import (
+    Candle,
+    Context,
+    Position,
+    Refusal,
+    RefusedBy,
+    Side,
+    Signal,
+    SignalKind,
+)
+from tradeforge_engine.errors import EngineError
+from tradeforge_engine.higher_timeframe import (
+    GIVE_UP_AT_REGION_HEIGHTS,
+    MAX_SERVER_OFFSET,
+    BarAggregator,
+    HigherTimeframeGate,
+    RegionChoice,
+    RegionTracker,
+    Release,
+    _innermost,
+    _reaches,
+    _search_over,
+)
+from tradeforge_engine.loop import ENGINE_CONTEXT
+from tradeforge_engine.setups import SetupContext, StructureStrategy
+from tradeforge_engine.structure import (
+    MarketStructure,
+    OrderBlock,
+    OrderBlockDetector,
+    StructureKind,
+    Trend,
+    ZoneKind,
+)
+from tradeforge_engine.testing import (
+    AAPL,
+    BULLISH_START,
+    GAPPING_IMPULSE,
+    HOUR,
+    START,
+    ImmediateFillBroker,
+    ageless_structure,
+    bar,
+)
+
+H4 = 4 * HOUR
+_UTC_BROKER = dt.timedelta(0)
+"""The clock every scenario in this file runs on.
+
+Zero is a claim, not a default: these fixtures were written against buckets that open at 00:00,
+04:00 and 08:00 UTC, and they keep that meaning only for a broker whose server keeps UTC. What a
+*different* clock does to the same bars is `test_the_buckets_follow_the_broker_s_clock` and the
+scenario below it — and that they change at all is the whole point of the parameter.
+"""
+_ACCOUNT = ImmediateFillBroker(instrument=AAPL).account()
+_TICK = Decimal("0.01")
+
+
+def _at(index: int) -> dt.datetime:
+    return START + index * HOUR
+
+
+def _index_of(candle: Candle) -> int:
+    return round((candle.time - START) / HOUR)
+
+
+def _sub(time: dt.datetime, open_: Decimal, close: Decimal) -> Candle:
+    return Candle(time=time, open=open_, high=max(open_, close), low=min(open_, close), close=close)
+
+
+def _expand(candle: Candle, first_hour: int) -> list[Candle]:
+    """Four hourly bars that assemble back into `candle` exactly, stepping in its direction.
+
+    An up bar dips to its low first and climbs to its high in two strictly rising steps; a down
+    bar mirrors that. The strictness is the point: the hourly structure arms on three bars with
+    strictly higher (or lower) highs *and* lows, and flat sub-bars never give it one. The tick
+    nudges are what keep consecutive lows strictly apart without moving any extreme.
+    """
+    open_, high, low, close = candle.open, candle.high, candle.low, candle.close
+    times = [_at(first_hour + i) for i in range(4)]
+    if close >= open_:
+        middle = low + (high - low) / 2
+        return [
+            _sub(times[0], open_, low),
+            _sub(times[1], low + _TICK, middle),
+            _sub(times[2], middle + _TICK, high),
+            _sub(times[3], high - _TICK, close),
+        ]
+    middle = high - (high - low) / 2
+    return [
+        _sub(times[0], open_, high),
+        _sub(times[1], high - _TICK, middle),
+        _sub(times[2], middle - _TICK, low),
+        _sub(times[3], low + _TICK, close),
+    ]
+
+
+def _shift(candles: list[Candle], *, hours: int, price: Decimal) -> list[Candle]:
+    return [
+        Candle(
+            time=candle.time + hours * HOUR,
+            open=candle.open + price,
+            high=candle.high + price,
+            low=candle.low + price,
+            close=candle.close + price,
+        )
+        for candle in candles
+    ]
+
+
+_MIRROR_AXIS = Decimal(200)
+
+
+def _mirror(candles: list[Candle]) -> list[Candle]:
+    """Reflect about a price: the demand scenario becomes its supply twin, extremes swapped."""
+    return [
+        Candle(
+            time=candle.time,
+            open=_MIRROR_AXIS - candle.open,
+            high=_MIRROR_AXIS - candle.low,
+            low=_MIRROR_AXIS - candle.high,
+            close=_MIRROR_AXIS - candle.close,
+        )
+        for candle in candles
+    ]
+
+
+# The golden as the higher timeframe: eighteen H4 bars, hours 0-71. Bar 3 dug down to 80 so the
+# region it marks is [80, 100] — wide enough that the hourly run below touches it (low 92) without
+# closing through it (lowest close 89). The impulse also leaves the secondary [110, 117].
+_HTF_IMPULSE = [*GAPPING_IMPULSE]
+_HTF_IMPULSE[3] = bar(3, open_="99", close="99", high="100", low="80")
+PREFIX = [
+    sub
+    for position, candle in enumerate([*BULLISH_START, *_HTF_IMPULSE])
+    for sub in _expand(candle, 4 * position)
+]
+# The golden again as the hourly stream, hours 72-89, two higher so its bar-9 close of 126 breaks
+# the 125 top the prefix left. Its bar -8 (hour 72) is the touch: low 92 <= 100.
+BASE = _shift([*BULLISH_START, *GAPPING_IMPULSE], hours=80, price=Decimal(2))
+STREAM = [*PREFIX, *BASE]
+
+TOUCH = 72
+"""The hourly bar that reaches [80, 100]; the release opens here."""
+ARMS = 89
+"""The hourly bullish BOS (126 > 125) that marks [88, 92] — the one zone armed under the filter."""
+
+
+@dataclass
+class _Marked:
+    """A stand-in setup: qualify the first zone the detector marks, on the bar it marks it."""
+
+    def qualify(self, context: SetupContext) -> OrderBlock | None:
+        return context.marked[0] if context.marked else None
+
+
+@dataclass
+class _Names:
+    """Remembers every zone marked, in order, and names one of them on chosen bars."""
+
+    picks: dict[int, int]
+    seen: list[OrderBlock] = field(default_factory=list)
+
+    def qualify(self, context: SetupContext) -> OrderBlock | None:
+        self.seen.extend(context.marked)
+        pick = self.picks.get(_index_of(context.candle))
+        return self.seen[pick] if pick is not None and pick < len(self.seen) else None
+
+
+def _drive(
+    strategy: StructureStrategy,
+    candles: list[Candle],
+    *,
+    position_on: frozenset[int] = frozenset(),
+    refused_on: dict[int, RefusedBy] | None = None,
+) -> dict[int, list[Signal]]:
+    """Feed candles one at a time; the signals each bar produced, keyed by bar number.
+
+    `refused_on` hands the strategy, on the named bar, a refusal of the last entry it asked for
+    — the way `Context.refusals` does, one bar after the order was placed.
+    """
+    out: dict[int, list[Signal]] = {}
+    last_entry: Signal | None = None
+    with localcontext(ENGINE_CONTEXT):
+        for candle in candles:
+            index = _index_of(candle)
+            position = None
+            if index in position_on:
+                position = Position(
+                    symbol=AAPL.symbol,
+                    side=Side.LONG,
+                    volume=Decimal(1),
+                    entry_price=candle.open,
+                    entry_time=candle.time,
+                )
+            refusals: tuple[Refusal, ...] = ()
+            refused_by = (refused_on or {}).get(index)
+            if refused_by is not None and last_entry is not None:
+                assert last_entry.client_id is not None
+                refusals = (
+                    Refusal(
+                        client_id=last_entry.client_id,
+                        intent=SignalKind.ENTRY,
+                        refused_by=refused_by,
+                        reason=last_entry.reason,
+                        detail="the venue would not take it",
+                    ),
+                )
+            context = Context(
+                candle=candle,
+                instrument=AAPL,
+                account=_ACCOUNT,
+                position=position,
+                refusals=refusals,
+            )
+            out[index] = list(strategy.on_bar(context))
+            for signal in out[index]:
+                if signal.kind is SignalKind.ENTRY:
+                    last_entry = signal
+    return out
+
+
+def _entries(signals: dict[int, list[Signal]]) -> dict[int, Signal]:
+    return {
+        index: signal
+        for index, bar_signals in signals.items()
+        for signal in bar_signals
+        if signal.kind is SignalKind.ENTRY
+    }
+
+
+def _demand(confirmed_at: dt.datetime) -> OrderBlock:
+    """A hand-built hourly zone, for asking the gate about a break confirmed at a given bar."""
+    return OrderBlock(
+        kind=ZoneKind.DEMAND,
+        top=Decimal(92),
+        bottom=Decimal(88),
+        time=confirmed_at - HOUR,
+        confirmed_at=confirmed_at,
+        break_kind=StructureKind.BOS,
+        primary=True,
+    )
+
+
+def _fed(
+    candles: list[Candle],
+    *,
+    target: dt.timedelta = H4,
+    offset: dt.timedelta = _UTC_BROKER,
+) -> HigherTimeframeGate:
+    gate = HigherTimeframeGate(base=HOUR, target=target, offset=offset)
+    with localcontext(ENGINE_CONTEXT):
+        for candle in candles:
+            gate.observe(candle)
+    return gate
+
+
+def _through(hour: int) -> list[Candle]:
+    return [candle for candle in STREAM if _index_of(candle) <= hour]
+
+
+# --------------------------------------------------------------------------- #
+# The aggregator                                                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_four_hourly_bars_make_one_h4_bar_with_the_widest_extremes() -> None:
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
+    hourly = [
+        bar(0, open_="100", close="101", high="102", low="99", tick_volume=5),
+        bar(1, open_="101", close="103", high="105", low="100", tick_volume=7),
+        bar(2, open_="103", close="98", high="104", low="97", tick_volume=1),
+        bar(3, open_="98", close="100", high="101", low="98", tick_volume=2),
+    ]
+    completed = [done for candle in hourly for done in bars.update(candle)]
+
+    assert len(completed) == 1
+    (h4,) = completed
+    assert (h4.time, h4.open, h4.high, h4.low, h4.close) == (
+        _at(0),
+        Decimal(100),
+        Decimal(105),
+        Decimal(97),
+        Decimal(100),
+    )
+    assert h4.tick_volume == 15
+
+
+def test_the_h4_bar_is_returned_on_the_hourly_bar_that_ends_it_and_only_then() -> None:
+    """The 03:00 bar closes at 04:00, the bucket's edge — the H4 is complete on that bar's own
+    update, not one bar later. And the next hourly bar returns nothing again."""
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
+    assert [bars.update(bar(i, open_="1", close="1")) for i in range(3)] == [(), (), ()]
+    (h4,) = bars.update(bar(3, open_="1", close="1"))
+    assert h4.time == _at(0)
+    assert bars.update(bar(4, open_="1", close="1")) == ()
+
+
+def test_a_bucket_left_open_is_flushed_by_the_first_bar_of_a_later_one() -> None:
+    """A session ends and the bar that would have closed the bucket never comes. The next bucket's
+    first bar returns the partial one — one bar late, which is the only honest timing."""
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
+    assert bars.update(bar(4, open_="10", close="11", high="12", low="9")) == ()
+    assert bars.update(bar(5, open_="11", close="13", high="14", low="10")) == ()
+    (partial,) = bars.update(bar(12, open_="20", close="21"))
+    assert (partial.time, partial.open, partial.high, partial.low, partial.close) == (
+        _at(4),
+        Decimal(10),
+        Decimal(14),
+        Decimal(9),
+        Decimal(13),
+    )
+
+
+def test_one_bar_can_flush_the_old_bucket_and_end_its_own() -> None:
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
+    bars.update(bar(4, open_="10", close="11"))
+    completed = bars.update(bar(15, open_="20", close="21"))
+    assert [done.time for done in completed] == [_at(4), _at(12)]
+
+
+def test_a_bucket_still_open_is_never_returned() -> None:
+    bars = BarAggregator(base=HOUR, target=H4, offset=_UTC_BROKER)
+    assert [bars.update(bar(i, open_="1", close="1")) for i in range(3)] == [(), (), ()]
+
+
+@pytest.mark.parametrize(
+    ("target", "moment", "bucket"),
+    [
+        (
+            H4,
+            dt.datetime(2024, 1, 1, 5, 30, tzinfo=dt.UTC),
+            dt.datetime(2024, 1, 1, 4, tzinfo=dt.UTC),
+        ),
+        (H4, dt.datetime(2024, 1, 1, 4, tzinfo=dt.UTC), dt.datetime(2024, 1, 1, 4, tzinfo=dt.UTC)),
+        (
+            dt.timedelta(days=1),
+            dt.datetime(2024, 1, 3, 23, 45, tzinfo=dt.UTC),
+            dt.datetime(2024, 1, 3, tzinfo=dt.UTC),
+        ),
+        # 2024-01-03 is a Wednesday; the week's bucket opens on the Monday before it.
+        (
+            dt.timedelta(weeks=1),
+            dt.datetime(2024, 1, 3, 10, tzinfo=dt.UTC),
+            dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+        ),
+    ],
+)
+def test_buckets_close_on_whole_units_of_the_target(
+    target: dt.timedelta, moment: dt.datetime, bucket: dt.datetime
+) -> None:
+    assert (
+        BarAggregator(base=dt.timedelta(minutes=15), target=target, offset=_UTC_BROKER).bucket_of(
+            moment
+        )
+        == bucket
+    )
+
+
+@pytest.mark.parametrize(
+    ("hours", "bucket"),
+    [
+        # The broker keeps UTC: 05:30 falls in the bucket that opened at 04:00, as it always did.
+        (0, dt.datetime(2024, 1, 1, 4, tzinfo=dt.UTC)),
+        # Three hours ahead: 05:30 UTC is 08:30 on his chart, inside the bar that opened at 08:00
+        # server — 05:00 UTC. His H4 bars close at 21:00, 01:00, 05:00 and 09:00 UTC.
+        (3, dt.datetime(2024, 1, 1, 5, tzinfo=dt.UTC)),
+        # Behind UTC, and by a half hour, because both are real: 05:30 UTC is 00:00 server, which
+        # opens a bucket exactly.
+        (-5.5, dt.datetime(2024, 1, 1, 5, 30, tzinfo=dt.UTC)),
+    ],
+)
+def test_the_buckets_follow_the_broker_s_clock(hours: float, bucket: dt.datetime) -> None:
+    """His rule of 2026-09-09. A MetaTrader chart cuts its H4 at midnight, 04:00 and 08:00 *server*
+    time; the stored candles are UTC. Anchoring on UTC marks every region displaced by the broker's
+    offset — and nothing about the result looks wrong, which is what makes it expensive."""
+    bars = BarAggregator(base=HOUR, target=H4, offset=dt.timedelta(hours=hours))
+
+    assert bars.offset == dt.timedelta(hours=hours)
+    assert bars.bucket_of(dt.datetime(2024, 1, 1, 5, 30, tzinfo=dt.UTC)) == bucket
+
+
+def test_a_different_clock_reads_different_regions_out_of_the_same_bars() -> None:
+    """⚠️ The reason the offset is demanded rather than defaulted, end to end and on the same
+    stream. One hour of broker offset groups the hourly bars into different H4 bars, so the
+    structure above breaks elsewhere and leaves a region of [99, 105] where the UTC reading leaves
+    [80, 100] — and the M15 below, released by neither, takes no trade at all.
+
+    Two clocks, one set of candles, two different backtests. Nothing raises, nothing looks odd,
+    and only one of them is the chart he is reading."""
+    utc = _fed(STREAM)
+    ahead = _fed(STREAM, offset=HOUR)
+
+    assert [(str(zone.block.bottom), str(zone.block.top)) for zone in utc.zones] == [
+        ("80", "100"),
+        ("110", "117"),
+    ]
+    assert [(str(zone.block.bottom), str(zone.block.top)) for zone in ahead.zones] == [
+        ("99", "105"),
+        ("110", "117"),
+    ]
+    # And the difference reaches the trade, which is the only place it matters.
+    assert (
+        list(
+            _entries(
+                _drive(
+                    ageless_structure(qualifier=_Marked(), htf=H4, htf_offset=HOUR, timeframe=HOUR),
+                    STREAM,
+                )
+            )
+        )
+        == []
+    )
+
+
+def test_a_bar_that_straddles_a_boundary_is_refused_rather_than_folded_in() -> None:
+    """An offset that does not describe the clock the candles were collected under puts the
+    boundaries inside the bars. Folding such a bar into whichever bucket its opening instant fell
+    in is the quiet failure — buckets closing a little late, regions displaced a little — so it
+    raises on the first bar instead.
+
+    Ten minutes against hourly bars: the H4 boundaries land at 03:50, and the 03:00 bar runs past
+    them."""
+    bars = BarAggregator(base=HOUR, target=H4, offset=dt.timedelta(minutes=10))
+    # The 00:00, 01:00 and 02:00 bars sit inside the bucket that opened at 23:50; the 03:00 one
+    # would run ten minutes past its close at 03:50.
+    for index in range(3):
+        bars.update(bar(index, open_="1", close="1"))
+    straddles = bar(3, open_="1", close="1")
+
+    with pytest.raises(EngineError, match="spans the boundary"):
+        bars.update(straddles)
+
+
+@pytest.mark.parametrize("hours", [15, -15, 100, -100])
+def test_a_clock_no_terminal_could_have_is_refused(hours: int) -> None:
+    """The same bound the collector uses, and for the same reason: past fourteen hours the number
+    being stated is not a timezone.
+
+    ⚠️ **Both signs, because the guard is written on the magnitude.** Tested on the positive side
+    alone it holds for `offset > MAX` just as well — and that mutant is the plausible refactor,
+    somebody simplifying the `abs` away. A document then carrying `-19` (a real confusion: the
+    offset of a UTC+5 broker written the wrong way round, or a number pasted in minutes) builds an
+    aggregator anchored nineteen hours out of place. With M15 bars the straddle guard says nothing
+    either, because nineteen hours is a whole number of them: every region comes out displaced,
+    the run finishes, and no number looks wrong. Which is the failure this whole PR exists for.
+    """
+    with pytest.raises(ValueError, match="within 14:00:00 of UTC"):
+        BarAggregator(base=HOUR, target=H4, offset=dt.timedelta(hours=hours))
+
+
+@pytest.mark.parametrize("offset", [MAX_SERVER_OFFSET, -MAX_SERVER_OFFSET])
+def test_the_furthest_real_clock_is_accepted(offset: dt.timedelta) -> None:
+    """Fourteen hours exactly is Kiritimati, and it is a place. The bound is inclusive, and only a
+    value that must pass proves it: refused here, the engine would reject a document the schema's
+    own `maximum: 14` had just accepted — two layers disagreeing about one number, which the API
+    reports as a 500 on a strategy it validated ([[limite-exclusivo-colapsado]])."""
+    assert BarAggregator(base=HOUR, target=H4, offset=offset).offset == offset
+    assert dt.timedelta(hours=14) == MAX_SERVER_OFFSET
+
+
+def test_a_filter_with_no_clock_is_cut_on_utc() -> None:
+    """His decision of 2026-09-26 (*"nao vamos fazer o ajuste"*), reversing 2026-09-09: no
+    offset is UTC, where the stored candles are — the same entries as a UTC broker stated."""
+    silent = ageless_structure(qualifier=_Marked(), htf=H4, timeframe=HOUR)
+    stated = ageless_structure(qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR)
+
+    assert silent._gate is not None
+    assert silent._gate.offset == _UTC_BROKER
+    assert _entries(_drive(silent, STREAM)) == _entries(_drive(stated, STREAM))
+
+
+@pytest.mark.parametrize(
+    ("base", "target"),
+    [
+        (HOUR, HOUR),
+        (H4, HOUR),
+        (HOUR, dt.timedelta(minutes=90)),
+    ],
+)
+def test_the_higher_timeframe_must_be_coarser_and_a_whole_number_of_bars(
+    base: dt.timedelta, target: dt.timedelta
+) -> None:
+    with pytest.raises(ValueError, match="higher timeframe"):
+        BarAggregator(base=base, target=target, offset=_UTC_BROKER)
+
+
+# --------------------------------------------------------------------------- #
+# The gate, asked directly                                                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_region_above_exists_only_once_the_bar_that_reveals_it_has_closed() -> None:
+    """The H4 that breaks structure spans hours 68-71. On hour 70 there is no region to know of;
+    on hour 71, the bar that closes it, both regions the golden leaves are there."""
+    assert _fed(_through(70)).zones == ()
+    zones = _fed(_through(71)).zones
+    assert [(str(zone.block.bottom), str(zone.block.top)) for zone in zones] == [
+        ("80", "100"),
+        ("110", "117"),
+    ]
+
+
+def test_the_touch_releases_the_side_on_the_bar_that_reaches_the_region() -> None:
+    probe = _demand(_at(ARMS))
+    assert _fed(_through(TOUCH - 1)).reference(probe) is None
+    reference = _fed(_through(TOUCH)).reference(probe)
+    assert reference is not None
+    assert (str(reference.bottom), str(reference.top)) == ("80", "100")
+
+
+def test_a_bar_that_falls_through_one_region_into_another_references_the_innermost() -> None:
+    """Hour 72 reaches both regions — low 92 is under 117 and under 100 — and closes at 93, through
+    the secondary [110, 117]. Taking the newer region as the reference would release and end the
+    search on the same bar; the region price is *in* is the primary."""
+    gate = _fed(_through(TOUCH))
+    reference = gate.reference(_demand(_at(ARMS)))
+    assert reference is not None
+    assert str(reference.top) == "100"
+    # Both were reached, so both are spent: nothing touching [110, 117] later releases anything.
+    gate.spend(Side.LONG)
+    with localcontext(ENGINE_CONTEXT):
+        gate.observe(bar(73, open_="112", close="114", high="115", low="111"))
+    assert gate.reference(_demand(_at(ARMS))) is None
+
+
+def test_the_touch_is_the_wick_reaching_the_edge_and_the_edge_counts() -> None:
+    """His mitigation rule, read on the base bar: the first wick to the region's entry edge. A
+    bar whose low is exactly 100 and whose close is back at 105 has touched [80, 100] — the same
+    `<=` `TrackedZone._advance` uses — so the side is released although nothing closed inside."""
+    gate = _fed(_through(TOUCH - 1))
+    with localcontext(ENGINE_CONTEXT):
+        gate.observe(bar(TOUCH, open_="104", close="105", high="106", low="100"))
+    reference = gate.reference(_demand(_at(ARMS)))
+    assert reference is not None
+    assert (str(reference.bottom), str(reference.top)) == ("80", "100")
+
+    short_of_it = _fed(_through(TOUCH - 1))
+    with localcontext(ENGINE_CONTEXT):
+        short_of_it.observe(bar(TOUCH, open_="104", close="105", high="106", low="100.01"))
+    assert short_of_it.reference(_demand(_at(ARMS))) is None
+
+
+def test_the_supply_touch_is_the_wick_reaching_the_bottom_edge() -> None:
+    """The mirror, with its own numbers: the supply region at [100, 120] is reached by a high of
+    exactly 100 that closes back at 95, and not by one that stops at 99.99."""
+    prefix = [candle for candle in _mirror(STREAM) if _index_of(candle) < TOUCH]
+    probe = OrderBlock(
+        kind=ZoneKind.SUPPLY,
+        top=Decimal(112),
+        bottom=Decimal(108),
+        time=_at(ARMS - 1),
+        confirmed_at=_at(ARMS),
+        break_kind=StructureKind.BOS,
+        primary=True,
+    )
+    gate = _fed(prefix)
+    short_of_it = _fed(prefix)
+    with localcontext(ENGINE_CONTEXT):
+        gate.observe(bar(TOUCH, open_="96", close="95", high="100", low="94"))
+        short_of_it.observe(bar(TOUCH, open_="96", close="95", high="99.99", low="94"))
+    reference = gate.reference(probe)
+    assert reference is not None
+    assert (str(reference.bottom), str(reference.top)) == ("100", "120")
+    assert short_of_it.reference(probe) is None
+
+
+def test_the_release_opens_on_the_touching_bar_not_on_its_h4_bucket() -> None:
+    """Hour 72 opens an H4 bucket, so on the golden the touch and the bucket coincide. Here the
+    touch is hour 73: hour 72 reaches only the secondary and closes through it — spent, nothing
+    released — and hour 73 reaches the primary. A break confirmed on hour 72 came before the
+    touch and is refused; on 73 it is allowed."""
+    gate = _fed(_through(TOUCH - 1))
+    with localcontext(ENGINE_CONTEXT):
+        gate.observe(bar(72, open_="112", close="105", high="113", low="101"))
+        assert gate.reference(_demand(_at(ARMS))) is None
+        gate.observe(bar(73, open_="105", close="103", high="106", low="95"))
+    assert not gate.allows(_demand(_at(72)))
+    assert gate.allows(_demand(_at(73)))
+
+
+def test_a_deeper_region_becomes_the_reference_but_the_release_keeps_its_first_bar() -> None:
+    """Hour 72 reaches only the secondary [110, 117] and holds above it; hour 73 comes down to the
+    primary. The two heights and the break are now measured from [80, 100], and *from that bar
+    on* still counts from hour 72: a break confirmed then was a reaction to a region price had
+    come to."""
+    gate = _fed(_through(TOUCH - 1))
+    with localcontext(ENGINE_CONTEXT):
+        gate.observe(bar(72, open_="112", close="112", high="113", low="111"))
+        first = gate.reference(_demand(_at(ARMS)))
+        assert first is not None
+        assert str(first.top) == "117"
+        gate.observe(bar(73, open_="112", close="103", high="112", low="95"))
+    reference = gate.reference(_demand(_at(ARMS)))
+    assert reference is not None
+    assert str(reference.top) == "100"
+    assert gate.allows(_demand(_at(72)))
+    assert not gate.allows(_demand(_at(71)))
+
+
+def test_a_break_that_confirmed_before_the_touch_is_not_released() -> None:
+    """His answer 5: *from that bar on*. A zone whose break confirmed on hour 71 was not the
+    reaction to the region; one confirmed on the touching bar itself, or after, was."""
+    gate = _fed(_through(TOUCH))
+    assert not gate.allows(_demand(_at(TOUCH - 1)))
+    assert gate.allows(_demand(_at(TOUCH)))
+    assert gate.allows(_demand(_at(TOUCH + 1)))
+
+
+def test_spending_shuts_the_side_and_the_same_region_never_releases_again() -> None:
+    gate = _fed(_through(TOUCH))
+    gate.spend(Side.LONG)
+    assert not gate.allows(_demand(_at(ARMS)))
+    # Hour 73 dips to 91, inside [80, 100] again — the second visit releases nothing.
+    with localcontext(ENGINE_CONTEXT):
+        gate.observe(STREAM[TOUCH + 1])
+    assert not gate.allows(_demand(_at(ARMS)))
+    assert gate.reference(_demand(_at(ARMS))) is None
+
+
+def test_two_heights_past_the_region_end_the_search_on_the_wick() -> None:
+    """[80, 100] is twenty high, so the search ends at 140. A high of 140 that closes back at 120
+    ends it — *"atingir"* is trading there — and a high one tick short does not."""
+    assert GIVE_UP_AT_REGION_HEIGHTS == 2
+    ran_away = _fed(_through(TOUCH))
+    fell_short = _fed(_through(TOUCH))
+    with localcontext(ENGINE_CONTEXT):
+        ran_away.observe(bar(73, open_="95", close="120", high="140", low="95"))
+        fell_short.observe(bar(73, open_="95", close="120", high="139.99", low="95"))
+    assert not ran_away.allows(_demand(_at(ARMS)))
+    assert fell_short.allows(_demand(_at(ARMS)))
+
+
+def test_a_close_through_the_region_ends_the_search_and_a_close_on_its_edge_does_not() -> None:
+    """His example: released, no entry, a close at 85 under [90, 100] — stop looking. The wick is
+    not the event, the close is; and a close exactly on the far edge is neither."""
+    broke = _fed(_through(TOUCH))
+    rested = _fed(_through(TOUCH))
+    with localcontext(ENGINE_CONTEXT):
+        broke.observe(bar(73, open_="93", close="79.99", high="93", low="79"))
+        rested.observe(bar(73, open_="93", close="80", high="93", low="79"))
+    assert not broke.allows(_demand(_at(ARMS)))
+    assert rested.allows(_demand(_at(ARMS)))
+
+
+def test_the_supply_side_mirrors_the_release_the_two_heights_and_the_break() -> None:
+    """The stream reflected about 200: the primary becomes a supply region at [100, 120], the
+    secondary [83, 90], and hour 72 reaches both from below, closing at 107 — through the
+    secondary. The reference is the innermost; the search ends at 60 on the wick or on a close
+    above 120. Numbers that differ from the demand side's, so a sign error cannot hide."""
+    mirrored = _mirror(STREAM)
+    through_touch = [candle for candle in mirrored if _index_of(candle) <= TOUCH]
+    probe = OrderBlock(
+        kind=ZoneKind.SUPPLY,
+        top=Decimal(112),
+        bottom=Decimal(108),
+        time=_at(ARMS - 1),
+        confirmed_at=_at(ARMS),
+        break_kind=StructureKind.BOS,
+        primary=True,
+    )
+    gate = _fed(through_touch)
+    reference = gate.reference(probe)
+    assert reference is not None
+    assert (str(reference.bottom), str(reference.top)) == ("100", "120")
+
+    ran_away = _fed(through_touch)
+    fell_short = _fed(through_touch)
+    broke = _fed(through_touch)
+    rested = _fed(through_touch)
+    with localcontext(ENGINE_CONTEXT):
+        ran_away.observe(bar(73, open_="105", close="80", high="105", low="60"))
+        fell_short.observe(bar(73, open_="105", close="80", high="105", low="60.01"))
+        broke.observe(bar(73, open_="107", close="120.01", high="121", low="107"))
+        rested.observe(bar(73, open_="107", close="120", high="121", low="107"))
+    assert not ran_away.allows(probe)
+    assert fell_short.allows(probe)
+    assert not broke.allows(probe)
+    assert rested.allows(probe)
+
+
+# --------------------------------------------------------------------------- #
+# The strategy under the filter                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_without_the_filter_the_stream_arms_five_times() -> None:
+    """The baseline every test below is read against: the hourly structure marks zones on five
+    bars of this stream, four of them before price ever reaches the region above."""
+    entries = _entries(_drive(ageless_structure(qualifier=_Marked()), STREAM))
+    assert sorted(entries) == [26, 30, 44, 70, ARMS]
+
+
+def test_nothing_is_armed_before_price_reaches_a_region_above() -> None:
+    strategy = ageless_structure(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
+    signals = _drive(strategy, _through(TOUCH - 1))
+    assert all(bar_signals == [] for bar_signals in signals.values())
+
+
+def test_the_touch_releases_one_entry_and_the_entry_carries_the_region_above() -> None:
+    strategy = ageless_structure(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
+    entries = _entries(_drive(strategy, STREAM))
+
+    assert list(entries) == [ARMS]
+    entry = entries[ARMS]
+    assert entry.side is Side.LONG
+    assert str(entry.limit_price) == "92"
+    assert entry.context is not None
+    assert {key: str(value) for key, value in entry.context.items()} == {
+        "zone_top": "92",
+        "zone_bottom": "88",
+        "htf_top": "100",
+        "htf_bottom": "80",
+    }
+    assert [(region.label, str(region.bottom), str(region.top)) for region in entry.regions] == [
+        ("zone", "88", "92"),
+        ("htf", "80", "100"),
+    ]
+
+
+def test_the_arming_spends_the_release_and_a_later_zone_is_refused() -> None:
+    """Hour 89 marks three zones; the stand-in takes the first, then names the second on the next
+    bar. Without the filter that is an ordinary replacement — cancel and a new order. With it,
+    the release was spent on the first arming and the second zone is refused outright."""
+    tail = [*STREAM, bar(90, open_="126", close="126")]
+    # Secondaries are offered too, so the stand-in can name hour 89's second zone. Ten zones are
+    # marked before hour 89 (three on 26, one each on 30 and 44, five on 70): the first of hour
+    # 89's three is the eleventh seen and the second is the twelfth.
+    picks = {ARMS: 10, ARMS + 1: 11}
+
+    plain = _drive(ageless_structure(qualifier=_Names(picks), allow_secondary=True), tail)
+    assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.CANCEL, SignalKind.ENTRY]
+
+    filtered = _drive(
+        ageless_structure(
+            qualifier=_Names(picks),
+            allow_secondary=True,
+            htf=H4,
+            htf_offset=_UTC_BROKER,
+            timeframe=HOUR,
+        ),
+        tail,
+    )
+    assert filtered[ARMS + 1] == []
+    assert list(_entries(filtered)) == [ARMS]
+
+
+def test_the_short_side_spends_its_own_release() -> None:
+    """The mirror of the test above, and the one a `spend(Side.LONG)` written by hand would pass
+    without: the supply release has to be the one shut by a sold zone's arming."""
+    tail = _mirror([*STREAM, bar(90, open_="126", close="126")])
+    # The mirror is not the demand run's twin bar for bar — the tick nudges in `_expand` step the
+    # same way on both, and since 05/10 the machine starts as the Pascal does, its first bar
+    # turning the bias up, so the falling run opens with a CHoCH that marks three demand zones on
+    # hour 26. Ten zones before hour 89 here (three on 26, one each on 30 and 44, five on 70), and
+    # hour 89's first and second are the eleventh and twelfth seen.
+    picks = {ARMS: 10, ARMS + 1: 11}
+
+    plain = _drive(ageless_structure(qualifier=_Names(picks), allow_secondary=True), tail)
+    assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.CANCEL, SignalKind.ENTRY]
+
+    filtered = _drive(
+        ageless_structure(
+            qualifier=_Names(picks),
+            allow_secondary=True,
+            htf=H4,
+            htf_offset=_UTC_BROKER,
+            timeframe=HOUR,
+        ),
+        tail,
+    )
+    assert filtered[ARMS + 1] == []
+    assert [entry.side for entry in _entries(filtered).values()] == [Side.SHORT]
+
+
+def test_an_order_the_venue_turned_away_hands_the_release_back() -> None:
+    """The order armed on hour 89 never reached the book; the refusal lands on hour 90, and the
+    stand-in names the same zone again. Without the filter that is a plain re-arm. With it, the
+    release has to come back — his rule spends a region on an order *placed* and withdrawn, and
+    this one was never placed — so the zone is armed a second time under a new name."""
+    tail = [*STREAM, bar(90, open_="126", close="126")]
+    picks = {ARMS: 4, ARMS + 1: 4}
+    refused = {ARMS + 1: RefusedBy.BROKER}
+
+    plain = _drive(ageless_structure(qualifier=_Names(picks)), tail, refused_on=refused)
+    assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.ENTRY]
+
+    filtered = _drive(
+        ageless_structure(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        tail,
+        refused_on=refused,
+    )
+    entries = _entries(filtered)
+    assert list(entries) == [ARMS, ARMS + 1]
+    assert entries[ARMS].client_id != entries[ARMS + 1].client_id
+    context = entries[ARMS + 1].context
+    assert context is not None
+    assert str(context["htf_top"]) == "100"
+
+
+def test_an_order_the_market_withdrew_keeps_the_release_spent() -> None:
+    """`MARKET` is an order that rested and was taken back by price moving through it — placed
+    and withdrawn unfilled, exactly the case his answer 3 spends the region on."""
+    tail = [*STREAM, bar(90, open_="126", close="126")]
+    picks = {ARMS: 4, ARMS + 1: 4}
+    refused = {ARMS + 1: RefusedBy.MARKET}
+
+    plain = _drive(ageless_structure(qualifier=_Names(picks)), tail, refused_on=refused)
+    assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.ENTRY]
+
+    filtered = _drive(
+        ageless_structure(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        tail,
+        refused_on=refused,
+    )
+    assert filtered[ARMS + 1] == []
+
+
+def test_a_refusal_that_lands_after_the_search_ended_hands_nothing_back() -> None:
+    """The order armed on hour 89 is turned away at the gate, but the bar the refusal lands on
+    runs to 140 — two heights past [80, 100]. His rule ended the search on that bar; handing the
+    release back would reopen it, and the same zone named again must stay refused."""
+    tail = [*STREAM, bar(90, open_="126", close="128", high="140", low="126")]
+    picks = {ARMS: 4, ARMS + 1: 4}
+    refused = {ARMS + 1: RefusedBy.BROKER}
+
+    plain = _drive(ageless_structure(qualifier=_Names(picks)), tail, refused_on=refused)
+    assert [signal.kind for signal in plain[ARMS + 1]] == [SignalKind.ENTRY]
+
+    filtered = _drive(
+        ageless_structure(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        tail,
+        refused_on=refused,
+    )
+    assert filtered[ARMS + 1] == []
+
+
+def test_a_region_above_reached_while_a_position_is_open_still_releases() -> None:
+    """Every bar that touches [80, 100] — 72 through 88 — is spent inside a trade, and the trade
+    ends just before the break that marks the zone. The gate has to have been reading those bars
+    from behind the position branch, or nothing is released when it matters."""
+    strategy = ageless_structure(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
+    entries = _entries(_drive(strategy, STREAM, position_on=frozenset(range(TOUCH, ARMS))))
+    assert list(entries) == [ARMS]
+
+
+def test_a_zone_from_a_break_before_the_touch_is_not_armed_under_the_release() -> None:
+    """Hour 70 marks [80.01, 90] on a break before price reached the region above. Named on hour
+    73 — released, the zone standing — it is still refused: the break was not the reaction."""
+    # Only primaries reach the qualifier: one each on hours 26, 30 and 44, then hour 70's.
+    picks = {73: 3}
+    plain = _drive(ageless_structure(qualifier=_Names(picks)), _through(73))
+    assert [signal.kind for signal in plain[73]] == [SignalKind.ENTRY]
+
+    filtered = _drive(
+        ageless_structure(qualifier=_Names(picks), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR),
+        _through(73),
+    )
+    assert filtered[73] == []
+
+
+def test_the_short_side_releases_end_to_end() -> None:
+    strategy = ageless_structure(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
+    entries = _entries(_drive(strategy, _mirror(STREAM)))
+
+    assert list(entries) == [ARMS]
+    entry = entries[ARMS]
+    assert entry.side is Side.SHORT
+    assert str(entry.limit_price) == "108"
+    assert entry.context is not None
+    assert (str(entry.context["htf_bottom"]), str(entry.context["htf_top"])) == ("100", "120")
+
+
+def test_the_regions_above_are_published_for_the_chart_named_by_their_timeframe() -> None:
+    """⚠️ Without this a filtered run is unreadable. `zones()` is the one channel a chart has, and
+    a setup under the filter marks regions on two charts at once: the small ones are where the
+    order rests, the big ones are what released the side at all. Drawn without the second set,
+    every refused entry looks like an entry the setup did not find.
+
+    They come **first**, so a reader drawing in order puts the big ones behind, and each carries
+    the name of the bar it belongs to — `H4` — because the legend has to name them.
+    """
+    strategy = ageless_structure(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
+    _drive(strategy, STREAM)
+
+    marks = list(strategy.zones())
+    assert [(mark.label, str(mark.bottom), str(mark.top)) for mark in marks[:2]] == [
+        ("H4", "80", "100"),
+        ("H4", "110", "117"),
+    ]
+    assert {mark.label for mark in marks[2:]} == {"zone"}
+    assert len(marks) > 2, "the base timeframe's own regions still come"
+
+
+def test_the_regions_above_end_on_the_higher_timeframe_s_clock_not_on_the_release() -> None:
+    """⚠️ **Two instants that are easy to confuse, and this is the one bar where they differ.**
+
+    A region above is *reached* by a base bar — that is what releases the side, and the gate
+    records it at base resolution. It is *marked mitigated* by the higher timeframe's own
+    detector, which cannot know until the H4 bar holding that touch has closed. On hour 74 the
+    side has been released for two bars and the region above still reads as standing.
+
+    The rectangle follows the second, because a rectangle is a picture of the higher timeframe
+    and that is where his chart ends it. Driving to the end of the stream would prove nothing:
+    the fixture's touch falls on hour 72, which opens an H4 bucket, so there the release instant,
+    the bucket's opening and the detector's stamp are all the same number and four different
+    implementations agree. Found by the guardian on exactly that reading.
+    """
+    strategy = ageless_structure(
+        qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER, timeframe=HOUR
+    )
+    _drive(strategy, _through(TOUCH + 2))
+
+    gate = strategy._gate
+    assert gate is not None
+    assert gate.reference(_demand(_at(ARMS))) is not None, "the side is released by now"
+    [above, *_] = strategy.zones()
+    assert above.label == "H4"
+    assert above.mitigated_at is None, "the H4 bar holding the touch has not closed"
+
+    # The bar that closes it. The stamp is that H4 bar's **own time**, which is its opening — hour
+    # 72 — so the rectangle ends where the higher timeframe says the region died, not where the
+    # engine found out.
+    _drive(strategy, [STREAM[TOUCH + 3]])
+    [closed, *_] = strategy.zones()
+    assert closed.mitigated_at == _at(TOUCH)
+
+
+def test_without_the_filter_only_the_setup_s_own_regions_are_published() -> None:
+    """A key that is absent says something a key that is present and empty does not — and here it
+    is a whole series. Nothing about the unfiltered chart changes."""
+    strategy = ageless_structure(qualifier=_Marked())
+    _drive(strategy, STREAM)
+
+    assert {mark.label for mark in strategy.zones()} == {"zone"}
+
+
+def test_the_filter_needs_the_setup_s_own_timeframe() -> None:
+    with pytest.raises(ValueError, match="own timeframe"):
+        ageless_structure(qualifier=_Marked(), htf=H4, htf_offset=_UTC_BROKER)
+
+
+def test_a_higher_timeframe_the_engine_cannot_name_is_refused_at_construction() -> None:
+    """⚠️ Refused where it is built, not where it is drawn. `zones()` labels the regions above
+    with the bar's own name, and a duration outside the table has none — so before this guard a
+    hand-built setup ran a whole backtest and then raised a bare `KeyError` when the API asked for
+    the picture, which is the worst possible moment to find out. The factory only ever passes
+    durations from the table; this is for every other caller."""
+    with pytest.raises(ValueError, match="bar this engine can name"):
+        ageless_structure(
+            qualifier=_Marked(),
+            htf=dt.timedelta(hours=5),
+            htf_offset=_UTC_BROKER,
+            timeframe=HOUR,
+        )
+
+
+def test_a_timeframe_alone_builds_no_gate() -> None:
+    strategy = ageless_structure(qualifier=_Marked(), timeframe=HOUR)
+    assert strategy._gate is None
+
+
+class _EveryHigherBar:
+    """The gate as it was before 27/09: the untouched regions rebuilt on every higher bar that
+    closes, whether or not the detector's list changed. Slow and plainly right — the reference."""
+
+    def __init__(self, *, base: dt.timedelta, target: dt.timedelta, offset: dt.timedelta) -> None:
+        # ⚠️ The whole of the old gate's state in one object, as before the split into
+        # `RegionTracker` and releases (27/09): the oracle is the unsplit gate, not the new one.
+        self._bars = BarAggregator(base=base, target=target, offset=offset)
+        self._structure = MarketStructure()
+        self._blocks = OrderBlockDetector()
+        self._touched: set[OrderBlock] = set()
+        self._untouched: list[OrderBlock] = []
+        self._releases: dict[Side, Release] = {}
+
+    def spend(self, side: Side) -> None:
+        # `HigherTimeframeGate.spend`, as it has always been.
+        self._releases.pop(side, None)
+
+    def observe(self, candle: Candle) -> None:
+        closed = False
+        for higher in self._bars.update(candle):
+            self._blocks.update(higher, self._structure.update(higher))
+            held = {tracked.block for tracked in self._blocks.zones}
+            self._touched.intersection_update(held)
+            closed = True
+        if closed:
+            self._untouched = [
+                tracked.block
+                for tracked in self._blocks.zones
+                if tracked.block not in self._touched
+            ]
+        reached: dict[Side, list[OrderBlock]] = {}
+        for block in self._untouched:
+            if not _reaches(block, candle) or block in self._touched:
+                continue
+            self._touched.add(block)
+            reached.setdefault(block.side, []).append(block)
+        if reached:
+            self._untouched = [block for block in self._untouched if block not in self._touched]
+        for side, blocks in reached.items():
+            standing = self._releases.get(side)
+            opened_at = candle.time if standing is None else standing.opened_at
+            self._releases[side] = Release(block=_innermost(blocks), opened_at=opened_at)
+        for side in (Side.LONG, Side.SHORT):
+            release = self._releases.get(side)
+            if release is not None and _search_over(release.block, candle):
+                del self._releases[side]
+
+
+@pytest.mark.parametrize("kept", [1, 3, 200])
+def test_rebuilding_only_when_a_region_is_offered_changes_nothing(
+    kept: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⚠️ **The gate rebuilds its untouched regions only when the detector offered one** (27/09):
+    the rebuild on every higher bar was half of a CHOCH run over M5. Held against the gate that
+    rebuilds every time, bar by bar, over random walks with holes in the history — a hole of two
+    or three hours closes two higher bars in one call, the first offering a region and the second
+    not (the refactor that keeps only the last bar's answer loses that region) — with the
+    detector's list trimmed hard, so regions leave while touched, and sides spent at random."""
+    monkeypatch.setattr(OrderBlockDetector, "_MAX_ZONES", kept)
+    two_at_once = released = 0
+    for seed in range(100):
+        rng = random.Random(seed)  # noqa: S311 — a reproducible walk, not a secret
+        fast = HigherTimeframeGate(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        plain = _EveryHigherBar(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        price, hour = 100, 0
+        for _ in range(600):
+            step = rng.choice([1] * 8 + [2, 3, 4])
+            two_at_once += step > 1
+            hour += step
+            open_ = price
+            price = max(5, open_ + rng.randint(-3, 3))
+            candle = Candle(
+                time=START + hour * HOUR,
+                open=Decimal(open_),
+                high=Decimal(max(open_, price) + rng.randint(0, 2)),
+                low=Decimal(max(1, min(open_, price) - rng.randint(0, 2))),
+                close=Decimal(price),
+            )
+            fast.observe(candle)
+            plain.observe(candle)
+            assert fast._releases == plain._releases, (seed, hour)
+            assert fast._regions._untouched == plain._untouched, (seed, hour)
+            # Pruned as before: the record of touches never outgrows the regions the detector holds.
+            assert len(fast._regions._touched) <= kept
+            released += len(fast._releases)
+            if rng.random() < 0.05:
+                side = rng.choice([Side.LONG, Side.SHORT])
+                fast.spend(side)
+                plain.spend(side)
+    # The walk has to have reached the cases it exists for, or it proves nothing.
+    assert two_at_once > 0
+    assert released > 0
+
+
+# --------------------------------------------------------------------------- #
+# Which regions above may release (his choice, 2026-09-29)                      #
+# --------------------------------------------------------------------------- #
+
+
+def _tracked(candles: list[Candle]) -> RegionTracker:
+    tracker = RegionTracker(base=HOUR, target=H4, offset=_UTC_BROKER)
+    with localcontext(ENGINE_CONTEXT):
+        for candle in candles:
+            tracker.observe(candle)
+    return tracker
+
+
+def test_the_tracker_keeps_the_last_break_above_and_the_regions_it_offered() -> None:
+    """The H4 that closes on hour 71 breaks upward and offers [80, 100] and [110, 117]: the trend
+    it leaves is bullish, and both are the last leg's."""
+    tracker = _tracked(_through(71))
+    assert tracker.trend is Trend.BULLISH
+    assert [tracked.block.primary for tracked in tracker.zones] == [True, False]
+    assert all(tracker.of_last_leg(tracked.block) for tracked in tracker.zones)
+
+
+def test_the_mirrored_stream_leaves_a_bearish_trend_and_supply_in_its_last_leg() -> None:
+    tracker = _tracked(_mirror(_through(71)))
+    assert tracker.trend is Trend.BEARISH
+    assert tracker.zones
+    assert all(tracked.block.kind is ZoneKind.SUPPLY for tracked in tracker.zones)
+    assert all(tracker.of_last_leg(tracked.block) for tracked in tracker.zones)
+
+
+@dataclass
+class _Above:
+    """A tracker set by hand: what the bar reached, the trend above and the last leg's regions —
+    the three facts the gate reads, without building an H4 history that produces each case."""
+
+    reached: dict[Side, tuple[OrderBlock, ...]] = field(default_factory=dict)
+    trend: Trend | None = None
+    leg: frozenset[OrderBlock] = frozenset()
+    timeframe: dt.timedelta = H4
+    offset: dt.timedelta = _UTC_BROKER
+    zones: tuple[object, ...] = ()
+
+    def of_last_leg(self, block: OrderBlock) -> bool:
+        return block in self.leg
+
+
+def _region(
+    bottom: str, top: str, *, kind: ZoneKind = ZoneKind.DEMAND, primary: bool = True
+) -> OrderBlock:
+    return OrderBlock(
+        kind=kind,
+        top=Decimal(top),
+        bottom=Decimal(bottom),
+        time=_at(0),
+        confirmed_at=_at(3),
+        break_kind=StructureKind.BOS,
+        primary=primary,
+    )
+
+
+def _gate(
+    above: _Above, *, choice: RegionChoice = RegionChoice.ANY, allow_secondary: bool = True
+) -> HigherTimeframeGate:
+    return HigherTimeframeGate(
+        base=HOUR,
+        target=H4,
+        offset=_UTC_BROKER,
+        regions=above,  # type: ignore[arg-type]
+        choice=choice,
+        allow_secondary=allow_secondary,
+    )
+
+
+def _quiet(hour: int) -> Candle:
+    """A base bar that ends no search below: no two heights run past, no close through."""
+    return bar(hour, open_="95", close="95", high="96", low="94")
+
+
+def _step(
+    gate: HigherTimeframeGate, above: _Above, hour: int, **reached: tuple[OrderBlock, ...]
+) -> None:
+    above.reached = {Side.LONG if name == "long" else Side.SHORT: v for name, v in reached.items()}
+    with localcontext(ENGINE_CONTEXT):
+        gate.observe(_quiet(hour))
+
+
+DEMAND = _region("90", "100")
+OLDER_DEMAND = _region("86", "90")
+SUPPLY = _region("110", "120", kind=ZoneKind.SUPPLY)
+SECONDARY = _region("92", "98", primary=False)
+
+
+def test_by_default_any_untouched_region_releases_whichever_way_the_structure_points() -> None:
+    """The rule every recorded result ran under: an older demand not of the last leg, and a supply
+    under a bullish trend, both release."""
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above)
+    _step(gate, above, 10, long=(OLDER_DEMAND,), short=(SUPPLY,))
+    assert gate.reference(DEMAND) == OLDER_DEMAND
+    assert gate.reference(SUPPLY) == SUPPLY
+
+
+def test_with_trend_a_region_of_the_last_leg_releases() -> None:
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, long=(DEMAND,))
+    assert gate.reference(DEMAND) == DEMAND
+
+
+def test_with_trend_an_older_region_of_the_same_side_releases_nothing() -> None:
+    """His answer of 29/09: only the last leg's — an older demand does not count."""
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, long=(OLDER_DEMAND,))
+    assert gate.reference(DEMAND) is None
+
+
+def test_with_trend_a_region_against_the_structure_releases_nothing() -> None:
+    """A supply under a bullish trend is not of the last leg: reached, it releases no sell. The bar
+    still reached something, so it is not one `quiet` may skip."""
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, short=(SUPPLY,))
+    assert gate.reference(SUPPLY) is None
+    assert gate.shut_on_this_bar() is False
+
+
+def test_with_trend_a_turn_above_shuts_the_side_still_waiting_for_its_entry() -> None:
+    """His answer of 29/09: released for the buy, no entry yet, the structure above turns bearish —
+    the search for the buy ends on that bar. Under the default it stays open."""
+    for choice, stays in ((RegionChoice.WITH_TREND, False), (RegionChoice.ANY, True)):
+        above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+        gate = _gate(above, choice=choice)
+        _step(gate, above, 10, long=(DEMAND,))
+        assert gate.reference(DEMAND) == DEMAND
+        above.trend = Trend.BEARISH
+        _step(gate, above, 11)
+        assert (gate.reference(DEMAND) is not None) is stays, choice
+
+
+def test_with_trend_a_new_leg_the_same_way_keeps_a_release_already_open() -> None:
+    """A later bullish break moves the last leg on; the buy it released before stays open — the
+    touch was in favour when it happened, and nothing turned against it."""
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, long=(DEMAND,))
+    above.leg = frozenset({_region("100", "104")})
+    _step(gate, above, 11)
+    assert gate.reference(DEMAND) == DEMAND
+
+
+def test_with_trend_a_refused_order_gets_no_release_back_once_the_structure_turned() -> None:
+    above = _Above(trend=Trend.BULLISH, leg=frozenset({DEMAND}))
+    gate = _gate(above, choice=RegionChoice.WITH_TREND)
+    _step(gate, above, 10, long=(DEMAND,))
+    release = gate.release_for(DEMAND)
+    assert release is not None
+    gate.spend(Side.LONG)
+    above.trend = Trend.BEARISH
+    gate.restore(release, _quiet(11))
+    assert gate.release_for(DEMAND) is None
+    # The control: with the structure bullish again, the same refusal hands it back.
+    above.trend = Trend.BULLISH
+    gate.restore(release, _quiet(12))
+    assert gate.release_for(DEMAND) == release
+
+
+def test_primaries_only_a_secondary_reached_releases_nothing() -> None:
+    above = _Above()
+    only_primaries = _gate(above, allow_secondary=False)
+    _step(only_primaries, above, 10, long=(SECONDARY,))
+    assert only_primaries.reference(DEMAND) is None
+    everything = _gate(above)
+    _step(everything, above, 10, long=(SECONDARY,))
+    assert everything.reference(DEMAND) == SECONDARY
+
+
+def test_primaries_only_a_bar_through_both_keeps_the_primary_as_the_reference() -> None:
+    """The secondary [92, 98] is the innermost of the two the bar reached; with secondaries off it
+    is no candidate, so the primary is the reference."""
+    above = _Above()
+    only_primaries = _gate(above, allow_secondary=False)
+    _step(only_primaries, above, 10, long=(DEMAND, SECONDARY))
+    assert only_primaries.reference(DEMAND) == DEMAND
+    everything = _gate(above)
+    _step(everything, above, 10, long=(DEMAND, SECONDARY))
+    assert everything.reference(DEMAND) == SECONDARY
+
+
+@pytest.mark.parametrize(
+    "choice", [{"choice": RegionChoice.WITH_TREND}, {"allow_secondary": False}]
+)
+def test_on_the_golden_stream_the_stricter_choices_release_what_the_default_does(
+    choice: dict[str, object],
+) -> None:
+    """On the golden stream the region touched is the last leg's, in favour, and the primary is
+    the innermost — so the stricter choices release exactly what the default does."""
+    gate = HigherTimeframeGate(base=HOUR, target=H4, offset=_UTC_BROKER, **choice)  # type: ignore[arg-type]
+    with localcontext(ENGINE_CONTEXT):
+        for candle in _through(TOUCH):
+            gate.observe(candle)
+    reference = gate.reference(_demand(_at(ARMS)))
+    assert reference is not None
+    assert reference == _fed(_through(TOUCH)).reference(_demand(_at(ARMS)))
+
+
+def test_each_break_above_replaces_the_last_leg_and_one_offering_nothing_empties_it() -> None:
+    """The engine-guardian's blocker (29/09): every test above saw one break, so a leg that
+    accumulated across breaks — an older region of the same side releasing again — or one kept
+    over a break that offered nothing would both have passed. His answer on the second: a break
+    with no region does **not** keep the leg before it, because by the time a region of that older
+    leg is reached the move that reaches it is already turning the trend.
+
+    Held over the random walks against a reference that reads the same bars with its own
+    detectors and replaces the leg on every break, bar by bar; and a gate choosing `WITH_TREND`
+    on the real tracker never releases from outside the leg as it stood when it released."""
+    empty_breaks = older_in_favour = released = 0
+    for seed in range(100):
+        rng = random.Random(seed)  # noqa: S311 — a reproducible walk, not a secret
+        tracker = RegionTracker(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        gate = HigherTimeframeGate(
+            base=HOUR,
+            target=3 * HOUR,
+            offset=_UTC_BROKER,
+            regions=tracker,
+            choice=RegionChoice.WITH_TREND,
+        )
+        bars = BarAggregator(base=HOUR, target=3 * HOUR, offset=_UTC_BROKER)
+        structure = MarketStructure()
+        blocks = OrderBlockDetector()
+        trend: Trend | None = None
+        leg: frozenset[OrderBlock] = frozenset()
+        price, hour = 100, 0
+        for _ in range(600):
+            hour += rng.choice([1] * 8 + [2, 3, 4])
+            open_ = price
+            price = max(5, open_ + rng.randint(-3, 3))
+            candle = Candle(
+                time=START + hour * HOUR,
+                open=Decimal(open_),
+                high=Decimal(max(open_, price) + rng.randint(0, 2)),
+                low=Decimal(max(1, min(open_, price) - rng.randint(0, 2))),
+                close=Decimal(price),
+            )
+            for higher in bars.update(candle):
+                broke = structure.update(higher)
+                offered = blocks.update(higher, broke)
+                if broke is not None:
+                    trend, leg = broke.trend, frozenset(offered)
+                    empty_breaks += not offered
+            before = dict(gate._releases)
+            tracker.observe(candle)
+            gate.observe(candle)
+
+            assert tracker.trend == trend, (seed, hour)
+            for tracked in tracker.zones:
+                assert tracker.of_last_leg(tracked.block) == (tracked.block in leg), (seed, hour)
+                in_favour = trend is not None and (tracked.block.kind is ZoneKind.DEMAND) == (
+                    trend is Trend.BULLISH
+                )
+                older_in_favour += in_favour and tracked.block not in leg and tracked.usable
+            for side, release in gate._releases.items():
+                if before.get(side) != release:
+                    assert release.block in leg, (seed, hour, side)
+                    released += 1
+            if rng.random() < 0.05:
+                gate.spend(rng.choice([Side.LONG, Side.SHORT]))
+    # The walks have to reach the cases this exists for, or the equalities prove nothing.
+    assert empty_breaks > 0
+    assert older_in_favour > 0
+    assert released > 0

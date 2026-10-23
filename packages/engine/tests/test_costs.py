@@ -10,12 +10,28 @@ import datetime as dt
 from decimal import Decimal
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
-from tradeforge_engine.costs import CommissionCostModel, NoCostModel, SpreadCostModel
-from tradeforge_engine.domain import OrderRequest, Side, SignalKind
-from tradeforge_engine.testing import AAPL, EURUSD
+from tradeforge_engine.costs import (
+    COST_QUANTUM,
+    BarSpreadCostModel,
+    CombinedCostModel,
+    CommissionCostModel,
+    NoCostModel,
+    ProportionalSpreadCostModel,
+    SpreadCostModel,
+)
+from tradeforge_engine.domain import ZERO, OrderRequest, Side, SignalKind
+from tradeforge_engine.testing import AAPL, EURUSD, bar
 
 T0 = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
+
+# ⚠️ 40, not 10. The models that ignore the bar are checked against a spread that is *not*
+# the one they were configured with, so a model that quietly started reading the bar would
+# return 20 where the test demands 5. A fixture carrying the configured value would agree
+# with both implementations and prove neither.
+A_BAR = bar(0, open_="1.10000", close="1.10100", spread=40)
 
 
 def an_order(volume: str = "1") -> OrderRequest:
@@ -32,15 +48,15 @@ def test_spread_charges_half_on_each_leg() -> None:
     """A 10-point spread on EURUSD (tick_value 1): half is 5 points = $5 per lot, entry and
     exit alike, so the round trip pays the whole $10."""
     model = SpreadCostModel(spread_points=Decimal(10))
-    entry = model.entry_cost(an_order(), EURUSD, Decimal("1.10000"))
-    exit_ = model.exit_cost(an_order(), EURUSD, Decimal("1.10500"))
+    entry = model.entry_cost(an_order(), EURUSD, Decimal("1.10000"), A_BAR)
+    exit_ = model.exit_cost(an_order(), EURUSD, Decimal("1.10500"), A_BAR)
     assert entry == Decimal("5")
     assert exit_ == Decimal("5")
 
 
 def test_spread_scales_with_volume() -> None:
     model = SpreadCostModel(spread_points=Decimal(10))
-    assert model.entry_cost(an_order("0.25"), EURUSD, Decimal("1.1")) == Decimal("1.25")
+    assert model.entry_cost(an_order("0.25"), EURUSD, Decimal("1.1"), A_BAR) == Decimal("1.25")
 
 
 def test_commission_is_per_unit_on_each_leg() -> None:
@@ -53,14 +69,14 @@ def test_commission_is_per_unit_on_each_leg() -> None:
         volume=Decimal(100),
         decided_at=T0,
     )
-    assert model.entry_cost(order, AAPL, Decimal("190.00")) == Decimal("0.500")
-    assert model.exit_cost(order, AAPL, Decimal("195.00")) == Decimal("0.500")
+    assert model.entry_cost(order, AAPL, Decimal("190.00"), A_BAR) == Decimal("0.500")
+    assert model.exit_cost(order, AAPL, Decimal("195.00"), A_BAR) == Decimal("0.500")
 
 
 def test_no_cost_model_charges_nothing() -> None:
     model = NoCostModel()
-    assert model.entry_cost(an_order(), EURUSD, Decimal("1.1")) == Decimal(0)
-    assert model.exit_cost(an_order(), EURUSD, Decimal("1.1")) == Decimal(0)
+    assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == Decimal(0)
+    assert model.exit_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == Decimal(0)
 
 
 def test_a_negative_spread_is_refused() -> None:
@@ -72,3 +88,176 @@ def test_a_negative_spread_is_refused() -> None:
 def test_a_negative_commission_is_refused() -> None:
     with pytest.raises(ValueError, match="magnitude"):
         CommissionCostModel(commission_per_unit=Decimal("-0.01"))
+
+
+def test_the_bar_spread_model_charges_what_the_bar_quoted() -> None:
+    """A bar quoting 40 points on EURUSD (tick_value 1): half is 20 points = $20 per leg."""
+    model = BarSpreadCostModel()
+    assert model.entry_cost(an_order(), EURUSD, Decimal("1.10000"), A_BAR) == Decimal(20)
+    assert model.exit_cost(an_order(), EURUSD, Decimal("1.10000"), A_BAR) == Decimal(20)
+
+
+def test_the_bar_spread_model_scales_with_volume() -> None:
+    model = BarSpreadCostModel()
+    assert model.entry_cost(an_order("0.25"), EURUSD, Decimal("1.1"), A_BAR) == Decimal(5)
+
+
+def test_the_bar_spread_model_follows_the_bar_and_the_fixed_one_does_not() -> None:
+    """The separating scenario: two bars quoting different spreads, one order, one instrument.
+
+    Without this, every assertion above is satisfied by a `BarSpreadCostModel` that ignored the
+    bar and happened to be configured with 40 — which is exactly the implementation this class
+    exists to *not* be. Two bars is the cheapest market that tells them apart: the fixed model
+    returns one number twice, the bar model returns two.
+    """
+    tight = bar(1, open_="1.10000", close="1.10100", spread=10)
+    wide = bar(2, open_="1.10100", close="1.10200", spread=80)
+
+    live = BarSpreadCostModel()
+    fixed = SpreadCostModel(spread_points=Decimal(10))
+    order = an_order()
+
+    assert live.entry_cost(order, EURUSD, Decimal("1.1"), tight) == Decimal(5)
+    assert live.entry_cost(order, EURUSD, Decimal("1.1"), wide) == Decimal(40)
+
+    # Same two bars, and the fixed model cannot see the difference — by design.
+    assert fixed.entry_cost(order, EURUSD, Decimal("1.1"), tight) == Decimal(5)
+    assert fixed.entry_cost(order, EURUSD, Decimal("1.1"), wide) == Decimal(5)
+
+
+def test_a_bar_with_no_spread_stops_the_session() -> None:
+    """`Candle.spread` defaults to 0, so "no spread" and "free execution" have the same shape.
+
+    Charging nothing would be a paper session reporting an edge the live account will not have,
+    and it would report it in silence. The refusal names the bar so the operator can go look at
+    it, rather than at a P&L that is merely too good.
+    """
+    silent = bar(3, open_="1.10000", close="1.10100")
+    with pytest.raises(ValueError, match="carries no spread"):
+        BarSpreadCostModel().entry_cost(an_order(), EURUSD, Decimal("1.1"), silent)
+
+
+def test_a_bar_with_no_spread_is_free_only_when_that_is_asserted() -> None:
+    """The escape hatch, and it has to be asked for by name."""
+    silent = bar(3, open_="1.10000", close="1.10100")
+    model = BarSpreadCostModel(require_spread=False)
+    assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), silent) == Decimal(0)
+    assert model.exit_cost(an_order(), EURUSD, Decimal("1.1"), silent) == Decimal(0)
+
+
+def test_a_combined_model_charges_every_part_on_each_leg() -> None:
+    """A raw-spread account (24/09): 8 points of spread and $3.50 a lot, half a lot. Each leg
+    pays half the spread (0.5 x 4 = $2) and the commission (0.5 x 3.50 = $1.75): $3.75, twice."""
+    model = CombinedCostModel(
+        SpreadCostModel(spread_points=Decimal(8)),
+        CommissionCostModel(commission_per_unit=Decimal("3.50")),
+    )
+    order = an_order("0.5")
+    assert model.entry_cost(order, EURUSD, Decimal("1.10000"), A_BAR) == Decimal("3.75")
+    assert model.exit_cost(order, EURUSD, Decimal("1.10500"), A_BAR) == Decimal("3.75")
+
+
+def test_a_combined_model_of_one_part_is_that_part() -> None:
+    alone = SpreadCostModel(spread_points=Decimal(10))
+    model = CombinedCostModel(alone)
+    assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == alone.entry_cost(
+        an_order(), EURUSD, Decimal("1.1"), A_BAR
+    )
+
+
+def test_a_combined_model_of_nothing_is_refused() -> None:
+    """No parts is a costless run that looks costed — the one thing a cost model must not be."""
+    with pytest.raises(ValueError, match="at least one part"):
+        CombinedCostModel()
+
+
+class _Uneven:
+    """A part that charges differently on each leg, as no model does yet — so a combined model
+    that asked the wrong leg of its parts would be caught the day one does (engine-guardian)."""
+
+    def entry_cost(
+        self, order: OrderRequest, instrument: object, price: Decimal, candle: object
+    ) -> Decimal:
+        return Decimal(1)
+
+    def exit_cost(
+        self, order: OrderRequest, instrument: object, price: Decimal, candle: object
+    ) -> Decimal:
+        return Decimal(2)
+
+
+def test_a_combined_model_asks_each_part_for_the_same_leg() -> None:
+    model = CombinedCostModel(_Uneven(), SpreadCostModel(spread_points=Decimal(10)))
+    assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == Decimal(6)
+    assert model.exit_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == Decimal(7)
+
+
+class TestProportionalSpread:
+    """02/10: XRP's 100-point spread, quoted at $2.50, was 5 % of a 2020 price in points."""
+
+    def test_at_the_price_it_was_quoted_at_it_is_the_spread_in_points(self) -> None:
+        fixed = SpreadCostModel(spread_points=Decimal(10))
+        scaled = ProportionalSpreadCostModel(
+            spread_points=Decimal(10), reference_price=Decimal("1.10000")
+        )
+
+        price = Decimal("1.10000")
+        assert scaled.entry_cost(an_order(), EURUSD, price, A_BAR) == (
+            fixed.entry_cost(an_order(), EURUSD, price, A_BAR)
+        )
+
+    def test_a_tenth_of_the_price_pays_a_tenth_of_the_spread_on_each_leg(self) -> None:
+        model = ProportionalSpreadCostModel(
+            spread_points=Decimal(100), reference_price=Decimal("2.5")
+        )
+
+        entry = model.entry_cost(an_order(), EURUSD, Decimal("0.25"), A_BAR)
+        exit_ = model.exit_cost(an_order("2"), EURUSD, Decimal("0.25"), A_BAR)
+
+        assert entry == Decimal(5)  # 10 points at a tenth of the price, half of it, $1 a point
+        assert exit_ == Decimal(10)  # and twice the volume
+
+    def test_the_bar_is_not_what_it_reads_the_fill_price_is(self) -> None:
+        """`A_BAR` quotes a spread of 40: a model reading it would charge 20, not 5."""
+        model = ProportionalSpreadCostModel(spread_points=Decimal(10), reference_price=Decimal(1))
+
+        assert model.entry_cost(an_order(), EURUSD, Decimal(1), A_BAR) == Decimal(5)
+
+    def test_the_ticks_are_worth_the_instruments_tick_value(self) -> None:
+        """AAPL's tick is worth $0.01: 100 points at the reference price, half on the entry, at
+        one unit, is 50 ticks = $0.50 — not the $50 a model that dropped `tick_value` charges."""
+        model = ProportionalSpreadCostModel(
+            spread_points=Decimal(100), reference_price=Decimal(200)
+        )
+
+        assert model.entry_cost(an_order(), AAPL, Decimal(200), A_BAR) == Decimal("0.5")
+
+    def test_a_spread_of_zero_charges_nothing(self) -> None:
+        model = ProportionalSpreadCostModel(spread_points=ZERO, reference_price=Decimal(1))
+
+        assert model.entry_cost(an_order(), EURUSD, Decimal("1.1"), A_BAR) == ZERO
+
+    @given(
+        price=st.decimals(min_value=Decimal("0.0001"), max_value=Decimal(100_000), places=4),
+        volume=st.decimals(min_value=Decimal("0.01"), max_value=Decimal(100), places=2),
+    )
+    def test_every_cost_terminates_so_the_ledger_balances_exactly(
+        self, price: Decimal, volume: Decimal
+    ) -> None:
+        """A division by the reference price need not terminate; summed unrounded, a ledger
+        drifts from its balance in the twentieth decimal (engine-guardian, 02/10)."""
+        model = ProportionalSpreadCostModel(spread_points=Decimal(7), reference_price=Decimal(3))
+
+        cost = model.entry_cost(an_order(str(volume)), EURUSD, price, A_BAR)
+
+        assert cost == cost.quantize(COST_QUANTUM)
+        assert cost.as_tuple().exponent >= COST_QUANTUM.as_tuple().exponent  # type: ignore[operator]
+
+    @pytest.mark.parametrize(("points", "price"), [("-1", "1"), ("1", "0"), ("1", "-2")])
+    def test_a_negative_spread_or_a_price_that_is_not_positive_is_refused(
+        self, points: str, price: str
+    ) -> None:
+        with pytest.raises(ValueError, match=r"magnitude|positive"):
+            ProportionalSpreadCostModel(
+                spread_points=Decimal(points), reference_price=Decimal(price)
+            )

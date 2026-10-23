@@ -1,0 +1,234 @@
+# Coleta pela tela — PR-232 a PR-234
+
+**Objetivo:** testar **qualquer** ativo que o MT5 entregue, sem sair da tela. Buscar o símbolo
+digitando, saber quanto histórico dá para pegar (e o que está limitando), e disparar a coleta.
+
+**Referência:** `docs/adr/0021-agente-de-coleta-no-host.md`, backlog (origem PR-223, pedido de
+06/08/2026), `sdd.md §9` (topologia).
+
+⚠️ **Inserido entre o PR-301 e o PR-302.** A ordem obrigatória da fase 3 vale para o caminho *live*
+(paper → kill switch → conta real, `specs/fase-3.md`), e nada aqui toca esse caminho.
+
+---
+
+## A restrição que decide tudo
+
+A API roda em **container Linux**; o `MetaTrader5` é **wheel de Windows** e só é importado por
+`apps/collector` e `apps/executor` (ADR-02). A API não fala com o MT5 — hoje nem nunca. Por isso
+existe o **agente no host** (ADR-0021), e por isso toda pergunta ao terminal é assíncrona.
+
+## O que foi medido antes de escrever o spec (19/08/2026)
+
+| | |
+|---|---|
+| `symbols_get(group="A*")` | **0,1 ms**, casa por prefixo, enxerga símbolos ocultos |
+| busca binária por posição, H1 | 0,6 ms |
+| busca binária por posição, **H4** | **207 s** (o terminal baixa histórico durante a pergunta) |
+| `copy_rates_from(1970, …)` | **derruba o processo** (`OSError: Errno 22`) |
+| `terminal_info().maxbars` | **100000** — capa M1, M5, M15 e H1 na conta dele |
+| EURUSD D1 mais antigo | 1971-01-04, com `o==h==l==c` e `tick_volume=1` |
+
+As duas últimas linhas são o motivo de a sonda de histórico não poder devolver só uma data.
+
+---
+
+## PR-232 — Agente no host + busca de símbolo
+
+**Escopo:**
+- Agente no host: `arq tradeforge_collector.agent.WorkerSettings`, fila `collect`, com o
+  `MT5Source` já existente por trás. Mesma forma como o worker da API sobe no compose
+  (`arq tradeforge_api.worker.WorkerSettings`) — um subcomando próprio seria superfície nova
+  para nenhuma capacidade nova.
+- Job `sync_symbols`: `mt5.symbols_get()` → tabela nova `broker_symbols` (snapshot do que a
+  corretora oferece **hoje**), separada de `instruments`.
+- API: `GET /symbols/search?q=<prefixo>&limit=` servindo do snapshot; `POST /symbols/sync`
+  enfileirando o job e devolvendo `202`.
+- Web: o `<select>` de símbolo do `BacktestSettings` vira **combobox** que consulta ao digitar
+  (a partir de 1 letra), com ação "não achei / atualizar do MT5".
+
+**Aceite:** digitar `eur` lista os 18 pares EUR do broker, incluindo os que **não** estão no
+Market Watch; trocar de conta no MT5 e sincronizar troca a lista; a busca continua respondendo com
+o terminal fechado.
+
+**Você vai aprender:** por que uma fronteira de plataforma vira topologia (e não um `if`), filas
+segregadas por *quem pode executar* em vez de por prioridade, e a diferença entre "o que o sistema
+conhece" (`instruments`) e "o que a corretora oferece" (`broker_symbols`).
+
+---
+
+## A janela padrão: orçamento de barras, com piso medido
+
+Decidido em 19/08/2026 a partir de duas medições no broker do Guilherme (`Tradeview-Demo`).
+
+### Medição 1 — barras reais por ano, EURUSD 2024
+
+| tf | barras/ano |
+|---|---|
+| M1 | 368.083 |
+| M5 | 73.705 |
+| M15 | 24.582 |
+| H1 | 6.150 |
+| H4 | 1.541 |
+| D1 | 259 |
+
+⚠️ **M1 × 1 ano = 368.083 e M5 × 5 anos = 368.525.** Os dois números que o Guilherme escolheu à
+mão são o mesmo número: um **orçamento de barras**, não um limite de calendário. É o critério
+certo, porque é barra que vira trade — e generaliza sozinho para timeframes mais lentos, que
+precisam de mais tempo de calendário para produzir a mesma quantidade de sinal.
+
+### Medição 2 — o ano em que o spread deixou de ser inventado
+
+Spread que o broker carimbou em cada barra do EURUSD H1:
+
+```
+2004: 40  constante o ano inteiro (min == max)   → CARIMBADO
+2005: 30  constante                              → CARIMBADO
+2006: 20  constante                              → CARIMBADO
+2007: 20  constante                              → CARIMBADO
+2008: 20  constante                              → CARIMBADO
+2009: 20  constante                              → CARIMBADO
+2010: 11  varia 8..20                            → medido
+2014:  1  varia 0..11                            → medido
+```
+
+⚠️ **A fronteira é medida e não escolhida.** Antes dela o broker escreveu um único número por ano
+inteiro: não é spread, é preenchimento. Um backtest ali tem custo fictício mesmo quando o preço
+não é — e nenhum `CostModel` conserta isso, porque não há o que modelar.
+
+⚠️ **CORREÇÃO (sonda do PR-233): o ano é 2009, não 2010.** A tabela acima veio de uma amostra de
+janeiro a abril de cada ano; a sonda varre o **ano inteiro** e encontra variação já em 2009. A
+medição mais completa ganha. O piso da janela padrão é **2009-01-01**.
+
+Isso é **independente** do piso de preço. E aqui o PR-233 recuou de propósito: **as barras não
+conseguem provar quando o instrumento passou a existir.** A assinatura de fabricação (`high ==
+low` com `tick_volume <= 1`) desaparece no EURUSD já em 1973 — mas o euro só nasceu em 1999, então
+1973 a 1998 é reconstrução com OHLC e volume plausíveis, invisível a qualquer propriedade de uma
+barra. A mediana de volume salta 38× em 1999 (156 → 5.907), mas os anos anteriores oscilam entre
+131 e 2.006 sem ordem, então um limiar ali seria um número escolhido para caber num símbolo.
+
+Então a sonda responde **"a partir de quando a série deixa de conter barras que ninguém negociou"**,
+que é mensurável, e recusa responder "a partir de quando este instrumento é real", que não é. A
+segunda pergunta tem resposta que um humano sabe — a data de listagem — e a tela pergunta em vez de
+inventar.
+
+### A regra
+
+**Janela padrão = `min(368.500 barras, desde 2009-01-01)`**, por timeframe:
+
+| tf | janela | barras | quem limitou |
+|---|---|---|---|
+| M1 | 1,0 ano | 368.000 | orçamento |
+| M5 | 5,0 anos | 368.500 | orçamento |
+| M15 | 15,0 anos | 368.500 | orçamento |
+| H1 | 17,6 anos | 108.400 | piso de 2009 |
+| H4 | 17,6 anos | 27.100 | piso de 2009 |
+| D1 | 17,6 anos | 4.600 | piso de 2009 |
+
+Os dois limites quase se encontram no M15, o que é um bom sinal de coerência entre eles.
+
+⚠️ **Isto é um default que a tela pré-preenche, nunca um limite que a engine impõe.** O operador
+sempre pode alargar; o sistema só não escolhe mal por omissão. E a tela mostra a **contagem de
+barras** da janela, não só as datas — "5 anos" não diz nada, "7.705 barras" diz.
+
+### O que a regra não conserta
+
+De 2009 a 2026 o spread ainda vai de ~11 para 1 ponto. Cobrando um número só na janela inteira, o
+erro máximo é ~10 ticks — com a mediana de stop do EURUSD H1 já medida neste projeto (0,00116 =
+116 ticks), isso é **~9% de 1R**. Bem melhor que os 40 ticks (~35% de 1R) de antes de 2010, mas
+não é zero. O conserto é custo variável no tempo, e está no backlog.
+
+---
+
+## PR-233 — Sonda de histórico
+
+**Escopo:**
+- Job `probe_history(symbol, timeframe)`: busca binária **por posição** (nunca `copy_rates_from`
+  com data antiga — ver medição), gravando barra mais antiga, contagem, `maxbars` do terminal e o
+  instante da sondagem.
+- Detecção das duas mentiras:
+  1. **Teto do terminal** — `contagem == maxbars` significa que o limite é a configuração dele, não
+     o broker. A tela diz isso e diz onde mudar.
+  2. **Série reconstruída** — barras com `high == low` e `tick_volume <= 1` não são mercado. A sonda
+     reporta a partir de onde a série vira negociação de verdade.
+- API: `GET /symbols/{symbol}/history?timeframe=` (o que já foi sondado) e `POST .../probe` (202).
+- Web: ao escolher o símbolo, mostrar o span **utilizável** e o que o está limitando.
+
+  3. **Custo carimbado** — anos em que o `spread` da barra é constante (`min == max`) são anos em
+     que o broker inventou o custo. A sonda reporta o primeiro ano medido, que é o piso honesto
+     da janela padrão. ⚠️ Sondado **por símbolo**: 2010 é o número do EURUSD deste broker, e uma
+     ação americana tem outra história.
+
+**Aceite:** para EURUSD, o M1 aparece marcado como limitado pelo terminal (100.000 barras), o D1
+aparece com 1971 como início **bruto** e 1999 como início de preço real, e a janela padrão começa
+em 2010 porque antes disso o spread é constante; nenhuma chamada da API espera os 207 s da
+sondagem.
+
+**Você vai aprender:** que "mais histórico" e "mais validação" não são a mesma coisa — 28 anos de
+barras sem range fazem o backtest parecer melhor e ser menos validado; e como reportar uma medição
+junto com o que a limitou.
+
+---
+
+## PR-234 — Coletar pela tela
+
+**Escopo:**
+- Job `collect_range(symbol, timeframe, start, end)`: reusa o `backfill()` que já existe, escreve
+  Parquet no host e cataloga `instruments` + `datasets`.
+- API: `POST /collections` (202) + `GET /collections/{id}` para acompanhar; progresso pelo mesmo
+  caminho de pub/sub dos backtests.
+- Web: escolher símbolo/timeframe/período (pré-preenchido pelo que a sonda do PR-233 disse ser
+  utilizável) e acompanhar.
+
+**Aceite:** escolher um símbolo que **nunca** foi coletado, coletar pela tela e rodar um backtest
+nele sem tocar na CLI.
+
+**Você vai aprender:** idempotência de coleta (recoletar um range já coletado atualiza a linha em
+vez de duplicá-la), e por que o caminho de escrita do Parquet mora no host.
+
+---
+
+## Fora de escopo, anotado
+
+- **Dois terminais instalados**: `mt5_source.py` chama `mt5.initialize()` sem argumento, então não
+  há como escolher qual terminal. Precisa de `--terminal-path` antes de "trocar de corretora" virar
+  operação de tela. (Backlog, origem PR-223.)
+- **Supervisão do agente**: ele morre com o terminal que o iniciou, exatamente como o `live`
+  (backlog, origem PR-301-A). O mesmo lugar que resolver um resolve o outro.
+
+---
+
+## PR-236 a PR-239 — Coleta multi-ativo (21/08/2026)
+
+A extensão natural do PR-234: a tela passou a coletar **até 20 símbolos** numa leva, com um
+timeframe e uma janela. Plano completo, decisões e checklist em
+`docs/features/FEATURE_COLETA_MULTI_ATIVO.md`.
+
+**Nada de tabela nova e nenhuma migração.** Uma leva de oito são oito linhas em `collections` —
+exatamente o que oito cliques produziriam. `baskets` agrupa porque o produto dele é a *comparação*
+entre mercados, que não existe sem o grupo; o produto de uma coleta é vela no disco, que não tem
+resposta cruzada para calcular.
+
+⚠️ **O pedido de "não sobrecarregar" já estava atendido por construção**, e isso encolheu a
+feature: `WorkerSettings.max_jobs = 1` serializa o agente porque o terminal é um canal IPC
+compartilhado — dois jobs pedindo histórico disputam o mesmo download em vez de dividir a espera.
+A memória já era limitada por `run_collection` andar um ano de calendário por vez. **Vinte símbolos
+deixam a fila mais longa, não o pico mais alto.** Não houve throttle a construir; houve um teste a
+escrever, para ninguém remover o que já existe.
+
+| PR | o que entrou |
+|---|---|
+| **236** (#129) | `POST /collections` aceita `items`, N linhas, N jobs, aceitação atômica |
+| **237** (#130) | `asset_class_from_path` derivado no `/symbols/search` |
+| **238** (#131) | seleção múltipla na tela, classe por símbolo, estimativa em fatias de ano |
+| **239** | sonda automática com cache por par, aviso de janela curta, fila visível |
+
+### As três armadilhas que este trabalho documenta
+
+1. **`items` é lista de objetos, não dois arrays paralelos.** Arrays paralelos saem de sincronia
+   e nenhum schema proíbe; o símbolo catalogado com a classe errada nunca levanta nada.
+2. **O piso mais tardio é o que vincula.** Uma janela cobre a leva, então abrir no piso mais antigo
+   daria a todos os outros anos de barras de preenchimento e spread digitado — o risco que a sonda
+   do PR-233 existe para reportar.
+3. **A sonda compartilha a fila da coleta.** Uma sondagem H4 levou **207 s**. O cache por par
+   `(símbolo, timeframe)` é o que faz o preço ser "uma vez por par" em vez de "uma vez por clique";
+   sem ele, vinte símbolos poriam horas de fila na frente da primeira vela. Ver DD-04.

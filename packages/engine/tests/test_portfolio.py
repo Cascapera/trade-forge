@@ -293,3 +293,50 @@ def test_a_partially_filled_entry_is_refused() -> None:
 
     with pytest.raises(EngineError, match="partial fill"):
         portfolio.apply(partial)
+
+
+def test_amending_the_stop_moves_the_live_level_and_not_the_sized_one() -> None:
+    """The ledger's half of ADR-0018.
+
+    `stop_loss` is where the position would exit today; `initial_stop_loss` is what the lot
+    was sized against. At the fill they are the same number, and it is precisely because they
+    look identical there that one field used to do both jobs.
+    """
+    portfolio = a_portfolio()
+    portfolio.apply(fill(order(stop="1.09000"), price="1.10000", time=T1))
+
+    portfolio.amend_stop(Decimal("1.09500"))
+
+    position = portfolio.position
+    assert position is not None
+    assert position.stop_loss == Decimal("1.09500")
+    assert position.initial_stop_loss == Decimal("1.09000")
+
+
+def test_amending_the_stop_with_no_position_open_is_an_error() -> None:
+    """The broker checks for a position before it ever gets here, so reaching this line means
+    a caller that skipped that check. Doing nothing quietly would leave it believing a stop is
+    in place — the ledger's version of an unprotected trade."""
+    with pytest.raises(EngineError, match="not open"):
+        a_portfolio().amend_stop(Decimal("1.09500"))
+
+
+def test_the_r_multiple_divides_by_the_risk_taken_at_entry_not_the_trailed_stop() -> None:
+    """Worked by hand: entry 1.10000, stop 1.09000, one lot. That is 1000 ticks of 0.00001 at
+    $1 a tick, so 1R = $1000. The trade exits at 1.10500 for $500, which is +0.5R.
+
+    Then the trailing: the stop is dragged to breakeven before the exit. Divide by *that*
+    stop and the distance is zero — no R at all, and every trailed winner in the report loses
+    the one number that makes trades comparable.
+    """
+    portfolio = a_portfolio()
+    entry = order(stop="1.09000")
+    portfolio.apply(fill(entry, price="1.10000", time=T1))
+    portfolio.amend_stop(Decimal("1.10000"))
+
+    trade = portfolio.apply(fill(order(Side.SHORT, SignalKind.EXIT), price="1.10500", time=T2))
+
+    assert trade is not None
+    assert trade.net_pnl == Decimal(500)
+    assert trade.r_multiple == Decimal("0.5")
+    assert trade.stop_loss == Decimal("1.09000")

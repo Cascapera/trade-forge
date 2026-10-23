@@ -1,0 +1,674 @@
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { ApiError, api } from '../api/client'
+import { useSession } from '../store'
+import { renderWithProviders } from '../test-utils'
+
+import { LaunchStudy } from './LaunchStudy'
+
+vi.mock('../api/client', async () => {
+  const actual = await vi.importActual<typeof import('../api/client')>('../api/client')
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      listInstruments: vi.fn(),
+      listStrategies: vi.fn(),
+      createStudy: vi.fn(),
+      previewStudy: vi.fn(),
+      planCollections: vi.fn(),
+    },
+  }
+})
+
+const listInstruments = vi.mocked(api.listInstruments)
+const createStudy = vi.mocked(api.createStudy)
+const listStrategies = vi.mocked(api.listStrategies)
+const previewStudy = vi.mocked(api.previewStudy)
+const planCollections = vi.mocked(api.planCollections)
+
+function instrument(symbol: string) {
+  return {
+    id: symbol,
+    symbol,
+    name: symbol,
+    asset_class: 'stock',
+    currency_quote: 'USD',
+    currency_base: null,
+    tick_size: '0.01',
+    tick_value: '0.01',
+    contract_size: '1',
+    digits: 2,
+    default_spread_points: null,
+  }
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  listInstruments.mockResolvedValue([instrument('AAPL')])
+  listStrategies.mockResolvedValue({
+    total: 1,
+    limit: 200,
+    offset: 0,
+    items: [
+      {
+        id: 'strategy-1',
+        name: 'MME9',
+        version: 1,
+        schema_version: '1.0',
+        setup: 'mme9_breakout',
+        runs: 3,
+        created_at: '2024-01-01T00:00:00Z',
+      },
+    ],
+  })
+  // Clean by default: the tests that care about the server's verdict say so themselves,
+  // and the rest must not be blocked by a preview they never set up.
+  previewStudy.mockResolvedValue({ points: 2, refusals: [], grid_error: null })
+  // Nothing missing unless a test says otherwise: the click then launches as it always did.
+  planCollections.mockResolvedValue([])
+  useSession.setState({ strategyId: 'strategy-1', strategyName: 'MME9' })
+})
+
+/**
+ * Put a set of values on a numeric axis.
+ *
+ * The values field is no longer one text box: a value is typed (or a list pasted) and then
+ * added, which is what turns it into the axis. Every caller below went through the same two
+ * steps by hand before this existed.
+ */
+function setValues(axis: number, values: string): void {
+  const label = `Parameter ${String(axis)} values`
+  fireEvent.change(screen.getByLabelText(label), { target: { value: values } })
+  // ⚠️ Only a described parameter has an add button. With no strategy chosen there is no setup
+  // and so no schema, and the axis falls back to a plain field where typing *is* the value —
+  // the same fallback a DSL strategy gets. Asserting the button exists would make this helper
+  // demand a screen state half of its callers deliberately do not set up.
+  const add = screen.queryByLabelText(`${label} add`)
+  if (add !== null) fireEvent.click(add)
+}
+
+/** Tick a set of names on an axis whose parameter has a fixed set of them. */
+function tickValues(axis: number, values: readonly string[]): void {
+  for (const value of values) {
+    fireEvent.click(screen.getByLabelText(`Parameter ${String(axis)} values ${value}`))
+  }
+}
+
+describe('LaunchStudy', () => {
+  it('offers the strategies that exist rather than demanding one built just now', async () => {
+    // ⚠️ This screen used to *refuse to open* unless a strategy had been created since the last
+    // reload, because there was no way to ask the server what existed — for a database holding
+    // forty-five of them. The picker is what `GET /strategies` was missing for.
+    useSession.setState({ strategyId: null, strategyName: null })
+
+    renderWithProviders(<LaunchStudy />)
+
+    expect(await screen.findByRole('option', { name: /MME9 · mme9_breakout/ })).toBeInTheDocument()
+    expect(screen.queryByText(/Build and run a strategy first/)).not.toBeInTheDocument()
+  })
+
+  it('will not launch until a strategy is chosen, and says so', async () => {
+    useSession.setState({ strategyId: null, strategyName: null })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText('Parameter 1 path'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    expect(screen.getByText('Choose a strategy.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
+  })
+
+  it('shows what each strategy actually runs, because a name can lie', async () => {
+    // Not hypothetical: this project's database holds `Structure — CHoCH 56454`, which runs
+    // `mme9_breakout`. A name is typed by a person; a setup is executed by the engine.
+    listStrategies.mockResolvedValue({
+      total: 1,
+      limit: 200,
+      offset: 0,
+      items: [
+        {
+          id: 'liar',
+          name: 'Structure - CHoCH 56454',
+          version: 1,
+          schema_version: '1.0',
+          setup: 'mme9_breakout',
+          runs: 1,
+          created_at: '2024-01-01T00:00:00Z',
+        },
+      ],
+    })
+
+    renderWithProviders(<LaunchStudy />)
+
+    expect(
+      await screen.findByRole('option', { name: /Structure - CHoCH 56454 · mme9_breakout/ }),
+    ).toBeInTheDocument()
+  })
+
+  it('reports the size of the grid as it is typed, and multiplies rather than adds', async () => {
+    // ⚠️ The reason this number is on screen at all. Three by four is twelve backtests, not
+    // seven, and the moment someone needs to know that is *while* adding the second axis — not
+    // after launching a study four times the size they meant.
+    renderWithProviders(<LaunchStudy />)
+    // The parameter dropdown exists only once the strategy list has arrived — it is built from
+    // the chosen strategy's setup, so waiting for the option is waiting for that query.
+    await screen.findByRole('option', { name: /MME9/ })
+
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9, 20')
+    expect(screen.getByRole('status')).toHaveTextContent('3 combinations, so 3 backtests.')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add a parameter' }))
+    // ⚠️ A parameter this setup **really has**. It used to say `setup.params.rr`, which
+    // `mme9_breakout` does not have — harmless while the field was free text, and a silent
+    // no-op now that it is a dropdown of the setup's own parameters. The old test was asserting
+    // a grid that could never have been launched.
+    fireEvent.change(screen.getByLabelText('Parameter 2'), {
+      target: { value: 'setup.params.breakeven_at_r' },
+    })
+    setValues(2, '1, 2, 3, 4')
+
+    expect(screen.getByRole('status')).toHaveTextContent('12 combinations, so 12 backtests.')
+  })
+
+  it('says nothing to run rather than one combination on an empty form', async () => {
+    // An empty product is 1, and "1 combination" on a blank form reads as ready to launch.
+    renderWithProviders(<LaunchStudy />)
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Nothing to run yet.')
+  })
+
+  it('does not refuse a grid for its size', async () => {
+    // ⚠️ His decision (18/09): no cap. 520 combinations used to be refused here, at 500.
+    renderWithProviders(<LaunchStudy />)
+
+    // The market is a search box now (PR-306): typing a ticker sets it, so there is no option
+    // to wait for — AAPL is catalogued, so nothing refuses it once the instruments arrive.
+    // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
+    // strategy's setup, so it fills from the *strategies* request — waiting for the market's
+    // option says nothing about it, and setting a parameter before it arrives is the same
+    // silent no-op one field over.
+    await screen.findByRole('option', { name: 'period' })
+    fireEvent.change(screen.getByLabelText('Market'), {
+      target: { value: 'AAPL' },
+    })
+    fireEvent.change(screen.getByLabelText('From'), {
+      target: { value: '2024-01-01' },
+    })
+    fireEvent.change(screen.getByLabelText('To'), {
+      target: { value: '2025-01-01' },
+    })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, Array.from({ length: 26 }, (_, at) => at + 1).join(','))
+    fireEvent.click(screen.getByRole('button', { name: 'Add a parameter' }))
+    fireEvent.change(screen.getByLabelText('Parameter 2'), {
+      target: { value: 'setup.params.breakeven_at_r' },
+    })
+    setValues(2, Array.from({ length: 20 }, (_, at) => at + 1).join(','))
+
+    expect(screen.getByText('520 combinations, so 520 backtests.')).toBeInTheDocument()
+    expect(screen.queryByText(/over the/)).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Run the study' })).toBeEnabled()
+    })
+  })
+
+  it('sends the grid with its values typed, not as strings', async () => {
+    // `"5"` is not a period the DSL accepts, and `long` is not a number. The form is the only
+    // place that knows which is which, because it is the only place that saw the text.
+    createStudy.mockResolvedValue({ id: 'study-1', points: [] })
+    renderWithProviders(<LaunchStudy />)
+
+    // The market is a search box now (PR-306): typing a ticker sets it, so there is no option
+    // to wait for — AAPL is catalogued, so nothing refuses it once the instruments arrive.
+    // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
+    // strategy's setup, so it fills from the *strategies* request — waiting for the market's
+    // option says nothing about it, and setting a parameter before it arrives is the same
+    // silent no-op one field over.
+    await screen.findByRole('option', { name: 'period' })
+    fireEvent.change(screen.getByLabelText('Market'), {
+      target: { value: 'AAPL' },
+    })
+    fireEvent.change(screen.getByLabelText('From'), {
+      target: { value: '2024-01-01' },
+    })
+    fireEvent.change(screen.getByLabelText('To'), {
+      target: { value: '2025-01-01' },
+    })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+    fireEvent.click(screen.getByRole('button', { name: 'Add a parameter' }))
+    fireEvent.change(screen.getByLabelText('Parameter 2'), {
+      target: { value: 'setup.params.side' },
+    })
+    tickValues(2, ['long', 'short'])
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+    await waitFor(() => {
+      expect(createStudy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          strategy_id: 'strategy-1',
+          symbol: 'AAPL',
+          grid: {
+            'setup.params.period': [5, 9],
+            'setup.params.side': ['long', 'short'],
+          },
+          cost_model: { type: 'none' },
+        }),
+      )
+    })
+  })
+
+  it('warns that everything a study measures is in-sample', () => {
+    // The one sentence on this screen that is about what a study cannot do. Without it the form
+    // reads as a tool for finding the parameters to trade, which is exactly the wrong reading.
+    renderWithProviders(<LaunchStudy />)
+
+    expect(screen.getByText(/measured on the same data it searched/)).toBeInTheDocument()
+  })
+
+  it('carries a spread through as the cost every point pays', () => {
+    // One market, so one cost — and it has to be one, or the points are not comparable to each
+    // other, which is the only thing a study is for.
+    createStudy.mockResolvedValue({ id: 'study-1', points: [] })
+    renderWithProviders(<LaunchStudy />)
+
+    return (async () => {
+      // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
+      // strategy's setup, so it fills from the *strategies* request — waiting for the market's
+      // option says nothing about it, and setting a parameter before it arrives is the same
+      // silent no-op one field over.
+      await screen.findByRole('option', { name: 'period' })
+      fireEvent.change(screen.getByLabelText('Market'), { target: { value: 'AAPL' } })
+      fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
+      fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-01-01' } })
+      fireEvent.change(screen.getByLabelText(/Spread \(ticks\)/), { target: { value: '8' } })
+      fireEvent.change(screen.getByLabelText('Parameter 1'), {
+        target: { value: 'setup.params.period' },
+      })
+      setValues(1, '5, 9')
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+      await waitFor(() => {
+        expect(createStudy).toHaveBeenCalledWith(
+          expect.objectContaining({ cost_model: { type: 'spread', spread_points: '8' } }),
+        )
+      })
+    })()
+  })
+
+  it('reports the server own words, not the status code it came with', async () => {
+    // ⚠️ `ApiError.message` is built from the status alone — "API error 422" — and that is what
+    // the screen used to show. Reported from the screen exactly like that, with the reason the
+    // server had actually sent sitting unread in `detail`.
+    createStudy.mockRejectedValue(
+      new ApiError(422, "'setup.params.periodd': this strategy has nothing at 'setup.params.periodd'"),
+    )
+    renderWithProviders(<LaunchStudy />)
+
+    // ⚠️ **Each** query needs its own wait. The parameter dropdown is built from the chosen
+    // strategy's setup, so it fills from the *strategies* request — waiting for the market's
+    // option says nothing about it, and setting a parameter before it arrives is the same
+    // silent no-op one field over.
+    await screen.findByRole('option', { name: 'period' })
+    fireEvent.change(screen.getByLabelText('Market'), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-01-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+    fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+    // ⚠️ The server's own words, not a generic apology: the refusals it sends are specific
+    // ("nothing at 'setup.params.periodd'", "repeats a value"), and each of them is the one
+    // sentence that tells the reader what to change.
+    expect(await screen.findByText(/nothing at 'setup.params.periodd'/)).toBeInTheDocument()
+  })
+
+  it('offers the parameters of the strategy that was chosen, not a list to remember', async () => {
+    // ⚠️ Before this the left field was free text and you had to know `setup.params.period` by
+    // heart — reported from the screen as "no parameters, what do I fill in and how". The
+    // options are **derived** from the JSON Schema the DSL generates, so nothing here is a
+    // second copy of the parameter list.
+    renderWithProviders(<LaunchStudy />)
+
+    await screen.findByRole('option', { name: /MME9 · mme9_breakout/ })
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-1' } })
+
+    const parameter = screen.getByLabelText('Parameter 1')
+    expect(within(parameter).getByRole('option', { name: 'period' })).toBeInTheDocument()
+    expect(within(parameter).getByRole('option', { name: 'breakeven_at_r' })).toBeInTheDocument()
+  })
+
+  it('says how to fill the values, in the parameter own bounds', async () => {
+    renderWithProviders(<LaunchStudy />)
+
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-1' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+
+    // The sentence comes from the schema's own minimum and maximum, so it tightens on its own
+    // the day a bound does.
+    expect(
+      screen.getByText('whole numbers at least 3 and at most 1000, separated by commas'),
+    ).toBeInTheDocument()
+  })
+
+  it('offers a line of values that will actually run', async () => {
+    renderWithProviders(<LaunchStudy />)
+
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-1' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    // Each suggestion is its own button now, and each is a value built around the parameter's
+    // default and clamped to its bounds — so every one of them is a grid point that will run.
+    fireEvent.click(screen.getByLabelText('Parameter 1 values suggest 4'))
+    fireEvent.click(screen.getByLabelText('Parameter 1 values suggest 9'))
+    fireEvent.click(screen.getByLabelText('Parameter 1 values suggest 14'))
+
+    expect(screen.getByRole('status')).toHaveTextContent('3 combinations')
+  })
+
+  it('clears the axes when the strategy changes, so no path points at the old document', async () => {
+    // ⚠️ Keeping them would leave `setup.params.period` selected against a structure setup that
+    // has no period — refused by the server, but only after the reader had filled in values for
+    // a parameter that was never going to exist.
+    listStrategies.mockResolvedValue({
+      total: 2,
+      limit: 200,
+      offset: 0,
+      items: [
+        {
+          id: 'strategy-1',
+          name: 'MME9',
+          version: 1,
+          schema_version: '1.0',
+          setup: 'mme9_breakout',
+          runs: 3,
+          created_at: '2024-01-01T00:00:00Z',
+        },
+        {
+          id: 'strategy-2',
+          name: 'CHoCH',
+          version: 1,
+          schema_version: '1.0',
+          setup: 'structure_choch',
+          runs: 1,
+          created_at: '2024-01-01T00:00:00Z',
+        },
+      ],
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-1' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    fireEvent.change(screen.getByLabelText(/Strategy/), { target: { value: 'strategy-2' } })
+
+    expect(screen.getByLabelText('Parameter 1')).toHaveValue('')
+    expect(screen.getByLabelText('Parameter 1 values')).toHaveValue('')
+    // And the options are the *new* setup's.
+    const parameter = screen.getByLabelText('Parameter 1')
+    expect(within(parameter).getByRole('option', { name: 'allow_secondary' })).toBeInTheDocument()
+    expect(within(parameter).queryByRole('option', { name: 'period' })).not.toBeInTheDocument()
+  })
+  it('names every combination the server refuses, not the first of them', async () => {
+    // ⚠️ **The whole point of the endpoint, seen from the screen.** Whether `htf: M5` can run on
+    // an M15 document is the DSL's semantics, which live in Python — the browser asks rather than
+    // reimplements. And it asks once for all of them: showing the first would make fixing a grid
+    // a sequence of round trips, which is what a person already had with the 422.
+    previewStudy.mockResolvedValue({
+      points: 3,
+      refusals: [
+        { label: "htf='M1'", values: { 'setup.params.htf': 'M1' }, reason: 'must be coarser' },
+        { label: "htf='M5'", values: { 'setup.params.htf': 'M5' }, reason: 'must be coarser' },
+      ],
+      grid_error: null,
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    // ⚠️ The rest of the form is filled in, or the button would be disabled for a missing market
+    // and this test would prove nothing about the preview at all.
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9, 20')
+
+    expect(
+      await screen.findByText(
+        '2 of these combinations cannot run at this chart and will be left out.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.getByText("htf='M1'")).toBeInTheDocument()
+    expect(screen.getByText("htf='M5'")).toBeInTheDocument()
+    // ⚠️ Left out, not refused (his request, 18/09): the one that can run still launches, and the
+    // count says so — three combinations, one backtest.
+    expect(screen.getByRole('button', { name: 'Run the study' })).toBeEnabled()
+    expect(screen.getByText('3 combinations, so 1 backtest.')).toBeInTheDocument()
+  })
+
+  it('blocks only when no combination can run at this chart', async () => {
+    previewStudy.mockResolvedValue({
+      points: 2,
+      refusals: [
+        { label: "htf='M1'", values: { 'setup.params.htf': 'M1' }, reason: 'must be coarser' },
+        { label: "htf='M5'", values: { 'setup.params.htf': 'M5' }, reason: 'must be coarser' },
+      ],
+      grid_error: null,
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    expect(
+      await screen.findByText(
+        'None of these combinations can run at this chart, so the study will not start.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
+  })
+
+  it('says a grid that cannot be applied at all in its own words', async () => {
+    // A different kind of no: there are no points to report on, rather than points that will not
+    // run. Reported by the server in its own field, and it must not be flattened into a count.
+    previewStudy.mockResolvedValue({
+      points: 0,
+      refusals: [],
+      grid_error: "this strategy has nothing at 'setup.params.nonesuch'",
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    // ⚠️ The rest of the form is filled in, or the button would be disabled for a missing market
+    // and this test would prove nothing about the preview at all.
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    expect(await screen.findByText(/nothing at 'setup.params.nonesuch'/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run the study' })).toBeDisabled()
+  })
+
+  it('stops blocking the moment the axis changes, before the new answer arrives', async () => {
+    // ⚠️ **The stale answer, which is the only thing the debounce makes possible.** For the
+    // 400ms after a keystroke the query is still keyed on the previous grid, so what is on hand
+    // is a real verdict about a grid nobody is looking at any more. Blocking on it means the
+    // reader fixes the axis and the screen goes on refusing what they just corrected.
+    // Every point refused, which is the one answer that still blocks since the study drops what
+    // cannot run (18/09) — a blocking verdict is what a stale one can wrongly keep in force.
+    previewStudy.mockResolvedValue({
+      points: 2,
+      refusals: [
+        { label: "htf='M1'", values: { 'setup.params.htf': 'M1' }, reason: 'must be coarser' },
+        { label: "htf='M5'", values: { 'setup.params.htf': 'M5' }, reason: 'must be coarser' },
+      ],
+      grid_error: null,
+    })
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    const button = await screen.findByRole('button', { name: 'Run the study' })
+    await waitFor(() => {
+      expect(button).toBeDisabled()
+    })
+
+    // The correction. No waiting: the point is what the screen does *before* the next answer.
+    setValues(1, '20')
+
+    expect(button).toBeEnabled()
+    expect(screen.queryByText("htf='M5'")).not.toBeInTheDocument()
+  })
+
+  it('does not block the launch on an answer that has not arrived', async () => {
+    // ⚠️ The preview is an early warning, never the gate — the gate is `POST /studies`, which
+    // validates every point again and writes nothing if one fails. A screen that disabled the
+    // button while waiting would make a slow round trip look like a refusal, and the person
+    // would go looking for a mistake that is not there.
+    previewStudy.mockReturnValue(new Promise(() => undefined))
+
+    renderWithProviders(<LaunchStudy />)
+    await screen.findByRole('option', { name: /MME9/ })
+    fireEvent.change(screen.getByLabelText(/Market/), { target: { value: 'AAPL' } })
+    fireEvent.change(screen.getByLabelText(/From/), { target: { value: '2024-01-01' } })
+    fireEvent.change(screen.getByLabelText(/To/), { target: { value: '2024-06-01' } })
+    fireEvent.change(screen.getByLabelText('Parameter 1'), {
+      target: { value: 'setup.params.period' },
+    })
+    setValues(1, '5, 9')
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Run the study' })).toBeEnabled()
+    })
+  })
+
+  describe('the data has to be there (PR-272)', () => {
+    /** Market, window and one axis of two values: a study that could launch. */
+    async function fillIn(): Promise<void> {
+      await screen.findByRole('option', { name: 'period' })
+      fireEvent.change(screen.getByLabelText('Market'), { target: { value: 'AAPL' } })
+      fireEvent.change(screen.getByLabelText('From'), { target: { value: '2024-01-01' } })
+      fireEvent.change(screen.getByLabelText('To'), { target: { value: '2025-01-01' } })
+      fireEvent.change(screen.getByLabelText('Parameter 1'), {
+        target: { value: 'setup.params.period' },
+      })
+      setValues(1, '5, 9')
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Run the study' })).toBeEnabled()
+      })
+    }
+
+    const missingAapl = {
+      symbol: 'AAPL',
+      timeframe: 'H1',
+      covers: null,
+      in_window: false,
+      windows: [{ date_from: '2024-01-01T00:00:00Z', date_to: '2025-12-31T23:59:59.999999Z' }],
+      at_broker: true,
+      time: null,
+    }
+
+    it('asks the plan about its one market and chart, and launches if nothing is missing', async () => {
+      createStudy.mockResolvedValue({ id: 'study-1', points: [] })
+      renderWithProviders(<LaunchStudy />)
+      await fillIn()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+      await waitFor(() => {
+        expect(createStudy).toHaveBeenCalledWith(
+          expect.objectContaining({ collect_missing: false }),
+        )
+      })
+      expect(planCollections).toHaveBeenCalledWith(
+        expect.objectContaining({ symbols: ['AAPL'], timeframes: ['H1'] }),
+      )
+    })
+
+    it('collects what the window is missing without asking', async () => {
+      // His rule of 26/09. ⚠️ What the study used to do before PR-272: queue every point, and
+      // let each fail in a worker.
+      planCollections.mockResolvedValue([missingAapl])
+      createStudy.mockResolvedValue({ id: 'study-1', points: [] })
+      renderWithProviders(<LaunchStudy />)
+      await fillIn()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+      await waitFor(() => {
+        expect(createStudy).toHaveBeenCalledWith(expect.objectContaining({ collect_missing: true }))
+      })
+      expect(screen.queryByRole('region', { name: 'missing data' })).not.toBeInTheDocument()
+    })
+
+    it('says why nothing would run when the window cannot be collected either', async () => {
+      planCollections.mockResolvedValue([{ ...missingAapl, at_broker: false }])
+      renderWithProviders(<LaunchStudy />)
+      await fillIn()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+
+      expect(await screen.findByRole('region', { name: 'missing data' })).toHaveTextContent(
+        'AAPL H1 — never collected; not listed by the broker, cannot be collected',
+      )
+      expect(createStudy).not.toHaveBeenCalled()
+      // Nothing in the window: running would be refused, so it is not offered.
+      expect(screen.queryByRole('button', { name: 'Run with what there is' })).not.toBeInTheDocument()
+    })
+
+    it('closes the question when the form changes', async () => {
+      planCollections.mockResolvedValue([{ ...missingAapl, at_broker: false }])
+      renderWithProviders(<LaunchStudy />)
+      await fillIn()
+      fireEvent.click(screen.getByRole('button', { name: 'Run the study' }))
+      await screen.findByRole('region', { name: 'missing data' })
+
+      fireEvent.change(screen.getByLabelText('To'), { target: { value: '2024-06-01' } })
+
+      expect(screen.queryByRole('region', { name: 'missing data' })).not.toBeInTheDocument()
+    })
+  })
+})

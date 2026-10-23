@@ -7,12 +7,15 @@ been run. In particular, `downgrade` is the half nobody exercises until the nigh
 they need it — so it is exercised here, on every push.
 """
 
+import json
+import re
+import uuid
 from collections.abc import Iterator
 
 import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import Engine, create_engine, inspect
+from sqlalchemy import CheckConstraint, Engine, Enum, create_engine, inspect, text
 
 from tradeforge_db.base import Base
 from tradeforge_db.migrate import downgrade, upgrade
@@ -26,6 +29,7 @@ EXPECTED_TABLES = {
     "backtests",
     "backtest_metrics",
     "trades",
+    "live_sessions",
 }
 
 
@@ -37,6 +41,22 @@ def test_upgrade_creates_every_table(migrated_engine: Engine) -> None:
     assert "alembic_version" in tables
 
 
+def enum_check_names() -> set[str]:
+    """The CHECK constraints Postgres holds only because a non-native `Enum` asked for it.
+
+    `models._enum` builds every enum column with `native_enum=False, create_constraint=True`,
+    so each one becomes an ordinary `CHECK (col IN (...))` named `ck_<table>_<enum name>`.
+    Derived from the metadata rather than listed, so an enum added tomorrow is covered and a
+    hand-written rule never is.
+    """
+    return {
+        f"ck_{table.name}_{column.type.name}"
+        for table in Base.metadata.tables.values()
+        for column in table.columns
+        if isinstance(column.type, Enum) and not column.type.native_enum and column.type.name
+    }
+
+
 def test_the_models_are_exactly_what_the_migration_built(migrated_engine: Engine) -> None:
     """The drift test — the strongest assertion in this package.
 
@@ -45,12 +65,59 @@ def test_the_models_are_exactly_what_the_migration_built(migrated_engine: Engine
     still passes, because the unit tests read the models; the constraint simply is not
     there in production. Here Alembic diffs the live database against the metadata, and
     an empty diff is the only acceptable answer.
+
+    ⚠️ **Enum-generated CHECKs are excluded, and only those.** Alembic 1.19 began comparing
+    CHECK constraints — which is how it found the thirty-one doubled names `rev_0013` fixed —
+    but it cannot match the constraint a non-native `Enum` produces back to the `Enum` in the
+    metadata, so it reports all ten as constraints to remove. The schema is right and the tool
+    cannot see it. The exclusion is computed from the metadata, not spelled out, so it covers
+    exactly the constraints nobody wrote by hand and stays sharp on every rule somebody did.
     """
+    ignored = enum_check_names()
+
+    def include_object(
+        obj: object, name: str | None, type_: str, reflected: bool, compare_to: object
+    ) -> bool:
+        return not (type_ == "check_constraint" and name in ignored)
+
     with migrated_engine.connect() as connection:
-        context = MigrationContext.configure(connection, opts={"compare_type": True})
+        context = MigrationContext.configure(
+            connection, opts={"compare_type": True, "include_object": include_object}
+        )
         differences = compare_metadata(context, Base.metadata)
 
     assert differences == []
+
+
+def test_the_enum_exclusion_covers_exactly_the_generated_checks(migrated_engine: Engine) -> None:
+    """A filter that silenced more than it claimed would make the drift test decorative.
+
+    So the excluded names are checked against the database twice over: every one of them is
+    really there, and none of them is a rule anybody wrote — a hand-written check would have a
+    name the metadata does not derive from an enum type.
+    """
+    ignored = enum_check_names()
+    assert ignored, "no enum checks derived at all: the derivation is wrong, not the schema"
+
+    with migrated_engine.connect() as connection:
+        present = {
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                    "WHERE n.nspname = current_schema() AND c.contype = 'c'"
+                )
+            )
+        }
+
+    assert ignored <= present, f"excluded a check the database does not have: {ignored - present}"
+    hand_written = {name for name in present if name.startswith("ck_")} - ignored
+    assert len(hand_written) > 40, (
+        f"only {len(hand_written)} hand-written checks left under scrutiny; the filter is "
+        "swallowing rules it was not meant to"
+    )
 
 
 def test_the_append_only_trigger_is_installed(migrated_engine: Engine) -> None:
@@ -101,4 +168,206 @@ def test_downgrade_unwinds_to_nothing_and_upgrade_rebuilds_it(dsn: str) -> None:
 
         assert set(inspect(engine).get_table_names()) >= EXPECTED_TABLES
     finally:
+        engine.dispose()
+
+
+# --------------------------------------------------------------------------- #
+# Constraint names, and the prefix that was written twice (rev_0013)            #
+# --------------------------------------------------------------------------- #
+
+# `ck_%(table_name)s_%(constraint_name)s` interpolates the name it is handed, so a migration
+# that writes the prefix itself gets it twice. This is the pattern that catches it:
+# `ck_backtests_ck_backtests_...`.
+_DOUBLED_PREFIX = re.compile(r"^(ck|uq|ix|fk)_(?P<table>\w+?)_(ck|uq|ix|fk)_(?P=table)_")
+
+
+def test_no_constraint_in_the_database_carries_its_prefix_twice(migrated_engine: Engine) -> None:
+    """The regression guard for rev_0013, stated against the database rather than the models.
+
+    ⚠️ The models could never have caught this. They declare `ck_backtests_failed_needs_error`
+    and always did; it was `rev_0001` that handed the convention a name with the prefix already
+    in it, and the database that ended up with `ck_backtests_ck_backtests_failed_needs_error`.
+    Thirty-one of them, in every database this project has ever built, invisible for a year
+    because Alembic 1.18 does not compare CHECK constraints and 1.19 does.
+    """
+    with migrated_engine.connect() as connection:
+        names = [
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                    "WHERE n.nspname = current_schema() ORDER BY 1"
+                )
+            )
+        ]
+
+    assert names, "no constraints at all: the query is wrong, not the schema"
+    doubled = [name for name in names if _DOUBLED_PREFIX.match(name)]
+    assert doubled == [], f"{len(doubled)} constraint(s) carry their prefix twice: {doubled[:5]}"
+
+
+def test_the_database_and_the_models_agree_on_every_check_name(migrated_engine: Engine) -> None:
+    """The sharper half: absence of doubling is not the same as agreement.
+
+    A name could be free of the doubled pattern and still not be the one the models declare —
+    a migration that invented its own spelling, say. This compares the two sets outright, which
+    is the property `drop_constraint` depends on: the ORM's name has to be the name that is
+    actually there.
+    """
+    with migrated_engine.connect() as connection:
+        in_database = {
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                    "WHERE n.nspname = current_schema() AND c.contype = 'c'"
+                )
+            )
+        }
+    # `str(...)` because SQLAlchemy types an unnamed constraint's `.name` as a sentinel, not
+    # as `str` — the `if` already excluded those, and this tells mypy so.
+    in_models = {
+        str(constraint.name)
+        for table in Base.metadata.tables.values()
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint) and constraint.name
+    }
+
+    # ⚠️ Only one direction is asserted. Postgres materialises a CHECK for every NOT NULL and
+    # for every non-native enum, so the database legitimately holds names the models never
+    # declared; the models holding a name the database does not is the failure.
+    missing = in_models - in_database
+    assert missing == set(), f"the models name checks the database does not have: {sorted(missing)}"
+
+
+@pytest.mark.usefixtures("_restore_head")
+def test_a_sweep_s_points_move_to_rows_and_back_in_order(dsn: str) -> None:
+    """`rev_0035`: the JSONB list becomes rows in the order it held them, and a downgrade puts the
+    same list back — `same_as` only where a point had one."""
+    points = [
+        {
+            "strategy_id": str(uuid.uuid4()),
+            "entry_id": "e",
+            "label": "M15 · a=1",
+            "values": {"timeframe": "M15", "a": 1},
+        },
+        {
+            "strategy_id": str(uuid.uuid4()),
+            "entry_id": "e",
+            "label": "M15 · a=2",
+            "values": {"timeframe": "M15", "a": 2},
+            "same_as": "M15 · a=1",
+        },
+    ]
+    points[1]["strategy_id"] = points[0]["strategy_id"]
+    sweep_id = uuid.uuid4()
+    engine = create_engine(dsn)
+    try:
+        downgrade("0034", dsn=dsn)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO sweeps (id, entry_ids, symbols, timeframes, points, date_from, "
+                    "date_to, initial_capital) VALUES (:id, '[]', '[]', '[\"M15\"]', "
+                    "CAST(:points AS jsonb), '2024-01-01', '2025-01-01', 10000)"
+                ),
+                {"id": sweep_id, "points": json.dumps(points)},
+            )
+
+        upgrade("0035", dsn=dsn)
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT position, strategy_id::text, label, coordinates, same_as "
+                    "FROM sweep_points WHERE sweep_id = :id ORDER BY position"
+                ),
+                {"id": sweep_id},
+            ).all()
+        assert [tuple(row) for row in rows] == [
+            (0, points[0]["strategy_id"], "M15 · a=1", {"timeframe": "M15", "a": 1}, None),
+            (1, points[0]["strategy_id"], "M15 · a=2", {"timeframe": "M15", "a": 2}, "M15 · a=1"),
+        ]
+
+        downgrade("0034", dsn=dsn)
+        with engine.connect() as connection:
+            back = connection.execute(
+                text("SELECT points FROM sweeps WHERE id = :id"), {"id": sweep_id}
+            ).scalar_one()
+        assert back == points
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM sweeps WHERE id = :id"), {"id": sweep_id})
+        engine.dispose()
+
+
+@pytest.mark.usefixtures("_restore_head")
+def test_existing_instruments_are_tied_to_the_broker_they_were_collected_from(dsn: str) -> None:
+    """`rev_0050` (ADR-0032): shares collected at +3 h are Tradeview's, what was collected at +2 h
+    ActivTrades'; a row with no candles behind it (a seed) keeps no broker, and so does a clock
+    neither broker had."""
+    rows = {
+        "AAPL": ("stock", "3 hours", True, "tradeview"),
+        "EURUSD": ("forex", "2 hours", True, "activtrades"),
+        "SEEDED": ("stock", "3 hours", False, None),
+        "ODDCLOCK": ("forex", "0 hours", True, None),
+    }
+    ids = {symbol: uuid.uuid4() for symbol in rows}
+    engine = create_engine(dsn)
+    try:
+        downgrade("0049", dsn=dsn)
+        with engine.begin() as connection:
+            for symbol, (asset_class, clock, collected, _) in rows.items():
+                connection.execute(
+                    text(
+                        "INSERT INTO instruments (id, symbol, name, asset_class, currency_quote, "
+                        "tick_size, tick_value, contract_size, digits, server_offset) VALUES "
+                        "(:id, :symbol, :symbol, :class, 'USD', 0.01, 0.01, 1, 2, "
+                        "CAST(:clock AS interval))"
+                    ),
+                    {"id": ids[symbol], "symbol": symbol, "class": asset_class, "clock": clock},
+                )
+                if collected:
+                    connection.execute(
+                        text(
+                            "INSERT INTO datasets (id, instrument_id, timeframe, date_from, "
+                            "date_to, candle_count, parquet_path) VALUES (:id, :instrument, "
+                            "'H1', '2024-01-01', '2025-01-01', 1, 'x')"
+                        ),
+                        {"id": uuid.uuid4(), "instrument": ids[symbol]},
+                    )
+
+        upgrade("0050", dsn=dsn)
+        with engine.connect() as connection:
+            found: dict[str, str | None] = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    text(
+                        "SELECT i.symbol, b.slug FROM instruments i "
+                        "LEFT JOIN brokers b ON b.id = i.broker_id WHERE i.id = ANY(:ids)"
+                    ),
+                    {"ids": list(ids.values())},
+                )
+            }
+            tickers: dict[str, str | None] = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    text("SELECT symbol, broker_symbol FROM instruments WHERE id = ANY(:ids)"),
+                    {"ids": list(ids.values())},
+                )
+            }
+        assert found == {symbol: expected[3] for symbol, expected in rows.items()}
+        assert tickers == {"AAPL": "AAPL", "EURUSD": "EURUSD", "SEEDED": None, "ODDCLOCK": None}
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM datasets WHERE instrument_id = ANY(:ids)"),
+                {"ids": list(ids.values())},
+            )
+            connection.execute(
+                text("DELETE FROM instruments WHERE id = ANY(:ids)"), {"ids": list(ids.values())}
+            )
         engine.dispose()

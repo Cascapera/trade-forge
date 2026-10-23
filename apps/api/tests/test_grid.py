@@ -1,0 +1,443 @@
+"""Expanding a grid of parameter ranges into the documents a study will run.
+
+No database and no HTTP: this is the arithmetic, and it is the half of a study that can be
+wrong without anything crashing. A grid that expands to the wrong documents still produces
+runs, still fills a heatmap, and still reads as a finding about the market.
+"""
+
+import re
+from collections.abc import Sequence
+from typing import Any
+
+import pytest
+
+from tradeforge_api.grid import (
+    GridError,
+    coordinates,
+    expand,
+    named,
+    read_point,
+    size_of,
+    value_at,
+)
+from tradeforge_schema import assert_executable
+from tradeforge_schema.models import Strategy
+
+# A setup document, because every strategy in this project's database is one of these. The
+# nesting is what matters: the axes reach two levels down, into a dict shared by every point
+# unless it is copied properly.
+_BASE: dict[str, Any] = {
+    "schema_version": "1.0",
+    "name": "MME9 breakout",
+    "timeframe": "H1",
+    "setup": {
+        "type": "mme9_breakout",
+        "params": {"side": "long", "period": 9, "take_profit_rr": 5},
+    },
+    "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+}
+
+# A DSL document, whose indicators are a *list* — the only shape that exercises a numeric
+# segment. Kept beside the setup one because the two reach the parameter by different paths.
+_DSL: dict[str, Any] = {
+    "schema_version": "1.0",
+    "name": "MA cross",
+    "timeframe": "H1",
+    "indicators": [
+        {"id": "fast", "type": "SMA", "params": {"period": 2}},
+        {"id": "slow", "type": "SMA", "params": {"period": 3}},
+    ],
+}
+
+
+def _params(document: dict[str, Any]) -> dict[str, Any]:
+    params: dict[str, Any] = document["setup"]["params"]
+    return params
+
+
+def _period(document: dict[str, Any], which: int) -> int:
+    """The `which`-th indicator's period, out of a DSL document's list."""
+    indicators: list[dict[str, Any]] = document["indicators"]
+    period: int = indicators[which]["params"]["period"]
+    return period
+
+
+def test_a_grid_expands_to_every_combination_last_axis_fastest() -> None:
+    """The golden: 3 periods by 2 targets is 6 documents, in the order a nested loop produces.
+
+    ⚠️ **Three by two, not two by two.** A square grid is the one shape where several wrong
+    implementations agree with the right one: `zip` instead of `product` gives 2 points against
+    6 here but 2 against 4 there, and a `sum` where the size is a product gives 4 either way on
+    a 2x2. The asymmetry is what makes the count mean something.
+
+    The order is asserted, not just the set, because it becomes the order of the study's runs —
+    and a heatmap laid out row by row is reading exactly that.
+    """
+    points = expand(
+        _BASE, {"setup.params.period": [5, 9, 20], "setup.params.take_profit_rr": [2, 3]}
+    )
+
+    assert [
+        (_params(p.document)["period"], _params(p.document)["take_profit_rr"]) for p in points
+    ] == [
+        (5, 2),
+        (5, 3),
+        (9, 2),
+        (9, 3),
+        (20, 2),
+        (20, 3),
+    ]
+
+
+def test_expanding_leaves_the_base_document_untouched() -> None:
+    """The caller's document is a stored strategy, and a study must not edit the thing it varies.
+
+    Mutating it in place would rewrite the base strategy's own parameters to whatever the last
+    grid point happened to be — and the row it came from is immutable by invariant, so the
+    damage would only ever show up as a later run of the *base* strategy behaving oddly.
+    """
+    expand(_BASE, {"setup.params.period": [5, 20]})
+
+    assert _params(_BASE)["period"] == 9
+
+
+def test_each_point_gets_its_own_nested_parameters() -> None:
+    """⚠️ The test that separates a deep copy from a shallow one, and the failure is total.
+
+    A shallow copy shares the nested `params` dict across every point. Each substitution then
+    writes into the *same* dictionary, so the last one wins and all N documents come out
+    identical — N runs of one configuration, presented as a search of the space.
+
+    Asserted on the objects rather than on the values, because the values are already pinned by
+    the golden above; what this states is *why* they can differ at all.
+    """
+    points = expand(_BASE, {"setup.params.period": [5, 9, 20]})
+
+    holders = [id(_params(point.document)) for point in points]
+    assert len(set(holders)) == len(points)
+
+
+def test_a_numeric_segment_reaches_into_a_list() -> None:
+    """`indicators.0.params.period` — the DSL's shape, where the container is a list.
+
+    Both indicators are varied at once so the test cannot pass by indexing the wrong element:
+    a path that always resolved to `indicators[0]` would give every point the same slow period.
+    """
+    points = expand(
+        _DSL, {"indicators.0.params.period": [2, 4], "indicators.1.params.period": [10]}
+    )
+
+    assert [(_period(p.document, 0), _period(p.document, 1)) for p in points] == [
+        (2, 10),
+        (4, 10),
+    ]
+
+
+def test_a_path_the_document_has_nothing_at_is_refused() -> None:
+    """⚠️ The refusal that matters most, because its absence is silent.
+
+    `periodd` is what a typo looks like. Substituting there would *add* a key, and nothing reads
+    it — the setup factory takes the parameters it knows and ignores the rest. The study would
+    run N identical backtests, report N identical results, and draw a flat heatmap that reads as
+    a finding about the market rather than as a misspelling.
+    """
+    with pytest.raises(GridError, match=re.escape("nothing at 'setup.params.periodd'")):
+        expand(_BASE, {"setup.params.periodd": [5, 9]})
+
+
+def test_a_path_running_through_a_scalar_is_refused() -> None:
+    """The other way a path can fail, and it fails one segment earlier.
+
+    `setup.type` is the string `mme9_breakout`. A walk that stopped at the second-to-last
+    segment would hand back that string as the container to write into — and the refusal would
+    come later, from Python, as a `TypeError` in the middle of writing a study to the database.
+    """
+    with pytest.raises(GridError, match=re.escape("nothing at 'setup.type.period'")):
+        expand(_BASE, {"setup.type.period": [5, 9]})
+
+
+def test_an_index_past_the_end_of_a_list_is_refused() -> None:
+    """The list-shaped version of the same mistake — and it names the length, so the message
+    says what the document actually holds rather than only that something was wrong."""
+    with pytest.raises(GridError, match="is a list of 2"):
+        expand(_DSL, {"indicators.7.params.period": [2, 4]})
+
+
+def test_an_axis_with_no_values_is_refused() -> None:
+    """An empty axis makes the product zero: the study would be accepted, expand to no points,
+    and sit there as a study that ran nothing. Refusing names the axis that was left blank."""
+    with pytest.raises(GridError, match="has no values"):
+        expand(_BASE, {"setup.params.period": [5, 9], "setup.params.take_profit_rr": []})
+
+
+def test_an_axis_that_repeats_a_value_is_refused() -> None:
+    """Two identical points are two identical backtests, and on a heatmap they are one cell
+    drawn twice. Cheap to catch here; indistinguishable from a real result afterwards."""
+    with pytest.raises(GridError, match="repeats a value"):
+        expand(_BASE, {"setup.params.period": [5, 9, 5]})
+
+
+def test_a_grid_with_no_axes_is_refused() -> None:
+    """A study that varies nothing is a backtest, and `POST /backtests` already exists."""
+    with pytest.raises(GridError, match="at least one parameter"):
+        expand(_BASE, {})
+
+
+def test_a_grid_is_expanded_whole_however_large() -> None:
+    """⚠️ His decision (18/09): no cap on a grid. 2034 combinations is the shape that met the old
+    cap of 500 on his catalogue entry; every one is expanded, none trimmed, none refused.
+
+    Asserted on the count and on both ends of the product, so a quietly truncating expansion
+    (the first 500, say) fails here rather than drawing half a heatmap as if it were whole.
+    """
+    grid: dict[str, Sequence[Any]] = {
+        "setup.params.period": list(range(2, 36)),  # 34 values
+        "setup.params.take_profit_rr": [round(0.5 + 0.1 * step, 1) for step in range(60)],
+    }
+
+    points = expand(_BASE, grid)
+
+    assert len(points) == 34 * 60 == 2040
+    assert points[0].values == {"setup.params.period": 2, "setup.params.take_profit_rr": 0.5}
+    assert points[-1].values == {"setup.params.period": 35, "setup.params.take_profit_rr": 6.4}
+
+
+def test_the_size_is_the_product_of_the_axes_not_their_total() -> None:
+    """Said separately from `expand` because a caller needs the number *before* committing.
+
+    ⚠️ Three by two by two: 12 as a product, 7 as a sum. Two axes of two would be 4 either way,
+    and the whole point of reporting this is that people underestimate it.
+    """
+    grid: dict[str, Sequence[Any]] = {
+        "setup.params.period": [5, 9, 20],
+        "setup.params.take_profit_rr": [2, 3],
+        "setup.params.side": ["long", "short"],
+    }
+
+    assert size_of(grid) == 12
+
+
+def test_a_point_is_named_by_what_makes_it_different() -> None:
+    """The stored name is what the run log shows, and the run log is where a study is read.
+
+    Only the leaf of each path appears: the `setup.params.` prefix is identical across every
+    point of a study, so repeating it would push the part that differs off the end of the column.
+    """
+    [point] = expand(_BASE, {"setup.params.period": [9]})
+
+    assert named("MME9 breakout", point) == "MME9 breakout [period=9]"
+
+
+def test_an_axis_can_replace_a_whole_list_element() -> None:
+    """The last segment being a list index, which no other test reaches.
+
+    `indicators.0.params.period` walks *through* a list and lands in a dict; `indicators.0`
+    lands on the list itself, which is the only shape that exercises writing and reading by
+    position. A grid over it swaps one indicator for another wholesale — coarse, but the DSL
+    permits it and the substitution has to be right or a study would run documents nobody asked
+    for.
+    """
+    points = expand(
+        _DSL,
+        {"indicators.0": [{"id": "fast", "type": "EMA", "params": {"period": 2}}]},
+    )
+
+    [point] = points
+    assert point.document["indicators"][0]["type"] == "EMA"
+    # And the sibling is untouched, so the write went to the named index rather than to the list.
+    assert point.document["indicators"][1]["type"] == "SMA"
+
+
+@pytest.mark.parametrize("path", ["", ".", "setup..params", "setup.params."])
+def test_a_malformed_path_is_refused_before_anything_is_walked(path: str) -> None:
+    """The grid's keys are raw strings from a client, so the empty segment is reachable input.
+
+    Untested until now, and the failure without it is not a refusal: an empty segment would be
+    looked up as a key, miss, and produce a message about the strategy having nothing at `''` —
+    which reads as a fact about the strategy rather than as a malformed request.
+    """
+    with pytest.raises(GridError, match="not a path into a strategy document"):
+        expand(_BASE, {path: [1, 2]})
+
+
+def test_an_axis_the_documents_do_not_have_reads_as_nothing_rather_than_raising() -> None:
+    """⚠️ The read is deliberately forgiving where the expansion is deliberately loud.
+
+    A grid is a stored column somebody can edit, and a study whose grid names a parameter its
+    documents lack is a study that can still be *read*: every other axis places, and the odd one
+    out sorts last. Raising here would 500 a reporting endpoint over a value that is merely
+    surprising — the heatmap, the fold's chosen label and the run ordering all go through this.
+
+    Expanding the same grid still refuses, and the asymmetry is the point: writing a document
+    from a path nothing reads would create a parameter the engine ignores.
+    """
+    document = {"setup": {"type": "mme9_breakout", "params": {"period": 9}}}
+    grid = {"setup.params.period": [9], "setup.params.nothing_reads_this": [1, 2]}
+
+    assert read_point(document, grid) == {
+        "setup.params.period": 9,
+        "setup.params.nothing_reads_this": None,
+    }
+    # Unplaceable sorts last: `len(axis)` is one past the final index, whatever the axis holds.
+    assert coordinates(grid, read_point(document, grid)) == (0, 2)
+
+    with pytest.raises(GridError, match=re.escape("nothing at 'setup.params.nothing_reads_this'")):
+        expand(document, grid)
+
+
+# --------------------------------------------------------------------------- #
+# An axis that switches a rule off (2026-09-09)                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_an_axis_may_carry_null_and_the_documents_it_makes_are_runnable() -> None:
+    """⚠️ **The experiment the filters exist to justify, end to end.** "Does the region above earn
+    its keep?" is one grid over `htf` — `off` against `H4` — and a grid is a cross product, so the
+    unfiltered point is a document that carries a broker clock configuring nothing.
+
+    Both halves are checked here, and only one of them had to change. `expand` already copied a
+    `None` through like any other value — not a line of `apps/api/src` moved for this — and that
+    is asserted rather than assumed, because nothing else pinned it. What gave is the semantic
+    layer, which stopped refusing an offset with no filter above it
+    (`semantic._broker_clock_errors`, relaxed the same day and for this reason). Either half
+    alone leaves the comparison impossible to ask for, and this is the only place both are true
+    at once.
+    """
+    base = {
+        "schema_version": "1.0",
+        "name": "choch",
+        "timeframe": "M15",
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+    points = expand(base, {"setup.params.htf": [None, "H4"]})
+
+    assert [_params(point.document)["htf"] for point in points] == [None, "H4"]
+    for point in points:
+        assert_executable(Strategy.model_validate(point.document))
+
+
+def test_a_point_that_switches_a_rule_off_is_named_for_it() -> None:
+    """A study's runs are told apart by name, and `htf=None` has to read as something. Whatever
+    it reads as, two points must not share it — that is the whole job of the name."""
+    base = {
+        "schema_version": "1.0",
+        "name": "choch",
+        "timeframe": "M15",
+        "setup": {"type": "structure_choch", "params": {"htf": "H4"}},
+        "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+    }
+
+    names = [named("base", point) for point in expand(base, {"setup.params.htf": [None, "H4"]})]
+
+    assert len(set(names)) == 2
+    # `None` and `'H4'`, spelled the way the label already spells every other value — a string
+    # keeps its quotes there, so the unfiltered point reads as the absence it is rather than as
+    # a timeframe called "None".
+    assert names == ["base [htf=None]", "base [htf='H4']"]
+
+
+# --------------------------------------------------------------------------- #
+# The target's axis — a rule that may be absent (his ask, 22/09)                #
+# --------------------------------------------------------------------------- #
+
+_WITH_TARGET: dict[str, Any] = {
+    **_BASE,
+    "exit": {
+        "stop_loss": {"type": "candle_extreme", "params": {"lookback": 2, "side": "low"}},
+        "take_profit": {"type": "risk_multiple", "params": {"rr": 2.0}},
+        "conditions": [],
+    },
+}
+
+_WITHOUT_TARGET: dict[str, Any] = {
+    **_BASE,
+    "exit": {
+        "stop_loss": {"type": "candle_extreme", "params": {"lookback": 2, "side": "low"}},
+        "take_profit": None,
+        "conditions": [],
+    },
+}
+
+
+def _target(document: dict[str, Any]) -> Any:
+    return document["exit"]["take_profit"]
+
+
+class TestTheTargetAxis:
+    """`exit.take_profit.params.rr` names a leaf that may not exist, and that is the point: a
+    setup which conducts its own stop is compared against the same setup with a target."""
+
+    def test_a_number_builds_the_whole_block_and_off_removes_it(self) -> None:
+        points = expand(_WITH_TARGET, {"exit.take_profit.params.rr": [3, None]})
+
+        assert _target(points[0].document) == {"type": "risk_multiple", "params": {"rr": 3}}
+        assert _target(points[1].document) is None
+        # The base is untouched, as with every other axis.
+        assert _target(_WITH_TARGET) == {"type": "risk_multiple", "params": {"rr": 2.0}}
+
+    def test_a_document_saved_without_a_target_can_still_be_given_one(self) -> None:
+        """The case the axis exists for: `take_profit` is `null`, so there is no `params` to
+        substitute into, and an axis that walked to the leaf would refuse the grid."""
+        points = expand(_WITHOUT_TARGET, {"exit.take_profit.params.rr": [None, 5]})
+
+        assert _target(points[0].document) is None
+        assert _target(points[1].document) == {"type": "risk_multiple", "params": {"rr": 5}}
+
+    def test_the_point_is_labelled_by_the_multiple_not_by_the_block(self) -> None:
+        # What the leaf buys: `rr=3`, not a dictionary printed into a run's name.
+        [three, off] = expand(_WITH_TARGET, {"exit.take_profit.params.rr": [3, None]})
+
+        assert three.label == "rr=3"
+        assert off.label == "rr=None"
+
+    def test_a_document_with_no_exit_at_all_is_refused_loudly(self) -> None:
+        # The typo's defence, unchanged: a grid that reached nowhere would add a key nothing
+        # reads and draw a flat heatmap over N identical runs.
+        with pytest.raises(GridError, match="nothing at 'exit'"):
+            expand(_BASE, {"exit.take_profit.params.rr": [3]})
+
+    @pytest.mark.parametrize(
+        ("document", "expected"), [(_WITH_TARGET, 2.0), (_WITHOUT_TARGET, None)]
+    )
+    def test_a_point_is_read_back_off_its_own_document(
+        self, document: dict[str, Any], expected: Any
+    ) -> None:
+        """What puts a finished run back on the axis — the heatmap's question. Reading the leaf
+        directly would refuse the run that has no target, which is a point of the grid."""
+        assert read_point(document, {"exit.take_profit.params.rr": [None, 2.0]}) == {
+            "exit.take_profit.params.rr": expected
+        }
+
+    def test_a_target_that_is_not_a_target_is_refused_rather_than_read_as_none(self) -> None:
+        # `null` means "no target"; anything else there is a document nobody should run, and
+        # reading it as "no target" would file the run under a point it does not belong to.
+        broken = {**_BASE, "exit": {"take_profit": "5R", "conditions": []}}
+        with pytest.raises(GridError, match="not a target"):
+            value_at(broken, "exit.take_profit.params.rr")
+
+    def test_a_target_block_without_its_multiple_is_refused(self) -> None:
+        broken = {**_BASE, "exit": {"take_profit": {"type": "risk_multiple"}, "conditions": []}}
+        with pytest.raises(GridError, match="no 'rr'"):
+            value_at(broken, "exit.take_profit.params.rr")
+
+    def test_the_documents_it_builds_are_ones_the_dsl_accepts(self) -> None:
+        """The end of the contract: every point has to be a legal strategy, target or none.
+
+        ⚠️ Built from its own base, not from `_BASE`: that one carries a `take_profit_rr` the DSL
+        does not have — harmless to the paths the other tests walk, and fatal to a validation."""
+        legal = {
+            "schema_version": "1.0",
+            "name": "MME9 breakout",
+            "timeframe": "H1",
+            "setup": {"type": "mme9_breakout", "params": {"side": "long", "period": 9}},
+            "exit": {
+                "stop_loss": {"type": "candle_extreme", "params": {"lookback": 2, "side": "low"}},
+                "take_profit": None,
+                "conditions": [],
+            },
+            "risk": {"sizing": {"type": "percent_risk", "params": {"percent": 1.0}}},
+        }
+        for point in expand(legal, {"exit.take_profit.params.rr": [1.5, None]}):
+            Strategy.model_validate(point.document)

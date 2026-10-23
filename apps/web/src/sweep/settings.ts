@@ -1,0 +1,279 @@
+// The sweep form, and everything about it that is arithmetic rather than rendering.
+//
+// A study varies the parameters and holds the market still; a basket varies the market and holds
+// the parameters still. A sweep takes both at once and adds a third axis, the chart. What that
+// makes easy is also the mistake it makes easy, so the counting lives here, in functions a test
+// can call without a browser.
+//
+// ⚠️ **Nothing here decides whether a combination is legal.** That is the DSL's semantics, and
+// they live in Python once (`/sweeps/preview`). This file knows only what the form can see: an
+// empty field, a window that runs backwards, an entry that has left the shelf.
+
+import type {
+  CatalogEntry,
+  CreateSweepRequest,
+  Instrument,
+  PreviewSweepRequest,
+} from '../api/types'
+import { apiFailure } from '../api/failure'
+
+export interface SweepForm {
+  /** Shelf entries to sweep, by id, in the order they were ticked. */
+  entryIds: string[]
+  symbols: string[]
+  timeframes: string[]
+  dateFrom: string
+  dateTo: string
+  initialCapital: string
+  /**
+   * What each market is charged, typed at launch because it is the broker's and changes with it
+   * (his ask, 24/09). Every field blank on every market means charge nothing — `{"type": "none"}`,
+   * never a spread of zero.
+   */
+  costs: Record<string, MarketCosts>
+  /** Every run keeps its trades, won or lost — a base for meta-labeling (02/10, ADR-0031). */
+  keepAllTrades: boolean
+}
+
+/**
+ * One market's costs as typed: the spread in points, the commission per lot per leg, and the swap
+ * per lot per night on each side — signed as the broker quotes it, since a swap can be a credit.
+ */
+export interface MarketCosts {
+  spread: string
+  commission: string
+  swapLong: string
+  swapShort: string
+}
+
+const NO_COSTS: MarketCosts = { spread: '', commission: '', swapLong: '', swapShort: '' }
+
+export const emptySweepForm: SweepForm = {
+  entryIds: [],
+  symbols: [],
+  timeframes: [],
+  dateFrom: '',
+  dateTo: '',
+  initialCapital: '10000',
+  costs: {},
+  keepAllTrades: false,
+}
+
+/**
+ * How many markets one sweep may name — the API's own ceiling (04/10). A whole market is the
+ * question now — every collected crypto, every Brazilian share — so it is not a basket's twenty.
+ */
+export const MAX_SWEEP_SYMBOLS = 500
+
+/**
+ * The form choosing exactly `symbols` — and each newly chosen market's costs started from the
+ * spread the broker quoted when it was collected, for the reader to correct. A market already
+ * carrying typed costs keeps them; one unchosen keeps them too, so ticking it back is no retyping.
+ */
+export function chooseMarkets(
+  form: SweepForm,
+  symbols: readonly string[],
+  instruments: readonly Instrument[] | undefined,
+): SweepForm {
+  const quoted = new Map(instruments?.map((one) => [one.symbol, one.default_spread_points]))
+  const costs = { ...form.costs }
+  for (const symbol of symbols) {
+    if (symbol in costs) continue
+    const spread = quoted.get(symbol)
+    costs[symbol] = { ...NO_COSTS, spread: spread == null ? '' : String(Number(spread)) }
+  }
+  return { ...form, symbols: [...symbols], costs }
+}
+
+/** The form with this one market ticked or unticked — `chooseMarkets` for a single tick. */
+export function toggleMarket(
+  form: SweepForm,
+  symbol: string,
+  instruments: readonly Instrument[] | undefined,
+): SweepForm {
+  const symbols = form.symbols.includes(symbol)
+    ? form.symbols.filter((one) => one !== symbol)
+    : [...form.symbols, symbol]
+  return chooseMarkets(form, symbols, instruments)
+}
+
+function costsOf(form: SweepForm, symbol: string): MarketCosts {
+  return { ...NO_COSTS, ...form.costs[symbol] }
+}
+
+/** Whether the form charges nothing at all: every field of every ticked market blank. */
+export function isCostless(form: SweepForm): boolean {
+  return form.symbols.every((symbol) => {
+    const costs = costsOf(form, symbol)
+    return [costs.spread, costs.commission, costs.swapLong, costs.swapShort].every(
+      (value) => value.trim() === '',
+    )
+  })
+}
+
+/**
+ * Why these costs cannot be sent, or null. Some markets costed and others not is refused rather
+ * than sent: a sweep mixing costed and costless runs ranks the costless ones first.
+ */
+function costsProblem(form: SweepForm): string | null {
+  if (isCostless(form)) return null
+  for (const symbol of form.symbols) {
+    const { spread, commission, swapLong, swapShort } = costsOf(form, symbol)
+    if (spread.trim() === '') {
+      return `Type the spread for ${symbol}, or leave every market blank to run without costs.`
+    }
+    for (const value of [spread, commission]) {
+      if (value.trim() !== '' && !(Number(value) >= 0)) {
+        return `The costs of ${symbol} must be numbers of zero or more.`
+      }
+    }
+    // A swap is signed — negative is charged, positive paid — so it only has to be a number.
+    for (const value of [swapLong, swapShort]) {
+      if (value.trim() !== '' && !Number.isFinite(Number(value))) {
+        return `The swap of ${symbol} must be a number, negative when it is charged.`
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * How many backtests this form describes.
+ *
+ * ⚠️ **The entries add; the charts and the markets multiply.** Three entries of ten points each
+ * is thirty documents, not a thousand — a combination picks *one* entry, so entries are
+ * alternatives rather than an axis. Getting that backwards is the arithmetic mistake this
+ * function exists to make once, and the intuition pulls the wrong way because everything else
+ * on the form does multiply.
+ *
+ * Counted from the shelf's own `points`, which the server derives from each entry's grid. An
+ * entry that varies nothing counts as **one**: the empty product, not zero.
+ *
+ * ⚠️ **`null` when a ticked entry is not in the list, and that is not the same as `0`.** The
+ * first draft treated an unknown id as contributing nothing, which reads as a measurement: a
+ * form with three entries ticked would say `0 backtests` beside them and the reader would have
+ * no way to tell "nothing to run" from "I could not count". It is reachable — the shelf is a
+ * live query, and an entry removed in another tab disappears from it on the next refetch —
+ * and the silent version simply under-counts the sweep it is about to launch.
+ */
+export function runCount(form: SweepForm, entries: readonly CatalogEntry[]): number | null {
+  const byId = new Map(entries.map((entry) => [entry.id, entry]))
+  let documents = 0
+  for (const id of form.entryIds) {
+    const entry = byId.get(id)
+    if (entry === undefined) return null
+    documents += entry.points
+  }
+  return documents * form.timeframes.length * form.symbols.length
+}
+
+/**
+ * Why this sweep cannot be launched yet, or null.
+ *
+ * One reason at a time and in a fixed order, so the message is stable while a form is being
+ * filled in — a list that reshuffles as fields are ticked reads as the form arguing back.
+ *
+ * ⚠️ Only what the form can decide on its own. The DSL's refusals and the coverage gaps come
+ * from the preview and are shown beside this, never folded into it: they answer different
+ * questions and have different fixes.
+ */
+export function whyNotLaunchable(form: SweepForm, entries: readonly CatalogEntry[]): string | null {
+  if (form.entryIds.length === 0) return 'Choose at least one entry from the shelf.'
+  if (form.symbols.length === 0) return 'Choose at least one market.'
+  if (form.symbols.length > MAX_SWEEP_SYMBOLS) {
+    return `Choose at most ${String(MAX_SWEEP_SYMBOLS)} markets.`
+  }
+  if (form.timeframes.length === 0) return 'Choose at least one chart.'
+  if (form.dateFrom === '' || form.dateTo === '') return 'Choose a period.'
+  // ⚠️ `<=`, not `<`: the sweeps table refuses a window of zero duration with a CHECK, so a form
+  // that allowed it would trade a readable refusal here for a 422 after the click.
+  if (form.dateTo <= form.dateFrom) return 'The end of the period must be after its start.'
+  if (Number(form.initialCapital) <= 0) return 'Initial capital must be positive.'
+  const costs = costsProblem(form)
+  if (costs !== null) return costs
+
+  // ⚠️ Refused rather than waved through: the entry is gone from the shelf, so the launch would
+  // come back as a 404 after the click. Said here, where the reader can see which tick to undo.
+  //
+  // ⚠️ **The cap is not checked here, and an earlier draft did.** It capped this count, which is
+  // gross — every combination, including the ones the DSL refuses — while the server caps the
+  // net count, what would actually be enqueued. 3100 combinations with 200 refused is 2900 runs:
+  // the server starts that sweep and the old form refused it. Only the preview knows the net
+  // number, and its sentence already blocks the button.
+  if (runCount(form, entries) === null) return 'An entry you chose is no longer on the shelf.'
+  return null
+}
+
+/**
+ * The question to ask the preview, or null when there is not enough of a form to ask about.
+ *
+ * ⚠️ **The window is in the question.** Coverage is per (symbol, timeframe), so the dates decide
+ * whether a run can happen at all and not merely how much history it reads — which is why this
+ * returns null until they are filled in rather than asking about an open-ended window.
+ */
+export function toPreviewRequest(form: SweepForm): PreviewSweepRequest | null {
+  if (form.entryIds.length === 0 || form.symbols.length === 0) return null
+  if (form.timeframes.length === 0) return null
+  if (form.dateFrom === '' || form.dateTo === '' || form.dateTo <= form.dateFrom) return null
+  return {
+    entry_ids: [...form.entryIds],
+    symbols: [...form.symbols],
+    timeframes: [...form.timeframes],
+    date_from: new Date(form.dateFrom).toISOString(),
+    date_to: new Date(form.dateTo).toISOString(),
+  }
+}
+
+/**
+ * The request body, from a form `whyNotLaunchable` has already approved.
+ *
+ * One cost model for the whole sweep, like a study and for the same reason: points measured
+ * under different costs are not comparable to each other, and comparing them is the only reason
+ * to run them together.
+ */
+export function toSweepRequest(form: SweepForm, collectMissing = false): CreateSweepRequest {
+  return {
+    entry_ids: [...form.entryIds],
+    symbols: [...form.symbols],
+    timeframes: [...form.timeframes],
+    date_from: new Date(form.dateFrom).toISOString(),
+    date_to: new Date(form.dateTo).toISOString(),
+    initial_capital: form.initialCapital,
+    cost_model: isCostless(form)
+      ? { type: 'none' }
+      : {
+          type: 'per_market',
+          markets: Object.fromEntries(
+            form.symbols.map((symbol) => {
+              const { spread, commission, swapLong, swapShort } = costsOf(form, symbol)
+              const swapped = swapLong.trim() !== '' || swapShort.trim() !== ''
+              return [
+                symbol,
+                {
+                  spread_points: spread.trim(),
+                  commission_per_unit: commission.trim() === '' ? '0' : commission.trim(),
+                  ...(swapped
+                    ? {
+                        swap_long_per_lot: swapLong.trim() === '' ? '0' : swapLong.trim(),
+                        swap_short_per_lot: swapShort.trim() === '' ? '0' : swapShort.trim(),
+                      }
+                    : {}),
+                },
+              ]
+            }),
+          ),
+        },
+    collect_missing: collectMissing,
+    ...(form.keepAllTrades ? { keep_all_trades: true } : {}),
+  }
+}
+
+/**
+ * What to tell the reader when the server refuses a sweep.
+ *
+ * The unpacking lives in `api/failure.ts`, shared with every other screen that writes: the reason
+ * is in `detail`, never in `ApiError.message`, and there are three shapes of it.
+ */
+export function launchFailure(error: unknown): string {
+  return apiFailure(error, 'The sweep was refused. Check the entries, markets and window.')
+}

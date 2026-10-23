@@ -6,19 +6,32 @@ can a decision made on candle N ever be executed with information from candle N?
 """
 
 import datetime as dt
+from collections.abc import Sequence
 from decimal import Decimal
 
 import pytest
 
-from tradeforge_engine.domain import Candle, OrderRequest, OrderResult, Position, Side, SignalKind
+from tradeforge_engine.backtest_broker import BacktestBroker
+from tradeforge_engine.domain import (
+    Candle,
+    OrderRequest,
+    OrderResult,
+    Position,
+    Refusal,
+    RefusedBy,
+    Side,
+    Signal,
+    SignalKind,
+)
 from tradeforge_engine.errors import EngineError, LookaheadError
-from tradeforge_engine.loop import run
+from tradeforge_engine.loop import iter_run, run
 from tradeforge_engine.testing import (
     EURUSD,
     HOUR,
     FixedRisk,
     ImmediateFillBroker,
     ScriptedStrategy,
+    bar,
     close_out,
     entry,
     rising,
@@ -378,3 +391,486 @@ def _an_order() -> OrderRequest:
         volume=Decimal(1),
         decided_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Orders that never reached the book, and the strategy being told so            #
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ **Why this section exists at all.** Between the strategy asking and the order resting
+# there are four gates, and every one of them used to be a `continue` next to a
+# `logger.debug`. A setup marks its armed order placed the instant it *emits* the signal
+# (`setups.py`), so each of those gates left the strategy holding an order that does not
+# exist anywhere — the ghost ADR-0023 measured at four of five hand-over points, arriving
+# through whichever door happened to be open. A log is not a channel; a strategy cannot read
+# one.
+
+
+_LOST_THE_NAME = (
+    "the refusal came back without the name of the order it refuses. `client_id` is the whole "
+    "correlation — a `Refusal` carries no `OrderRequest` — so a strategy cannot tell which of "
+    "its armed zones was turned away, and `StructurePhase` goes on holding the ghost."
+)
+
+
+def test_a_broker_refusal_reaches_the_strategy_on_the_next_bar() -> None:
+    """The gate the demo account walked into, in miniature.
+
+    ⚠️ **On the next bar, and it cannot be sooner.** The `Context` for bar N is built in step 2
+    and the refusal happens in step 4 — so delivering it on its own bar would mean building the
+    context after the decision it is meant to inform. That is the anti-lookahead rule read
+    backwards, and it is why `Context.refusals` is documented as one bar behind `Context.fills`
+    rather than as a delay somebody settled for.
+    """
+    broker = ImmediateFillBroker()
+    broker.refuse_with = "no room at the venue"
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=broker,
+        risk=FixedRisk(),
+    )
+
+    assert broker.refused, "nothing was refused; this test proved nothing"
+    assert not broker.submitted, "the order reached the book after all"
+
+    assert strategy.refusals_seen[2] == (), "the refusal was delivered on its own bar"
+    [refusal] = strategy.refusals_seen[3]
+    assert refusal.refused_by is RefusedBy.BROKER
+    assert refusal.detail == "no room at the venue", "the broker's own words were dropped"
+    assert refusal.intent is SignalKind.ENTRY
+    assert refusal.client_id == "zone-7", _LOST_THE_NAME
+
+
+def test_a_risk_veto_reaches_the_strategy_too() -> None:
+    """⚠️ **This is the door ADR-0023 measured, and it was closed by removing the veto rather
+    than by fixing the feedback.** The veto is still there in every ordinary session — this is
+    the channel it should always have had."""
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+    risk = FixedRisk(allow_all=False)
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=ImmediateFillBroker(),
+        risk=risk,
+    )
+
+    assert risk.vetoed, "nothing was vetoed; this test proved nothing"
+    [refusal] = strategy.refusals_seen[3]
+    assert refusal.refused_by is RefusedBy.RISK
+    assert refusal.client_id == "zone-7", _LOST_THE_NAME
+
+
+def test_an_order_sized_at_zero_is_a_refusal_not_a_silence() -> None:
+    """A size of zero is the risk manager saying "not this trade", and it used to be
+    indistinguishable from a strategy that decided nothing at all."""
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=ImmediateFillBroker(),
+        risk=FixedRisk(volume=Decimal(0)),
+    )
+
+    [refusal] = strategy.refusals_seen[3]
+    assert refusal.refused_by is RefusedBy.SIZING
+    assert "0" in refusal.detail, "the size that was refused is not in the message"
+    assert refusal.client_id == "zone-7", _LOST_THE_NAME
+
+
+def test_closing_a_position_that_is_not_there_is_a_refusal() -> None:
+    """The ghost read from the other side: a strategy asking to close what it does not hold has
+    already come apart from the broker, and that is worth telling it."""
+    strategy = ScriptedStrategy(script={2: [close_out(client_id="flatten-1")]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=ImmediateFillBroker(),
+        risk=FixedRisk(),
+    )
+
+    [refusal] = strategy.refusals_seen[3]
+    assert refusal.refused_by is RefusedBy.NO_POSITION
+    assert refusal.intent is SignalKind.EXIT
+    assert refusal.client_id == "flatten-1", _LOST_THE_NAME
+
+
+def test_a_refusal_is_news_once_and_is_not_repeated() -> None:
+    """⚠️ **Accumulating instead of replacing is the mutant that matters here**, and it is not a
+    tidiness point. `StructurePhase` forgets its armed order when it sees a refusal naming it;
+    a refusal redelivered on a later bar would forget an order the phase had *successfully*
+    armed in the meantime — turning one refused order into an endless one.
+    """
+    broker = ImmediateFillBroker()
+    broker.refuse_with = "no"
+    strategy = ScriptedStrategy(script={2: [entry()]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(8),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=broker,
+        risk=FixedRisk(),
+    )
+
+    carrying = [index for index, seen in enumerate(strategy.refusals_seen) if seen]
+    assert carrying == [3], f"the refusal was shown on {carrying}, not only on the bar after it"
+
+
+def test_a_refusal_from_before_the_first_bar_is_shown_on_it() -> None:
+    """The hand-over's gap, at the loop's own level (PR-304-B-D-2b).
+
+    A session warms against one broker and trades against another, and an order can be refused
+    *between* the two loops — by a gate no `BarOutcome` will ever report, because no bar of this
+    stream was running when it happened. `iter_run(refusals=...)` is the only door that fact has.
+
+    ⚠️ **Both halves of the assertion are the test.** Shown on bar 0 rather than bar 1 is what
+    separates this from a loop that seeds `pending` after the first `_step`, which would look
+    identical in any scenario where the strategy is idle early. And gone by bar 1 is what
+    separates it from a seed that is never replaced: `StructurePhase` forgets its armed order on
+    a refusal naming it, so a hand-over refusal redelivered for ever would make the phase forget
+    every order it armed afterwards, one bar after arming it — the ghost, rebuilt by the cure.
+    """
+    inherited = Refusal(
+        client_id="zone-7",
+        intent=SignalKind.ENTRY,
+        refused_by=RefusedBy.BROKER,
+        reason="entry.choch",
+        detail="the hand-over could not place it",
+    )
+    strategy = ScriptedStrategy()
+
+    list(
+        iter_run(
+            timeframe=HOUR,
+            candles=rising(4),
+            instrument=EURUSD,
+            strategy=strategy,
+            broker=ImmediateFillBroker(),
+            risk=FixedRisk(),
+            refusals=(inherited,),
+        )
+    )
+
+    assert strategy.refusals_seen[0] == (inherited,), (
+        "the strategy was never shown what the hand-over could not carry"
+    )
+    carrying = [index for index, seen in enumerate(strategy.refusals_seen) if seen]
+    assert carrying == [0], f"the inherited refusal was shown on {carrying}, not only on bar 0"
+
+
+def test_an_inherited_refusal_is_not_reported_as_this_run_s_own() -> None:
+    """⚠️ It was refused before this stream began, so no bar of it produced this.
+
+    `BarOutcome.refusals` is documented as "orders **this bar** asked for", and `RunResult`
+    accumulates exactly those into the record that answers "why did this run take no trades?".
+    A seed folded in there would put a refusal in both halves of that answer — shown to the
+    strategy *and* claimed as this stream's own work — and the first consumer to add up a
+    session's bars would count it twice.
+
+    ⚠️ Nothing persists `outcome.refusals` today (`session.py`'s `_persist` writes fills and
+    trades), so this is a contract kept before it has a consumer rather than a bug prevented.
+    Said plainly because the reverse — a docstring naming a consequence that no code can
+    produce — is how the next reader stops looking.
+    """
+    inherited = Refusal(
+        client_id="zone-7",
+        intent=SignalKind.ENTRY,
+        refused_by=RefusedBy.BROKER,
+        reason="entry.choch",
+        detail="the hand-over could not place it",
+    )
+
+    outcomes = list(
+        iter_run(
+            timeframe=HOUR,
+            candles=rising(4),
+            instrument=EURUSD,
+            strategy=ScriptedStrategy(),
+            broker=ImmediateFillBroker(),
+            risk=FixedRisk(),
+            refusals=(inherited,),
+        )
+    )
+
+    assert [refusal for outcome in outcomes for refusal in outcome.refusals] == []
+
+
+def test_the_run_reports_what_it_refused() -> None:
+    """⚠️ Without this the refusal is visible to a strategy and to nobody else — and the person
+    asking "why did this backtest take no trades" is not a strategy. A run that placed nothing
+    used to look exactly like a run that decided nothing."""
+    broker = ImmediateFillBroker()
+    broker.refuse_with = "no"
+
+    outcomes = list(
+        iter_run(
+            timeframe=HOUR,
+            candles=rising(6),
+            instrument=EURUSD,
+            strategy=ScriptedStrategy(script={2: [entry()]}),
+            broker=broker,
+            risk=FixedRisk(),
+        )
+    )
+
+    reported = [
+        (outcome.index, refusal.refused_by) for outcome in outcomes for refusal in outcome.refusals
+    ]
+    assert reported == [(2, RefusedBy.BROKER)], (
+        "the refusal is reported on the bar that produced it, not the bar it was shown on"
+    )
+
+
+def test_a_backtest_can_say_why_it_took_no_trades() -> None:
+    """⚠️ **The question a run could not answer.** A backtest that placed nothing and one that
+    decided nothing both come back with an empty `fills`, and they mean opposite things about
+    the strategy — one found no setup, the other found setups and could not act on them.
+
+    Written because `BarOutcome.refusals` promised exactly this record and `run()` dropped it:
+    a docstring nobody can execute is how the next reader stops looking.
+    """
+    broker = ImmediateFillBroker()
+    broker.refuse_with = "no"
+
+    result = run(
+        timeframe=HOUR,
+        candles=rising(8),
+        instrument=EURUSD,
+        strategy=ScriptedStrategy(
+            script={2: [entry(client_id="zone-7")], 4: [entry(client_id="zone-9")]}
+        ),
+        broker=broker,
+        risk=FixedRisk(),
+    )
+
+    assert result.fills == (), "the fixture is broken: something reached the book"
+    assert [refusal.client_id for refusal in result.refusals] == ["zone-7", "zone-9"], (
+        "the run cannot say what it intended and did not place"
+    )
+
+
+def test_the_loop_asks_the_broker_for_refusals_that_arrived_out_of_band() -> None:
+    """**ADR-0024's half inside the engine.** Against a real venue the verdict on an order
+    arrives after `submit` already answered `accepted`, from another process — so the broker has
+    somewhere to put it and the loop has to come and get it.
+
+    ⚠️ **On every bar, including the silent ones**, and that is the whole of what this pins. A
+    refusal for the order submitted on bar N lands while the strategy is doing nothing on bar
+    N+1. A loop that only drained the broker on bars where its own gates turned something away
+    would hold that refusal until the *next* order was refused — which for a setup arming one
+    zone at a time is for ever.
+    """
+
+    class RefusesOutOfBand(ImmediateFillBroker):
+        """A venue's verdict, arriving a bar late — the shape `MT5Broker` really has."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.asked = 0
+            self._mailbox = [
+                Refusal(
+                    client_id="zone-7",
+                    intent=SignalKind.ENTRY,
+                    refused_by=RefusedBy.VENUE,
+                    reason="entry.test",
+                    detail="the venue would not take it (retcode 10027)",
+                )
+            ]
+
+        def refusals(self) -> Sequence[Refusal]:
+            self.asked += 1
+            drained, self._mailbox = self._mailbox, []
+            return tuple(drained)
+
+    broker = RefusesOutOfBand()
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+
+    run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=broker,
+        risk=FixedRisk(),
+    )
+
+    assert broker.asked == 6, f"the broker was asked on {broker.asked} of 6 bars"
+    carrying = [index for index, seen in enumerate(strategy.refusals_seen) if seen]
+    assert carrying == [1], (
+        f"the out-of-band refusal reached the strategy on {carrying}; it is delivered on the bar "
+        "after it was drained, like any other"
+    )
+    [refusal] = strategy.refusals_seen[1]
+    assert refusal.refused_by is RefusedBy.VENUE
+    assert refusal.client_id == "zone-7"
+
+
+def test_a_refusal_from_the_brokers_mailbox_reaches_the_runs_record() -> None:
+    """ADR-0025. Reaching the *strategy* was never the whole promise.
+
+    ⚠️ **This is the bug the 2025 census found, and the test above cannot see it.** The mailbox
+    was drained straight into the next bar's `Context`, so a strategy learned of the refusal and
+    `RunResult.refusals` — *"every order the run intended and did not place"*, and the field that
+    exists to answer "why did this take no trades?" — never held it. It was invisible for as
+    long as the only backtest broker returned the empty tuple; the day one started answering,
+    19 orders left the book across a year of AAPL and EURUSD and the run reported none.
+
+    Pinned on `BarOutcome` too, not only on the total: `run()` is an accumulator over outcomes,
+    so a mutant that reported the mailbox anywhere else would still leave a live session — which
+    consumes `iter_run` bar by bar and never builds a `RunResult` — with nothing to record.
+    """
+
+    class RefusesOutOfBand(ImmediateFillBroker):
+        def __init__(self) -> None:
+            super().__init__()
+            self._mailbox = [
+                Refusal(
+                    client_id="zone-7",
+                    intent=SignalKind.ENTRY,
+                    refused_by=RefusedBy.MARKET,
+                    reason="entry.test",
+                    detail="1.09200 gapped past its stop 1.09300",
+                )
+            ]
+
+        def refusals(self) -> Sequence[Refusal]:
+            drained, self._mailbox = self._mailbox, []
+            return tuple(drained)
+
+    outcomes = list(
+        iter_run(
+            timeframe=HOUR,
+            candles=rising(4),
+            instrument=EURUSD,
+            strategy=ScriptedStrategy(script={}),
+            broker=RefusesOutOfBand(),
+            risk=FixedRisk(),
+        )
+    )
+    carrying = [index for index, outcome in enumerate(outcomes) if outcome.refusals]
+    assert carrying == [1], (
+        f"the mailbox landed on outcomes {carrying}; it is drained after bar 0 and recorded on "
+        "the outcome of bar 1, which is also the bar it is delivered on"
+    )
+
+    result = run(
+        timeframe=HOUR,
+        candles=rising(4),
+        instrument=EURUSD,
+        strategy=ScriptedStrategy(script={}),
+        broker=RefusesOutOfBand(),
+        risk=FixedRisk(),
+    )
+    assert [refusal.refused_by for refusal in result.refusals] == [RefusedBy.MARKET], (
+        "the run finished reporting no refusals while an order had been ended by the market"
+    )
+
+
+def test_a_verdict_that_lands_during_submit_still_reaches_the_next_bar() -> None:
+    """⚠️ **The window every other test here misses, and it cost this PR a blocking review.**
+
+    `test_the_loop_asks_the_broker_for_refusals_that_arrived_out_of_band` fills the mailbox in
+    `__init__` — *before* the run — which is the one arrival window no drain point treats
+    differently. The window that matters is the one ADR-0024 actually measured: `submit`
+    answers `accepted` and the executor's verdict lands 8 ms later, which is **inside step 3 of
+    the same bar**. The first version drained at the top of `_step` and put the result on that
+    bar's outcome — from where `pending` carried it to the bar after — and every such refusal
+    arrived one bar late: fifteen minutes, in a live M15 session, of a phase believing in an
+    order the venue never took. Not the drain's position, its **routing**: what is drained has
+    to reach the very next `Context`.
+
+    Measured while this test did not exist: order sent on bar 2, seen on bar 3 by `develop`
+    and on bar **4** by that version. Nothing was red.
+    """
+
+    class RefusesDuringSubmit(ImmediateFillBroker):
+        """The verdict arrives while `submit` is still on the stack — the live shape."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._mailbox: list[Refusal] = []
+
+        def submit(self, order: OrderRequest) -> OrderResult:
+            result = super().submit(order)
+            self._mailbox.append(
+                Refusal(
+                    client_id=order.client_id,
+                    intent=SignalKind.ENTRY,
+                    refused_by=RefusedBy.VENUE,
+                    reason="entry.test",
+                    detail="the venue would not take it (retcode 10027)",
+                )
+            )
+            return result
+
+        def refusals(self) -> Sequence[Refusal]:
+            drained, self._mailbox = self._mailbox, []
+            return tuple(drained)
+
+    strategy = ScriptedStrategy(script={2: [entry(client_id="zone-7")]})
+    result = run(
+        timeframe=HOUR,
+        candles=rising(6),
+        instrument=EURUSD,
+        strategy=strategy,
+        broker=RefusesDuringSubmit(),
+        risk=FixedRisk(),
+    )
+
+    carrying = [index for index, seen in enumerate(strategy.refusals_seen) if seen]
+    assert carrying == [3], (
+        f"a verdict that landed during the submit on bar 2 reached the strategy on {carrying}; "
+        "it belongs on bar 3, the very next one"
+    )
+    assert [refusal.refused_by for refusal in result.refusals] == [RefusedBy.VENUE]
+
+
+def test_the_market_ends_a_resting_order_and_the_run_says_so_end_to_end() -> None:
+    """The whole path with the real broker in it, because the two tests above both use a fake.
+
+    ⚠️ **A fake that agrees with the right answer agrees with the wrong one too.** Everything
+    above pins the loop given a broker that reports; nothing yet pins that the broker in this
+    repo *does* report through a `run()`, which is the arrangement the census actually measured.
+    A buy limit at 1.09500 stopped at 1.09300, and a bar that opens at 1.09200 — through the
+    level and through the stop.
+    """
+    resting = Signal(
+        kind=SignalKind.ENTRY,
+        side=Side.LONG,
+        reference_price=Decimal("1.09750"),
+        stop_loss=Decimal("1.09300"),
+        limit_price=Decimal("1.09500"),
+        reason="entry.test",
+        client_id="zone-9",
+    )
+    result = run(
+        timeframe=HOUR,
+        candles=[
+            bar(0, open_="1.09800", close="1.09750", high="1.09850", low="1.09700"),
+            bar(1, open_="1.09200", close="1.09100", high="1.09250", low="1.09000"),
+            bar(2, open_="1.09150", close="1.09180", high="1.09200", low="1.09100"),
+        ],
+        instrument=EURUSD,
+        strategy=ScriptedStrategy(script={0: [resting]}),
+        broker=BacktestBroker(instrument=EURUSD, initial_capital=Decimal(10_000)),
+        risk=FixedRisk(),
+    )
+    assert result.trades == ()
+    [refusal] = result.refusals
+    assert refusal.refused_by is RefusedBy.MARKET
+    assert refusal.client_id == "zone-9"

@@ -1,0 +1,413 @@
+"""`POST /collections/plan` over HTTP, against a real Postgres.
+
+The arithmetic is proved in `test_collection_plan.py`. What only a database can prove is that the
+right facts reach it: each pair's own extent, each pair's own probe, and nothing written. Every
+window here lies well before today, so the real clock the route reads cannot move an answer.
+"""
+
+import datetime as dt
+from collections.abc import Callable, Iterator
+from decimal import Decimal
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from tradeforge_api.config import Settings
+from tradeforge_api.main import create_app
+from tradeforge_db.broker_symbols import BrokerSymbolEntry, replace_snapshot
+from tradeforge_db.brokers import broker_for_server
+from tradeforge_db.models import Collection, Dataset, Instrument
+from tradeforge_db.symbol_history import HistoryProbe, upsert_history
+from tradeforge_engine.domain import AssetClass
+
+from .collector_fakes import running
+
+pytestmark = pytest.mark.integration
+
+
+def at(year: int, month: int = 1, day: int = 1, hour: int = 0) -> dt.datetime:
+    return dt.datetime(year, month, day, hour, tzinfo=dt.UTC)
+
+
+def year_start(year: int) -> str:
+    return f"{year}-01-01T00:00:00Z"
+
+
+def year_end(year: int) -> str:
+    return f"{year}-12-31T23:59:59.999999Z"
+
+
+class _CapturingQueue:
+    def __init__(self) -> None:
+        self.jobs: list[str] = []
+
+    async def enqueue_job(self, function: str, *args: object, **options: object) -> object:
+        self.jobs.append(function)
+        return None
+
+
+@pytest.fixture
+def queue() -> _CapturingQueue:
+    return _CapturingQueue()
+
+
+@pytest.fixture
+def client(session_factory: Callable[[], Session], queue: _CapturingQueue) -> Iterator[TestClient]:
+    app: Any = create_app(
+        settings=Settings(), session_factory=session_factory, arq_pool=queue, collector=running()
+    )
+    with TestClient(app) as opened:
+        yield opened
+
+
+def on_disk(
+    session_factory: Callable[[], Session],
+    symbol: str,
+    timeframe: str,
+    date_from: dt.datetime,
+    date_to: dt.datetime,
+) -> None:
+    """Index one pair as collected. The Parquet path points at nothing: only the index is read."""
+    with session_factory() as session:
+        instrument = session.scalars(select(Instrument).where(Instrument.symbol == symbol)).first()
+        if instrument is None:
+            instrument = Instrument(
+                symbol=symbol,
+                name=symbol,
+                asset_class=AssetClass.FOREX,
+                currency_base=symbol[:3],
+                currency_quote=symbol[3:],
+                tick_size=Decimal("0.00001"),
+                tick_value=Decimal(1),
+                contract_size=Decimal(100000),
+                digits=5,
+            )
+            session.add(instrument)
+            session.flush()
+        session.add(
+            Dataset(
+                instrument_id=instrument.id,
+                timeframe=timeframe,
+                date_from=date_from,
+                date_to=date_to,
+                candle_count=1000,
+                parquet_path=f"{symbol}/{timeframe}",
+            )
+        )
+        session.commit()
+
+
+def probed(
+    session_factory: Callable[[], Session], symbol: str, timeframe: str, oldest: dt.datetime
+) -> None:
+    with session_factory() as session:
+        upsert_history(
+            session,
+            HistoryProbe(
+                symbol=symbol,
+                timeframe=timeframe,
+                oldest=oldest,
+                bar_count=1000,
+                terminal_maxbars=100000,
+                bar_count_is_a_ceiling=False,
+                last_fabricated=None,
+                first_measured_cost=None,
+            ),
+            probed_at=at(2026, 8, 20),
+        )
+        session.commit()
+
+
+def a_plan(client: TestClient, **fields: object) -> Any:
+    body: dict[str, object] = {
+        "symbols": ["EURUSD"],
+        "timeframes": ["H1"],
+        "date_from": "2019-06-01T00:00:00Z",
+        "date_to": "2021-06-30T00:00:00Z",
+    }
+    body.update(fields)
+    return client.post("/collections/plan", json=body)
+
+
+def test_a_symbol_never_collected_is_planned_whole(client: TestClient) -> None:
+    """Not in `instruments` at all — the case the plan exists for, not a 422."""
+    response = a_plan(client)
+    assert response.status_code == 200, response.text
+    assert response.json() == [
+        {
+            "symbol": "EURUSD",
+            "timeframe": "H1",
+            "covers": None,
+            "in_window": False,
+            "windows": [{"date_from": year_start(2019), "date_to": year_end(2021)}],
+            # No sync has ever run here: "I do not know", which is not "no".
+            "at_broker": None,
+            # And no download has finished here either: no estimate rather than a zero (22/09).
+            "time": None,
+        }
+    ]
+
+
+def test_a_covered_pair_is_left_out(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    on_disk(session_factory, "EURUSD", "H1", at(2018, 1, 2), at(2022, 12, 30))
+    response = a_plan(client)
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+
+
+def test_the_extent_is_read_per_timeframe(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    """EURUSD H1 is on disk and EURUSD H4 is not. A plan that looked the extent up by symbol
+    alone would call H4 covered."""
+    on_disk(session_factory, "EURUSD", "H1", at(2018, 1, 2), at(2022, 12, 30))
+    response = a_plan(client, timeframes=["H1", "H4"])
+    assert [(one["symbol"], one["timeframe"]) for one in response.json()] == [("EURUSD", "H4")]
+
+
+def test_the_extent_is_read_per_symbol(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    on_disk(session_factory, "EURUSD", "H1", at(2018, 1, 2), at(2022, 12, 30))
+    response = a_plan(client, symbols=["EURUSD", "GBPUSD"])
+    assert [(one["symbol"], one["timeframe"]) for one in response.json()] == [("GBPUSD", "H1")]
+
+
+def test_a_partly_covered_pair_says_what_it_holds_and_reaches_it(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    # On disk 2021-03-01 .. 2021-09-30; asked 2019-06 .. 2021-06 → 2019 .. 2021, one window.
+    on_disk(session_factory, "EURUSD", "H1", at(2021, 3), at(2021, 9, 30))
+    (planned,) = a_plan(client).json()
+    assert planned["covers"] == "2021-03-01 to 2021-09-30"
+    assert planned["windows"] == [{"date_from": year_start(2019), "date_to": year_end(2021)}]
+
+
+def test_the_probe_is_read_per_timeframe(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    """H1 and H4 both start on disk at the broker's H1 oldest bar, 2020-05-10; only H1 was
+    probed. H1 is complete — nothing older exists. H4 is planned from 2019, because nobody
+    asked the broker how far back H4 goes. A plan that read the probe by symbol alone would
+    leave H4 out."""
+    oldest = at(2020, 5, 10, 13)
+    for timeframe in ("H1", "H4"):
+        on_disk(session_factory, "BTCUSD", timeframe, oldest, at(2022, 12, 30))
+    probed(session_factory, "BTCUSD", "H1", oldest)
+
+    response = a_plan(client, symbols=["BTCUSD"], timeframes=["H1", "H4"])
+    assert response.json() == [
+        {
+            "symbol": "BTCUSD",
+            "timeframe": "H4",
+            "covers": "2020-05-10 to 2022-12-30",
+            "in_window": True,
+            "windows": [{"date_from": year_start(2019), "date_to": year_end(2020)}],
+            "at_broker": None,
+            "time": None,
+        }
+    ]
+
+
+def test_the_probe_is_read_per_symbol(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    oldest = at(2020, 5, 10, 13)
+    for symbol in ("BTCUSD", "ETHUSD"):
+        on_disk(session_factory, symbol, "H1", oldest, at(2022, 12, 30))
+    probed(session_factory, "BTCUSD", "H1", oldest)
+
+    response = a_plan(client, symbols=["BTCUSD", "ETHUSD"])
+    assert [one["symbol"] for one in response.json()] == ["ETHUSD"]
+
+
+def test_a_plan_writes_and_queues_nothing(
+    client: TestClient, session_factory: Callable[[], Session], queue: _CapturingQueue
+) -> None:
+    assert a_plan(client).status_code == 200
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Collection)) == 0
+    assert queue.jobs == []
+
+
+def test_the_windows_are_accepted_by_the_collection_endpoint_as_they_are(
+    client: TestClient, session_factory: Callable[[], Session]
+) -> None:
+    """The plan is only useful if its answer can be sent on unchanged."""
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [BrokerSymbolEntry(symbol="EURUSD", path="Forex\\Majors\\EURUSD")],
+            server="Tradeview-Demo",
+            synced_at=at(2026, 8, 20),
+        )
+        session.commit()
+    (planned,) = a_plan(client).json()
+    rows = [{"timeframe": planned["timeframe"], **window} for window in planned["windows"]]
+
+    response = client.post(
+        "/collections", json={"items": [{"symbol": planned["symbol"]}], "rows": rows}
+    )
+    assert response.status_code == 202, response.text
+    (row,) = response.json()
+    assert (row["date_from"], row["date_to"], row["years_total"]) == (
+        "2019-01-01T00:00:00Z",
+        "2021-12-31T23:59:59.999999Z",
+        3,
+    )
+
+
+@pytest.mark.parametrize(
+    ("fields", "complaint"),
+    [
+        ({"date_from": "2019-06-01T00:00:00"}, "timezone"),
+        ({"date_from": "2022-01-01T00:00:00Z"}, "before"),
+        ({"symbols": ["EURUSD", "EURUSD"]}, "repeated"),
+        ({"timeframes": ["H2"]}, "H2"),
+        ({"symbols": []}, "at least 1"),
+    ],
+)
+def test_a_malformed_request_is_refused(
+    client: TestClient, fields: dict[str, object], complaint: str
+) -> None:
+    response = a_plan(client, **fields)
+    assert response.status_code == 422
+    assert complaint in response.text
+
+
+class TestWhetherAnythingCanRunNow:
+    """⚠️ `covers` cannot answer this, and the screen must not guess from it: a pair collected
+    for 2019 under a window in 2024 has a `covers` string and not one candle to run over."""
+
+    def test_a_pair_with_candles_inside_the_window_can_run(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        # Asked 2019-06 .. 2021-06; on disk 2021-03 .. 2021-09 — the window's tail is covered.
+        on_disk(session_factory, "EURUSD", "H1", at(2021, 3), at(2021, 9, 30))
+        (planned,) = a_plan(client).json()
+        assert planned["in_window"] is True
+
+    def test_a_pair_collected_for_other_dates_cannot(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        on_disk(session_factory, "EURUSD", "H1", at(2015, 1, 5), at(2016, 12, 30))
+        (planned,) = a_plan(client).json()
+        assert planned["covers"] == "2015-01-05 to 2016-12-30"
+        assert planned["in_window"] is False
+
+    def test_a_pair_never_collected_cannot(self, client: TestClient) -> None:
+        (planned,) = a_plan(client).json()
+        assert (planned["covers"], planned["in_window"]) == (None, False)
+
+    def test_a_symbol_collected_at_another_chart_cannot(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        """⚠️ The shape that reached him on 17/09: EURUSD collected at M15 over the very window
+        asked about, and an H1 strategy. The instrument exists, the data exists, and the pair
+        asked about holds nothing — which is why this is asked per (symbol, timeframe)."""
+        on_disk(session_factory, "EURUSD", "M15", at(2018, 1, 2), at(2022, 12, 30))
+        (planned,) = a_plan(client).json()
+        assert (planned["timeframe"], planned["covers"], planned["in_window"]) == (
+            "H1",
+            None,
+            False,
+        )
+
+
+def synced(session_factory: Callable[[], Session], *symbols: str) -> None:
+    with session_factory() as session:
+        replace_snapshot(
+            session,
+            [BrokerSymbolEntry(symbol=symbol) for symbol in symbols],
+            server="Tradeview-Demo",
+            synced_at=at(2026, 9, 10),
+        )
+        session.commit()
+
+
+class TestWhetherTheBrokerHasIt:
+    """⚠️ Found on 18/09, in his first sweep with "collect": AAPL and US500 are catalogue seeds,
+    not symbols of this broker, and their downloads came back with "no bars anywhere". Three
+    answers, because an unsynced list is a question nobody has asked yet."""
+
+    def test_a_listed_symbol_is_at_the_broker(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        synced(session_factory, "EURUSD", "GBPUSD")
+        (planned,) = a_plan(client).json()
+        assert planned["at_broker"] is True
+
+    def test_a_symbol_the_synced_list_does_not_name_is_not(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        synced(session_factory, "GBPUSD", "SPXm")
+        (planned,) = a_plan(client, symbols=["EURUSD"]).json()
+        # Still planned, with its windows: the person is told it cannot be collected rather than
+        # finding it silently missing from the list.
+        assert planned["at_broker"] is False
+        assert planned["windows"] != []
+
+    def test_an_unsynced_list_is_not_an_answer(self, client: TestClient) -> None:
+        (planned,) = a_plan(client).json()
+        assert planned["at_broker"] is None
+
+    def test_each_symbol_is_answered_for_itself(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        synced(session_factory, "GBPUSD")
+        plan = a_plan(client, symbols=["EURUSD", "GBPUSD"]).json()
+        assert {one["symbol"]: one["at_broker"] for one in plan} == {
+            "EURUSD": False,
+            "GBPUSD": True,
+        }
+
+    def test_a_market_is_found_by_the_ticker_of_the_broker_it_came_from(
+        self, client: TestClient, session_factory: Callable[[], Session]
+    ) -> None:
+        """09/10: WIN and WDO are `WIN$` and `WDO$` at XP. Asked by name, a sweep over WIN on M5
+        skipped it as "not at the broker", and BIT went through only because a US fund called
+        BIT is on Tradeview's list."""
+        with session_factory() as session:
+            replace_snapshot(
+                session,
+                [BrokerSymbolEntry(symbol="WIN$"), BrokerSymbolEntry(symbol="BIT$")],
+                server="XPMT5-DEMO",
+                synced_at=at(2026, 10, 9),
+            )
+            replace_snapshot(
+                session,
+                [BrokerSymbolEntry(symbol="BIT"), BrokerSymbolEntry(symbol="EURUSD")],
+                server="Tradeview-Demo",
+                synced_at=at(2026, 10, 9),
+            )
+            xp = broker_for_server(session, "XPMT5-DEMO")
+            for symbol, ticker in (("WIN", "WIN$"), ("WDO", "WDO$")):
+                session.add(
+                    Instrument(
+                        symbol=symbol,
+                        name=symbol,
+                        asset_class=AssetClass.FUTURE,
+                        currency_quote="BRL",
+                        tick_size=Decimal(1),
+                        tick_value=Decimal("0.2"),
+                        contract_size=Decimal(1),
+                        digits=0,
+                        broker_id=xp.id,
+                        broker_symbol=ticker,
+                    )
+                )
+            session.commit()
+
+        plan = a_plan(client, symbols=["WIN", "WDO", "EURUSD", "NOPE"]).json()
+
+        assert {one["symbol"]: one["at_broker"] for one in plan} == {
+            "WIN": True,  # WIN$ at XP
+            "WDO": False,  # XP lists no WDO$ here
+            "EURUSD": True,  # never collected: asked by its name, on every list
+            "NOPE": False,
+        }

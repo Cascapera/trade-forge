@@ -13,13 +13,97 @@ the path production uses.
 """
 
 import datetime as dt
-from dataclasses import asdict
+import uuid
+from dataclasses import asdict, dataclass
+from decimal import Decimal
 
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import exists, func, select
+from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.orm import Session
 
+from tradeforge_db.brokers import refuse_another_broker
 from tradeforge_db.models import Dataset, Instrument
 from tradeforge_engine.domain import InstrumentSpec
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogueEntry:
+    """An `InstrumentSpec` plus what the catalogue knows and the engine deliberately does not.
+
+    The split is the point. `InstrumentSpec` is the engine's type — "a symbol and the numbers
+    that turn a price move into money" — and the engine's pricing genuinely does not need a
+    spread: under ADR-07 costs are plugged into a run as a `CostModel`, never read off the
+    instrument. Adding `default_spread_points` to that dataclass would have been one line
+    fewer here and an open invitation for a later change to have the engine read it directly,
+    which is precisely the coupling ADR-07 exists to prevent.
+
+    So the field lives on the catalogue's own type instead. The database stores it because it
+    is broker-quoted data like `tick_value`; the screen reads it to pre-fill a cost model; the
+    engine never sees it.
+
+    `default_spread_points` is in **ticks**, already converted from whatever unit the source
+    quoted it in, and `None` means nobody has measured this symbol — never zero, which would
+    claim the instrument is free to trade.
+    """
+
+    spec: InstrumentSpec
+    default_spread_points: Decimal | None = None
+    broker_symbol: str | None = None
+    """The broker's own ticker when it is not `spec.symbol`, the internal name (ADR-0032):
+    `WIN$` at XP is `WIN` here, because a `$` is no name for a folder or a URL."""
+    price_step: Decimal | None = None
+    """The step a price is quoted in at the venue when it is not the series' tick (14/10): 5 for
+    XP's `WIN$`, whose tick is 1. `None` — the tick is the step."""
+
+
+class ClockChangedError(ValueError):
+    """A symbol with collected data was offered a different broker clock (his rule of 01/10).
+
+    A `ValueError` on purpose: the collector's command line prints those as one `error:` line
+    rather than a traceback, and the agent puts the sentence on the collection's row.
+    """
+
+    def __init__(self, symbol: str, recorded: dt.timedelta, offered: dt.timedelta) -> None:
+        self.symbol = symbol
+        self.recorded = recorded
+        self.offered = offered
+        super().__init__(
+            f"{symbol} is recorded on a server clock of {_hours(recorded)} and already has "
+            f"collected data on it; this collection reads the clock as {_hours(offered)}. "
+            f"Mixing the two would leave its bars shifted by {_hours(offered - recorded)} "
+            f"from one collection to the next. Run it again with --server-offset "
+            f"{_hours(recorded, unit='')} (the recorded clock; for the agent, "
+            f"TRADEFORGE_SERVER_OFFSET={_hours(recorded, unit='')}) — or, if the recorded one "
+            f"is wrong, remove {symbol}'s datasets and collect them all again"
+        )
+
+
+def _hours(offset: dt.timedelta, *, unit: str = " h") -> str:
+    """`+3 h`, `-2.5 h` — the way `--server-offset` is typed, so the hint can be copied."""
+    return f"{offset / dt.timedelta(hours=1):+g}{unit}"
+
+
+def refuse_a_new_clock(session: Session, spec: InstrumentSpec) -> None:
+    """Raise `ClockChangedError` if `spec` moves the clock of a symbol that already has data.
+
+    ⚠️ **The clock is part of every bar already on disk** (30/09): the collector turns the
+    broker's server time into UTC with it, so a dataset collected at +3 h and topped up at +2 h
+    holds bars shifted two ways, and the instrument would name only the last. A symbol with no
+    dataset yet has nothing to contradict, and may change its clock freely — that is how a
+    wrong first guess is corrected.
+
+    Public so a collector can ask **before** it writes Parquet, and not only when it catalogues:
+    by then the shifted bars are on disk.
+    """
+    recorded = session.execute(
+        select(Instrument.server_offset).where(
+            Instrument.symbol == spec.symbol,
+            exists().where(Dataset.instrument_id == Instrument.id),
+        )
+    ).scalar_one_or_none()
+    if recorded is not None and recorded != spec.server_offset:
+        raise ClockChangedError(spec.symbol, recorded, spec.server_offset)
+
 
 # Everything except the natural key. Re-running a backfill after a broker changes a
 # contract size must update the row, not silently keep the stale number that every
@@ -34,26 +118,149 @@ _INSTRUMENT_UPDATABLE = (
     "tick_value",
     "contract_size",
     "digits",
+    "default_spread_points",
+    "server_offset",
 )
 
 
-def upsert_instruments(session: Session, specs: tuple[InstrumentSpec, ...]) -> int:
-    """Insert the instruments, updating any symbol that already exists.
+def upsert_instruments(
+    session: Session,
+    entries: tuple[CatalogueEntry | InstrumentSpec, ...],
+    *,
+    overwrite: bool = True,
+    broker_id: uuid.UUID | None = None,
+) -> int:
+    """Insert the instruments. Returns how many rows the database actually wrote.
 
-    Idempotent: running it twice leaves the same rows. Returns how many were written.
+    Idempotent either way: running it twice leaves the same rows.
+
+    A bare `InstrumentSpec` is accepted as well as a `CatalogueEntry`, and means "this source
+    has nothing to say about the spread" — which writes NULL rather than zero. The seeds are
+    the reason: they are hand-written example instruments with no broker behind them, and
+    claiming a spread of zero for them would be inventing a measurement.
+
+    `overwrite` is what separates the two callers, and it exists because collapsing them cost
+    real data. The collector states the broker's truth and must win over whatever is there.
+    The seeds only guarantee the example symbols exist so a fresh machine has something to
+    run — but they went through the identical upsert, so `docker compose up` (which runs the
+    seed step every time) rewrote all ten updatable columns with placeholders.
+
+    That was invisible until PR-226 added `default_spread_points`, because the placeholder
+    specs were chosen to match what MT5 reports: rewriting `tick_size` with the same
+    `tick_size` changes nothing observable. The spread is the first column where the seeds
+    have nothing and the collector has something, so it is the first place the overwrite
+    could be seen — measured on 11-08-2026, a catalogued EURUSD 8 / GBPUSD 9 was back to
+    NULL within minutes, wiped by a stack restart.
+
+    ⚠️ The cost of `overwrite=False`: a corrected placeholder never reaches a database that
+    already has the row. Accepted, and the alternative is worse — a seed silently outranking
+    a measurement is how the data was lost in the first place, and the broker is the
+    authority on every one of these columns anyway.
+
+    ⚠️ **Every column but one.** `server_offset` is not overwritten on a symbol that already has
+    a dataset: `ClockChangedError` is raised instead, before anything is written (01/10,
+    `refuse_a_new_clock`). The broker's clock is a fact about the bars on disk, not only about
+    the symbol.
+
+    `broker_id`, when given, ties the rows to that broker with the symbol as its ticker
+    (ADR-0032), and `BrokerChangedError` refuses a symbol another broker already owns. Without it
+    — the seeds — the rows keep whatever broker they had.
     """
-    if not specs:
+    if not entries:
         return 0
+    if overwrite:
+        for entry in entries:
+            spec = entry.spec if isinstance(entry, CatalogueEntry) else entry
+            refuse_a_new_clock(session, spec)
+            if broker_id is not None:
+                refuse_another_broker(session, spec.symbol, broker_id)
 
-    rows = [asdict(spec) for spec in specs]
+    rows = [
+        {
+            **asdict(entry.spec if isinstance(entry, CatalogueEntry) else entry),
+            "default_spread_points": (
+                entry.default_spread_points if isinstance(entry, CatalogueEntry) else None
+            ),
+            "price_step": entry.price_step if isinstance(entry, CatalogueEntry) else None,
+            **(
+                {}
+                if broker_id is None
+                else {
+                    "broker_id": broker_id,
+                    "broker_symbol": (
+                        entry.broker_symbol or entry.spec.symbol
+                        if isinstance(entry, CatalogueEntry)
+                        else entry.symbol
+                    ),
+                }
+            ),
+        }
+        for entry in entries
+    ]
 
     statement = insert(Instrument).values(rows)
+    if not overwrite:
+        statement = statement.on_conflict_do_nothing(index_elements=[Instrument.symbol])
+        return _written(session, statement)
+
     statement = statement.on_conflict_do_update(
         index_elements=[Instrument.symbol],
-        set_={column: statement.excluded[column] for column in _INSTRUMENT_UPDATABLE},
+        set_={
+            **{
+                column: statement.excluded[column]
+                for column in _INSTRUMENT_UPDATABLE
+                if column != "default_spread_points"
+            },
+            # ⚠️ **A reading with no spread keeps the one measured** (14/10). An empty reading
+            # used to overwrite it, on the reasoning that a broker which stopped quoting has
+            # stopped. But the source answers `None` far more often for other reasons — the
+            # market is shut (its closing spread is refused), the series has no book (XP's
+            # `WIN$`) — and each of those wiped a measurement: any collection run after hours
+            # emptied the catalogue's spreads, and a replay that charges them then refuses the
+            # market. A new measurement still replaces the old one.
+            "default_spread_points": func.coalesce(
+                statement.excluded.default_spread_points, Instrument.default_spread_points
+            ),
+            # The same rule: a source that cannot say (any but MT5) keeps what one that could said.
+            "price_step": func.coalesce(statement.excluded.price_step, Instrument.price_step),
+            **(
+                {}
+                if broker_id is None
+                else {
+                    column: statement.excluded[column] for column in ("broker_id", "broker_symbol")
+                }
+            ),
+            # Stamped here rather than left to the column's `onupdate`, which does not fire:
+            # that hook belongs to the ORM's UPDATE, and this is a Core ON CONFLICT whose SET
+            # clause is used exactly as written. Absent from it, the stamp keeps the value the
+            # row was first inserted with — so the catalogue would carry a fresh spread under
+            # a stale date, which reads as a measurement and is not one.
+            #
+            # `func.now()` and not the process clock: the writer here is the collector on a
+            # Windows host and the row lives in a container, two clocks that need not agree.
+            # `models._created_at` states the rule — the database's clock is the shared one.
+            # (The sibling `upsert_dataset` stamps `collected_at` from Python; same defect,
+            # smaller blast radius, noted in `specs/backlog.md`.)
+            #
+            # Postgres evaluates `now()` at transaction start, so every symbol in one
+            # `catalogue` call shares a stamp. That is the honest reading: they were read
+            # from the terminal in one pass.
+            "updated_at": func.now(),
+        },
     )
-    session.execute(statement)
-    return len(rows)
+    return _written(session, statement)
+
+
+def _written(session: Session, statement: Insert) -> int:
+    """Run the upsert and count the rows the database actually wrote.
+
+    `len(rows)` would be the count of rows *offered*, which under `DO UPDATE` happens to be
+    the same number and under `DO NOTHING` is not: re-seeding a populated catalogue writes
+    nothing and would still have reported four. `tradeforge-db seed` prints this straight to
+    the migrate log, so the wrong number is not an internal detail — it is the line an
+    operator reads to find out what a deploy did.
+    """
+    return len(session.execute(statement.returning(Instrument.symbol)).all())
 
 
 def upsert_dataset(  # noqa: PLR0913 — keyword-only; these are simply the columns of the row

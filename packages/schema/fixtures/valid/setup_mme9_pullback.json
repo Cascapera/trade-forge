@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "name": "9.3 — duas correcoes contra a ancora",
+  "description": "MME9 subindo, ancora no maior fechamento da perna, dois fechamentos abaixo dela e compra no rompimento da maxima do ultimo, com stop sob a minima da correcao inteira.",
+  "timeframe": "H1",
+  "setup": {
+    "type": "mme9_pullback",
+    "params": {
+      "side": "long",
+      "corrections": 2,
+      "period": 9,
+      "stop_buffer_ticks": 0,
+      "breakeven_at_r": null
+    }
+  },
+  "risk": {
+    "sizing": { "type": "percent_risk", "params": { "percent": 1 } }
+  }
+}

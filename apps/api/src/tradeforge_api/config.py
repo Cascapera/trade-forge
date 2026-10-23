@@ -12,6 +12,7 @@ wrong database.
 
 from pathlib import Path
 
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tradeforge_db.config import PostgresSettings
@@ -50,3 +51,36 @@ class Settings(PostgresSettings, RedisConfig):
     # `--data-dir` (`data/ohlcv`) so a fresh clone's backfill and backtest line up with no
     # configuration. Env-driven (`PARQUET_ROOT`) so dev, CI and prod each point their own.
     parquet_root: Path = Path("data/ohlcv")
+
+    # How many backtest workers compose runs (`TRADEFORGE_WORKERS`, 23/09). One worker is one core:
+    # a backtest is synchronous CPU, so a worker runs one at a time and more speed comes only from
+    # more processes. Read here so the time estimates can divide by it — the same variable sets the
+    # worker's replicas in docker-compose.yml, so the two cannot disagree.
+    tradeforge_workers: int = Field(default=1, ge=1)
+
+    # Where the signals are posted (signals PR 6). Secrets: `.env` only, never the database or
+    # the repository, and `SecretStr` so no log or repr prints them. Empty: not this network.
+    discord_webhook_url: SecretStr = SecretStr("")
+    telegram_bot_token: SecretStr = SecretStr("")
+    telegram_chat_id: str = ""
+
+    # Whether a sweep's launch cuts its runs into batches (ADR-0029, `batching`). ⚠️ Off while any
+    # machine's workers predate `run_backtest_batch`: such a worker fails a batch job it takes and
+    # drops it, leaving its runs queued for good. Read by the launch, never by the worker.
+    tradeforge_batch: bool = True
+
+    # A sweep's run whose measurement was already made under this engine is copied instead of run
+    # (`reuse`, 28/09). Off makes every run run — to check the engine against its own past, or on
+    # a machine whose results are not to be trusted as originals. Read by the worker.
+    tradeforge_reuse: bool = True
+
+    # How many distinct days of paper trading a strategy must have on record before a live
+    # session is allowed. **Policy, not invariant** — the database refuses a strategy that has
+    # never completed a bar in paper at all (rev_0016), and that floor is not negotiable; this
+    # number is, and `specs/fase-3.md` calls it configurable for exactly that reason.
+    #
+    # ⚠️ Five *trading* days, counted as distinct UTC dates on which a paper session processed a
+    # bar — not five sessions and not a hundred and twenty hours. A strategy restarted six times
+    # on a Tuesday has one day of evidence, and a calendar week that included a bank holiday is
+    # not four days of market.
+    live_promotion_days: int = 5

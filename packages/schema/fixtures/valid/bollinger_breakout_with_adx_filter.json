@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0",
+  "name": "Rompimento de banda com filtro de ADX",
+  "description": "Compra quando o preço fecha acima da banda superior de Bollinger, desde que exista tendência de verdade (ADX acima de 25) e que ela seja de alta (+DI acima de -DI). Sai quando o preço volta para a média da banda",
+  "timeframe": "H1",
+  "indicators": [
+    { "id": "bb", "type": "BOLLINGER", "params": { "period": 20, "deviations": 2.0 } },
+    { "id": "forca", "type": "ADX", "params": { "period": 14 } }
+  ],
+  "entry": {
+    "long": {
+      "all": [
+        {
+          "op": "crosses_above",
+          "left": { "ref": "price.close" },
+          "right": { "ref": "bb.upper" }
+        },
+        { "op": "gt", "left": { "ref": "forca.adx" }, "right": { "value": 25 } },
+        {
+          "op": "gt",
+          "left": { "ref": "forca.plus_di" },
+          "right": { "ref": "forca.minus_di" }
+        }
+      ]
+    },
+    "short": null
+  },
+  "exit": {
+    "stop_loss": { "type": "candle_extreme", "params": { "lookback": 3, "side": "low" } },
+    "take_profit": { "type": "risk_multiple", "params": { "rr": 2.0 } },
+    "conditions": [
+      {
+        "op": "crosses_below",
+        "left": { "ref": "price.close" },
+        "right": { "ref": "bb.middle" }
+      }
+    ]
+  },
+  "risk": { "sizing": { "type": "percent_risk", "params": { "percent": 1.0 } } }
+}

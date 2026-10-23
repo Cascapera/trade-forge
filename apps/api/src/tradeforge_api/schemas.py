@@ -15,13 +15,100 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Sequence
 from decimal import Decimal
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
+from pydantic import (
+    AfterValidator,
+    AliasChoices,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    ValidationInfo,
+    computed_field,
+    field_validator,
+    model_validator,
+)
+
+from tradeforge_api.best import BestMetric
+from tradeforge_api.holdout import HoldoutRank
+from tradeforge_api.montecarlo import MAX_BLOCK_TRADES, MIN_BLOCK_TRADES
+from tradeforge_api.sweep_dataset import Role
+from tradeforge_api.walkforward import MAX_FOLDS, MIN_FOLDS
+from tradeforge_collector.classify import asset_class_from_path
+from tradeforge_db.live_sessions import is_stale, silence
+from tradeforge_db.models import LiveSession, SelectionMetric, SliceMode
+from tradeforge_engine.domain import AssetClass
+from tradeforge_schema.models import TIMEFRAMES
 
 # A Decimal that always serialises to a string. Applied to every monetary/ratio field below.
 Money = Annotated[Decimal, PlainSerializer(str, return_type=str)]
+
+
+def _storable(value: str) -> str:
+    """Refuse a string Postgres cannot hold, which is exactly one character: NUL.
+
+    ⚠️ Not a guess at what a symbol looks like. Broker symbols are genuinely strange —
+    `EURUSD.raw`, `#AAPL`, `US500.cash` — so a pattern invented here would refuse real
+    instruments to catch a fuzzer. The **one** constraint that is a fact rather than a taste is
+    that a text column cannot store a NUL byte: Postgres raises `DataError` from inside the
+    driver, and a value a client fully controls turns into a 500.
+
+    Found by schemathesis drawing `?symbol=%00` for the first time, on a route that had been
+    green for weeks — the same way the `offset` bigint overflow was found. Both are the same
+    shape: a parameter whose whole range was never actually tried.
+    """
+    # `chr(0)` rather than the escape, so nothing that edits this file can turn the escape into
+    # an actual NUL — which is precisely what happened while writing it, and Python then refuses
+    # to parse its own source.
+    if chr(0) in value:
+        raise ValueError("must not contain a NUL byte")
+    return value
+
+
+def _known_timeframe(value: str) -> str:
+    """Refuse a timeframe the DSL does not define.
+
+    ⚠️ Checked against `tradeforge_schema.TIMEFRAMES` rather than a list retyped here — the DSL
+    owns the set, and a second copy is a copy that disagrees the first time one is added.
+
+    Worth validating at the edge rather than letting the lookup miss: an unknown timeframe would
+    otherwise come back as a 404 saying the series has not been probed, which sends somebody to
+    press a probe button for a timeframe that cannot exist. 422 says which of the two is wrong.
+    """
+    _storable(value)
+    if value not in TIMEFRAMES:
+        legal = ", ".join(TIMEFRAMES)
+        raise ValueError(f"unknown timeframe {value!r}; expected one of {legal}")
+    return value
+
+
+Timeframe = Annotated[str, AfterValidator(_known_timeframe)]
+"""A timeframe as it arrives from a client, refused unless the DSL defines it."""
+
+Symbol = Annotated[str, AfterValidator(_storable)]
+"""An instrument symbol as it arrives from a client, refused only where the database would."""
+
+AwareInstant = AwareDatetime
+"""A launch window's edge, refused with a 422 unless it carries a timezone.
+
+⚠️ **Required since the launches ask the `datasets` index** (PR-262). A naive instant cannot be
+compared with that index's `timestamptz`, so the check raised and the API answered 500 where,
+before the check existed, the same body got a 202. `CollectionRow` refuses the same thing.
+"""
+
+StorableText = Annotated[str, AfterValidator(_storable)]
+"""Any free text from a client that reaches a query against a text column.
+
+⚠️ **The same validator as `Symbol`, named for the reason rather than for the field.** When
+`Symbol` was introduced the guard travelled with the one parameter the fuzzer had drawn a NUL
+into, and its three siblings — `?q=`, `?name=`, `?timeframe=` — kept the plain `str` and kept
+the 500. A rule attached to one field is a rule the next field does not inherit; naming it for
+what it protects is what makes the next one obvious.
+"""
 
 
 class _Out(BaseModel):
@@ -42,6 +129,46 @@ class StrategyOut(_Out):
     created_at: dt.datetime
 
 
+class StrategyListItem(_Out):
+    """One row of the strategy picker: enough to choose between lineages without opening any.
+
+    Deliberately **not** `StrategyOut`, which carries the whole DSL document. A picker renders
+    forty-five of these and reads none of the documents; shipping them would send megabytes of
+    JSONB to draw a list of names.
+
+    `runs` is here because it is what tells a real strategy from an experiment somebody typed
+    once and abandoned — the reader scanning this list is looking for the one they have been
+    working on, and how often it has been executed says that better than a date does.
+    """
+
+    id: uuid.UUID
+    name: str
+    version: int
+    """The **latest** version of this lineage; the id above is that version's row."""
+
+    schema_version: str
+    setup: str | None
+    """The named setup this strategy runs (`mme9_breakout`, `structure_choch`), or null for a
+    DSL document built from indicators and conditions. It is what a reader recognises a
+    strategy by, and every strategy in this project's database has one."""
+
+    runs: int
+    catalog: list[str] = Field(default_factory=list)
+    """The catalogue's labels for this lineage (29/09), alphabetically — the names a person gave
+    it. The document behind "CHOCH COMPLETO" is called `SCHOCH-20260922-222429`, and a picker that
+    showed only that was a picker in which the base CHoCH could not be found."""
+    created_at: dt.datetime
+
+
+class StrategiesPage(BaseModel):
+    """A page of lineages. `total` lets a client size the pager without walking every page."""
+
+    total: int
+    limit: int
+    offset: int
+    items: list[StrategyListItem]
+
+
 class InstrumentOut(_Out):
     """A tradable symbol and the numbers that price a position in it."""
 
@@ -55,6 +182,200 @@ class InstrumentOut(_Out):
     tick_value: Money
     contract_size: Money
     digits: int
+    # The broker's quoted spread in ticks, for a client to pre-fill a run's cost model with.
+    # Null means nobody has measured this symbol — a seeded row, or one catalogued before the
+    # collector recorded it — and a client must say so rather than charging zero, which is a
+    # claim that trading it is free. The engine never reads this: costs reach a run as a
+    # plugged-in `CostModel` (ADR-07), and this only decides what the screen offers first.
+    default_spread_points: Money | None = None
+    # Where it is collected from (ADR-0032): the broker's slug and its own ticker, which may
+    # differ from `symbol` — the internal name — when two brokers use the same ticker. Both null
+    # for a row no broker catalogued (a seed).
+    broker: str | None = None
+    broker_symbol: str | None = None
+
+
+class BrokerSymbolOut(_Out):
+    """One line of the broker's own catalogue, as MetaTrader last described it.
+
+    ⚠️ Not an `InstrumentOut`, and it deliberately carries none of the pricing numbers. This is
+    a symbol the account *can see*; whether this system knows how to turn a tick of it into
+    money is a separate question, answered by `instruments`, and a symbol can be in this list
+    for a long time before anyone collects a candle of it.
+    """
+
+    symbol: str
+    description: str | None = None
+    path: str | None = None
+    digits: int | None = None
+    # Whether the symbol sits in Market Watch. For display only — measured on this project's
+    # broker, 74 of 84 symbols are outside it and every one still answers a search and hands
+    # over history. Only the live loop has to care.
+    visible: bool = False
+
+    # ⚠️ Whether this system has an `Instrument` row for the symbol, which is what a backtest
+    # needs. Without it the screen would offer 84 symbols of which one can be run, and the user
+    # would find out which by clicking. Not a claim that candles exist for any particular range
+    # — only that the symbol has been catalogued at all.
+    catalogued: bool = False
+    # The broker whose terminal lists it (ADR-0032): two brokers can list the same ticker, and
+    # the screen says whose this one is. Null for a server nobody registered.
+    broker: str | None = None
+    name: str | None = None
+    """The system's name for it once collected from this broker — `WIN` for `WIN$` (ADR-0032).
+    What a launch screen chooses; the collect screen keeps `symbol`, the terminal's ticker."""
+
+    # ⚠️ `prop-decorator` is a mypy limitation, not a defect being silenced: mypy does not
+    # support any decorator stacked on top of `@property`, and this is the workaround Pydantic's
+    # own documentation prescribes for `computed_field`. Narrowed to that one code so a real
+    # typing error in this method would still fail the gate.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def asset_class_from_path(self) -> AssetClass | None:
+        """The class the broker's own filing decides, or `None` when it decides nothing.
+
+        ⚠️ **Derived here so the rule lives in one language.** `POST /collections` refuses a
+        symbol it cannot classify, and the screen has to know *which* of the twenty a person
+        must answer for — before sending anything. The alternative was reimplementing
+        `classify.asset_class_from_path` in TypeScript, and the two copies would disagree the
+        first time the broker files something under a new root: the screen would offer the
+        symbol and the API would refuse it, with nothing on either side explaining why.
+
+        ⚠️ **Computed, never stored.** Writing it into `broker_symbols` would duplicate a
+        derivation, and the copy would go stale the moment a sync refiles a symbol — leaving a
+        column that disagrees with the `path` sitting beside it. `Collection.asset_class` stays
+        the place a value is *recorded*, and it means something different there: a person
+        decided it. NULL in that column means the path did; this field is that path speaking.
+
+        The `classify` import reaches into `apps/collector`, which this app already depends on
+        for the Parquet reader and already imports the same way in `routers/collections`. Safe
+        on Linux because `classify` holds no MetaTrader import — which is why it is its own
+        module rather than living beside `MT5Source`, whose first docstring line says it is
+        never imported here.
+        """
+        return asset_class_from_path(self.path or "")
+
+
+class SymbolSnapshotOut(_Out):
+    """Where the symbol list came from, and when.
+
+    ⚠️ Named for the symbols and not just "snapshot", because this project already has a
+    `SnapshotOut`: the record of what a strategy was looking at when it entered a trade. Two
+    unrelated meanings under one name in one module is how a reader ends up reading the wrong
+    docstring and believing it.
+    """
+
+    server: str | None = None
+    synced_at: dt.datetime
+
+
+class SymbolSearchOut(BaseModel):
+    """Search results, plus the provenance of the list they came from.
+
+    ⚠️ **`snapshot` is nullable so that "no match" and "no catalogue" stay distinguishable.**
+    Both produce an empty `symbols`, and they are opposite problems: one means type fewer
+    letters, the other means nobody has ever synced this broker. A response that flattened them
+    would have the screen tell a user with no catalogue that their search found nothing —
+    technically true, and the least useful true sentence available.
+    """
+
+    symbols: list[BrokerSymbolOut]
+    snapshot: SymbolSnapshotOut | None = None
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        symbols: Sequence[object],
+        server: str | None,
+        synced_at: dt.datetime | None,
+    ) -> SymbolSearchOut:
+        """Assemble from ORM rows and the snapshot's own two fields."""
+        return cls(
+            symbols=[BrokerSymbolOut.model_validate(row) for row in symbols],
+            snapshot=(
+                None if synced_at is None else SymbolSnapshotOut(server=server, synced_at=synced_at)
+            ),
+        )
+
+
+class SymbolHistoryOut(_Out):
+    """What a probe found about one series, and what bounded the answer.
+
+    ⚠️ **Four fields where a screen wants one date, on purpose.** "Available from" would be four
+    different claims wearing one hat, and only one of them is ever the binding one — measured on
+    EURUSD D1, the terminal's ceiling, the filler and the typed costs give 1971, 1972 and 2009.
+    A reader fixes the first in a settings dialog, the second by starting later and the third by
+    not trusting old costs at all; a single date makes all three unavailable.
+
+    `usable_from` is offered *as well*, because deriving it in three clients is three chances to
+    derive it differently.
+    """
+
+    symbol: str
+    timeframe: str
+    oldest: dt.datetime | None = None
+    bar_count: int
+    terminal_maxbars: int
+    bar_count_is_a_ceiling: bool
+    last_fabricated: int | None = None
+    first_measured_cost: int | None = None
+    probed_at: dt.datetime
+
+    capped_by_terminal: bool = False
+    """The bar count is this machine's setting talking, not the broker's history."""
+
+    usable_from: dt.datetime | None = None
+    """The later of the two honest floors, never earlier than the data actually goes.
+
+    ⚠️ A **lower** bound on trust and nothing more. It cannot see a reconstruction that carries
+    plausible prices and volumes — EURUSD's own runs to 1999 and is invisible here — so a screen
+    rendering this owes the reader that caveat.
+    """
+
+    @classmethod
+    def build(cls, row: Any) -> SymbolHistoryOut:  # noqa: ANN401 — an ORM row, typed by the caller
+        """Assemble from a stored probe, deriving the two answers a screen would otherwise
+        derive for itself.
+
+        ⚠️ Derived **here** rather than in each client. Three clients deriving "usable from"
+        independently is three chances to disagree about which floor dominates, and the
+        disagreement would show up as two screens recommending different windows for the same
+        symbol.
+        """
+        after_filler = None if row.last_fabricated is None else row.last_fabricated + 1
+        years = [year for year in (after_filler, row.first_measured_cost) if year is not None]
+        if years:
+            floor = dt.datetime(max(years), 1, 1, tzinfo=dt.UTC)
+            usable = floor if row.oldest is None else max(floor, row.oldest)
+        else:
+            usable = row.oldest
+
+        return cls(
+            symbol=row.symbol,
+            timeframe=row.timeframe,
+            oldest=row.oldest,
+            bar_count=row.bar_count,
+            terminal_maxbars=row.terminal_maxbars,
+            bar_count_is_a_ceiling=row.bar_count_is_a_ceiling,
+            last_fabricated=row.last_fabricated,
+            first_measured_cost=row.first_measured_cost,
+            probed_at=row.probed_at,
+            capped_by_terminal=row.bar_count >= row.terminal_maxbars > 0,
+            usable_from=usable,
+        )
+
+
+class EnqueuedOut(BaseModel):
+    """A job was accepted for a worker that this process cannot see.
+
+    Carries the job's name and nothing else on purpose. There is no id worth returning: the
+    enqueue is idempotent by construction, so "your request is pending" is the whole truth, and
+    a handle would invite a caller to poll a job whose only observable result is the data it
+    replaces.
+    """
+
+    job: str
 
 
 class CreateBacktestRequest(BaseModel):
@@ -69,12 +390,25 @@ class CreateBacktestRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategy_id: uuid.UUID
-    symbol: str
+    symbol: Symbol
     timeframe: str
-    date_from: dt.datetime
-    date_to: dt.datetime
+    date_from: AwareInstant
+    date_to: AwareInstant
     initial_capital: Decimal = Field(gt=0)
     cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+    collect_missing: bool = True
+    """Collect what this window is missing, and run once it has landed.
+
+    ⚠️ **True unless said otherwise — his rule of 26/09**, which replaced "say what is missing
+    and ask" (17/09): every launch collects what it is missing by itself. The window is planned
+    (`coverage.plan_for`), the collections are queued, and the run waits for them. **With the host
+    agent off nothing is planned** (`collector.Collector`) and the run reads what is on disk, as
+    it does when a download fails. False — or nothing on disk at all — refuses a window the index
+    holds no candle of at once (PR-262).
+
+    ⚠️ The windows are the **server's** plan, not the caller's: a client that sent its own could
+    queue a partial year, and a partial year erases the rest of that year's partition.
+    """
 
 
 class MetricsOut(_Out):
@@ -92,15 +426,76 @@ class MetricsOut(_Out):
     expectancy: Money | None
     max_drawdown_abs: Money
     max_drawdown_pct: Money
+    """A fraction of the peak; above 1 only for an account that went below zero (`ruined_at`)."""
     max_dd_duration_days: int
     sharpe: Money | None
     sortino: Money | None
     cagr: Money | None
     avg_trade_duration: dt.timedelta | None
+    ruined_at: dt.datetime | None = None
+    """The close at which the account first reached zero or below (02/10): from there no order
+    could be sized. Null for a run that never was."""
+
+    # In R (25/09, `r_metrics`). All null for a run recorded before them.
+    net_r: Money | None = None
+    max_drawdown_r: Money | None = None
+    losing_streak: int | None = None
+    losing_streak_r: Money | None = None
+    positive_year_share: Money | None = None
+    """Null too for a run with fewer than two years that had a trade."""
+    yearly_r: dict[str, str] | None = None
+    """R per calendar year of entry, as decimal strings: `{"2019": "3.25"}`."""
+
+
+class TargetOutcomeOut(BaseModel):
+    """One rung of a run's target ladder: what its trades would have made at this target, in R net
+    of each trade's costs (`excursion.target_ladder`)."""
+
+    trades: int
+    hits: int
+    net_r: Money
+    expectancy_r: Money
+    max_drawdown_r: Money
+
+
+class TargetRungOut(BaseModel):
+    """One rung of the ladder across a sweep entry's runs — never pooled across entries, for the
+    reason `SweepEntryOut` gives. Median, like everything else a sweep summarises."""
+
+    rung: str
+    """The target in R, as the ladder writes it: `"0.5"`, `"2"`, `"10"`."""
+    runs_scored: int
+    """Runs that could answer this rung. A run with a target of its own below it cannot, and a run
+    recorded before the ladder existed has none."""
+    runs_positive: int
+    """Of those, the ones whose net R at this rung is above zero."""
+    median_expectancy_r: Money | None
+    """The median run's expectancy per trade, in R net. `None` when no run was scored."""
+    best_label: str | None
+    best_net_r: Money | None
+
+
+class BacktestPointOut(BaseModel):
+    """Where a sweep's run sits on its grid (29/09): what the result page says it optimised.
+
+    `values` are the point's own coordinates as the sweep wrote them (`sweep_points`), keyed by
+    dotted path — `{"setup.params.period": 21}` — so the page can tell a parameter the sweep
+    varied from one the document fixed. `entry_name` is the catalogue label, read live, and null
+    once the entry has been taken off the shelf."""
+
+    entry_id: str
+    entry_name: str | None
+    label: str
+    values: dict[str, Any]
 
 
 class BacktestOut(_Out):
-    """A run: its request, its lifecycle status, and its metrics once finished."""
+    """A run: its request, what it actually read, its lifecycle status, and its metrics.
+
+    `date_from`/`date_to` are the *request*; `first_candle`/`last_candle` are the answer.
+    They differ whenever the dataset starts later or ends earlier than what was asked for,
+    and a client that shows only the request is quietly reporting the wrong experiment.
+    """
 
     id: uuid.UUID
     strategy_id: uuid.UUID
@@ -112,10 +507,172 @@ class BacktestOut(_Out):
     status: str
     error: str | None
     engine_version: str
+    recorded: str = "full"
+    """What the run kept: `full`, `trades` (no pictures, no equity curve) or `metrics` (the metrics
+    alone). A sweep's runs keep less (`retention`); a screen reads this to say what is missing and
+    why, instead of showing an empty chart as if the run had drawn one."""
+    reused_from: uuid.UUID | None = None
+    """The finished run this one is a copy of — the same measurement under the same engine, taken
+    instead of run again (`reuse`, 28/09). Null for a run that ran."""
     created_at: dt.datetime
     started_at: dt.datetime | None
     finished_at: dt.datetime | None
+    candles_seen: int | None = None
+    first_candle: dt.datetime | None = None
+    last_candle: dt.datetime | None = None
     metrics: MetricsOut | None = None
+    point: BacktestPointOut | None = None
+    """The sweep point this run measured — null for a run launched on its own (29/09)."""
+    targets: dict[str, TargetOutcomeOut | None] | None = None
+    """What the run's trades would have made at each rung of the target ladder, keyed by the
+    target in R (`"2"`). `None` for a run recorded before the ladder existed; a rung is `None` when
+    some trade could not answer it."""
+    r_by_years: dict[str, dict[str, str]] | None = None
+    """R by year of entry, then year of exit, as decimal strings (`backtest_metrics.r_by_years`,
+    ADR-0030): `{"2021": {"2021": "2.5", "2022": "-1"}}`. The run page shows a row per year of
+    entry and says when a trade left in a later year (01/10). `None` for a run recorded before
+    29/09, and while there are no results.
+
+    ⚠️ **Here and not on `MetricsOut`**: that one rides on every row of a sweep's ranked page, which
+    reads `MetricsOut.yearly_r` — the same R summed by year of entry — and needs no matrix."""
+    waiting_for: list[CollectionOut] = Field(default_factory=list)
+    """The downloads this run is waiting for before it can start, oldest window first.
+
+    ⚠️ **Without this, waiting is indistinguishable from queueing.** A run told to collect first
+    sits at `queued` exactly like one behind a busy worker, and the difference is minutes against
+    hours. The rows carry their own progress (`years_done` of `years_total`), so a screen can say
+    what is being downloaded rather than only that something is.
+
+    ⚠️ Kept after they finish, like the link rows themselves: it is how a run explains why it
+    started late. A finished collection here is history, not a wait.
+    """
+
+
+class BacktestListItem(_Out):
+    """One row of the run log: enough to compare runs without opening any of them.
+
+    Deliberately *not* `BacktestOut`. Two differences, both of them the point of this schema.
+
+    It resolves the foreign keys the detail view leaves as ids. A list of runs is read by a human
+    deciding which experiment to look at, and `instrument_id` answers nothing — the symbol, the
+    strategy's name and its version are what tell one row from another. Resolving them here costs
+    two joins on the server and saves the client a lookup per row.
+
+    It carries `cost_model` because a run's costs are part of what it *is*, not a detail of how it
+    was launched. The same strategy over the same window with a wider spread is a different
+    experiment (ADR-07), and a comparison table that hides that invites reading two incomparable
+    rows as a like-for-like result.
+
+    What it does not carry is the equity curve, which lives on `MetricsOut`'s sibling and is
+    fetched per run from `/backtests/{id}/equity`. See `list_backtests` for what that costs.
+    """
+
+    id: uuid.UUID
+    strategy_id: uuid.UUID
+    strategy_name: str
+    strategy_version: int
+    symbol: str
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Money
+    cost_model: dict[str, Any]
+    status: str
+    error: str | None
+    recorded: str = "full"
+    """See `BacktestOut.recorded`. On the list because comparing curves starts here, and a run
+    with no curve must be told apart before it is ticked, not after."""
+    reused_from: uuid.UUID | None = None
+    """See `BacktestOut.reused_from`."""
+    created_at: dt.datetime
+    finished_at: dt.datetime | None
+    metrics: MetricsOut | None = None
+
+
+class BacktestsPage(BaseModel):
+    """A page of runs. `total` lets a client size the pager without walking every page."""
+
+    total: int
+    limit: int
+    offset: int
+    items: list[BacktestListItem]
+
+
+class SnapshotBarOut(BaseModel):
+    """One bar of an entry's picture. Prices are strings for the same reason `Money` is."""
+
+    time: dt.datetime
+    open: Money
+    high: Money
+    low: Money
+    close: Money
+
+
+class SnapshotRegionOut(BaseModel):
+    """A rectangle to draw over those bars: a price band with a left edge in time.
+
+    `from_time` is the candle the zone was formed on, which is routinely older than the
+    window's first bar — the client extends the rectangle rightward from wherever that falls,
+    clipping at the chart's edge, and must not shift it to the first bar it can see.
+    """
+
+    label: str
+    top: Money
+    bottom: Money
+    from_time: dt.datetime
+
+
+class SnapshotSeriesOut(BaseModel):
+    """A curve to draw across the bars — an indicator, as the strategy computed it.
+
+    Each point is a `[time, value]` pair. The time is carried per point, not implied by
+    position, so a client joins the curve to the bars on the timestamp: a series that ends
+    before the last bar draws a curve that stops short, rather than one silently stretched.
+
+    Expect exactly that. The curve ends on the decision bar while the bars can run further, to
+    the fill — only the strategy knows the indicator, and it stopped contributing when it
+    decided. A leading gap is the indicator warming up.
+    """
+
+    label: str
+    points: list[tuple[dt.datetime, Money]]
+
+
+class SnapshotLevelOut(BaseModel):
+    """A horizontal segment: the structure a break of structure broke.
+
+    Bounded at **both** ends, unlike a region. A zone is still in force after the entry and so
+    extends rightward; a level is over the moment it is crossed, and `to_time` is that bar. The
+    segment's length is how long the structure held, which is what says whether the break meant
+    anything — so a client draws it between the two instants and does not extend it.
+
+    `label` is `choch` or `bos`, and the difference matters: one turns the trend and the other
+    continues it.
+    """
+
+    label: str
+    price: Money
+    from_time: dt.datetime
+    to_time: dt.datetime
+
+
+class SnapshotOut(BaseModel):
+    """What the strategy was looking at when it entered, as recorded by the engine.
+
+    Absent (`None`) on a trade whose run predates the snapshot, which is a different fact from
+    an empty window and is why this is not simply an empty list of bars.
+    """
+
+    decided_at: dt.datetime
+    filled_at: dt.datetime
+    """The bar the order filled on — the window's last. Equal to `decided_at` when the order
+    rested longer than the engine keeps bars for, in which case the window stops at the arming
+    and the entry marker falls outside it. See `EntrySnapshot`."""
+
+    bars: list[SnapshotBarOut]
+    regions: list[SnapshotRegionOut] = []
+    series: list[SnapshotSeriesOut] = []
+    levels: list[SnapshotLevelOut] = []
 
 
 class TradeOut(_Out):
@@ -129,13 +686,53 @@ class TradeOut(_Out):
     exit_price: Money | None
     exit_reason: str | None
     volume: Money
+    # The stop the trade was sized against, not the one it exited at — see the column comment
+    # in `tradeforge_db.models`. A trailed trade reports `exit_reason='sl'` with an
+    # `exit_price` some distance from this, and a table that renders them side by side without
+    # saying so invites the reader to file a bug against the engine.
     stop_loss: Money | None
     take_profit: Money | None
     gross_pnl: Money | None
     costs: Money | None
+    swap: Money = Decimal(0)
+    """Signed: negative was charged for holding it overnight, positive was paid (24/09)."""
     net_pnl: Money | None
     r_multiple: Money | None
+    mfe_r: Money | None = None
+    """How far the trade went in its favour, in R of its initial stop — gross of costs, and read
+    against the trade on an ambiguous bar, so it can only err low. `None` when not measured."""
+    mae_r: Money | None = None
+    """How far against, in the same unit; it can only err high."""
     context: dict[str, str | None]
+    has_snapshot: bool = Field(
+        default=False,
+        # Read off the row's `snapshot` column, which holds the window itself. The alias is what
+        # makes this a *projection* of that column rather than a second column nobody writes:
+        # without it Pydantic would look for `has_snapshot` on the row, not find it, and hand
+        # back the default — every trade reporting no picture, quietly and always.
+        validation_alias=AliasChoices("snapshot", "has_snapshot"),
+    )
+    """Whether this trade has an entry picture to fetch, **not** the picture itself.
+
+    A snapshot is fifty-odd bars — around 7 kB of JSON per trade. Carrying them all in the list
+    makes a five-hundred-trade run a multi-megabyte response assembled to be almost entirely
+    thrown away: a reader opens the two or three entries that look wrong. So the list says only
+    that one exists, and `GET /backtests/{id}/trades/{trade_id}/snapshot` serves it when asked.
+
+    A flag rather than a nullable object because the client's question here is "is the button
+    live?" — and answering it with an object would put the cost right back."""
+
+    @field_validator("has_snapshot", mode="before")
+    @classmethod
+    def _snapshot_column_becomes_a_flag(cls, value: object) -> object:
+        """Reads the `snapshot` JSONB column, which is `{}` when no window was recorded.
+
+        `{}` is the column's NOT NULL default, so it is what every row written before
+        `rev_0003` says — and it means "nothing recorded", which is a false flag, not a bug.
+        """
+        if isinstance(value, bool):
+            return value
+        return bool(value)
 
 
 class TradesPage(BaseModel):
@@ -152,8 +749,2625 @@ class EquityPointOut(_Out):
     equity: Money
 
 
+class YearCutOut(BaseModel):
+    """A run cut to a window of whole years in R, without running it again (`year_cut`): what a run
+    of `[first_year, last_year]` would have made, with its trades that entered and left inside."""
+
+    first_year: int
+    last_year: int
+    net_r: Money
+    yearly_r: dict[str, Money]
+    """R per year of entry, of the trades the cut closes: `{"2022": "3.25"}`."""
+    trades: int | None = None
+    """How many trades the cut closes (01/10); null for a run recorded before it kept the count."""
+
+
+class CandleOut(_Out):
+    """One bar of the price chart. Prices are strings for the same reason `Money` is.
+
+    No volume. It is on the row in Parquet and deliberately left off the wire: a run of
+    thirteen thousand bars pays for every field it carries, and nothing on this chart reads
+    volume yet. Adding it later is additive; sending it now is bytes spent on nothing.
+    """
+
+    time: dt.datetime
+    open: Money
+    high: Money
+    low: Money
+    close: Money
+
+
+class CandlesOut(BaseModel):
+    """The bars a finished run read, with the provenance to check them against.
+
+    The three provenance fields are not decoration. Parquet underneath a run can be
+    re-collected or extended after the fact, so "what this run read" and "what the dataset
+    holds today" are two different questions — and the second is the only one this endpoint
+    can answer by reading. Carrying `candles_seen` alongside `count` lets a client see the
+    two disagree instead of drawing a chart that quietly covers a different period than the
+    trades on it.
+    """
+
+    timeframe: str
+    symbol: str
+
+    #: What the run recorded eating, copied from the `backtests` row.
+    candles_seen: int
+    first_candle: dt.datetime
+    last_candle: dt.datetime
+
+    #: What was actually found on disk just now, for that same window.
+    count: int
+    candles: list[CandleOut]
+
+
+class OverlaySeriesOut(BaseModel):
+    """A curve to draw across the run's bars — an indicator, as the strategy computed it.
+
+    Each point is a `[time, value]` pair, and the time is carried per point rather than implied
+    by position. A client joins the curve to the candles **on the timestamp**: the series is
+    shorter than the bars whenever the indicator was still warming up, and a curve joined by
+    index would then be drawn one period to the left of where it belongs — every point wrong,
+    and the shape still perfectly plausible.
+
+    Warm-up bars are absent rather than null. The curve begins where the indicator did.
+    """
+
+    label: str
+    points: list[tuple[dt.datetime, Money]]
+
+
+class ZoneOut(BaseModel):
+    """One region over the whole run, with both ends of its life.
+
+    Three instants, none interchangeable. `from_time` is where the rectangle begins — the candle
+    before the gap, routinely far older than the break that revealed it. `confirmed_at` is when a
+    strategy could first act on it; on this project's own data the gap between the two runs to a
+    median of 8 bars, so collapsing them would redraw most regions as much younger than they
+    are. `mitigated_at` is the bar whose wick took the region, and `null` means it was still
+    standing when the run ended — a chart extends that one to its own right edge rather than
+    closing it somewhere invented.
+    """
+
+    kind: str
+    """`demand` or `supply`."""
+
+    top: Money
+    bottom: Money
+    from_time: dt.datetime
+    confirmed_at: dt.datetime
+    mitigated_at: dt.datetime | None
+    primary: bool
+    """First gap event of the impulse; the rest are secondary and need `allow_secondary`."""
+
+    label: str = "zone"
+    """Which series this region belongs to: `zone` for the run's own timeframe, or the name of a
+    higher one — `H4` — for the regions a filtered setup was released by.
+
+    A run under the higher-timeframe filter marks regions on two charts at once, and they mean
+    opposite things: the small ones are where the order rests, the big ones are what allowed an
+    entry to be looked for at all. A chart that drew them alike would show a stretch of refused
+    entries with nothing on it to explain them. Default `zone`, so every run without the filter
+    reads exactly as before.
+    """
+
+
+class OverlaysOut(BaseModel):
+    """Every curve the run's strategy was reading, over the window the run read.
+
+    `series` is empty for a strategy that declares none — the structure setups, whose overlay is
+    a set of zones rather than a line. Empty is an answer, not a failure.
+    """
+
+    symbol: str
+    timeframe: str
+
+    #: The same provenance pair `/candles` carries, and the curve needs it *more* than the bars
+    #: do. The bars are read back; the curve is **recomputed over them**, so one extra bar inside
+    #: the window does not add a point at the end — it reseeds the average and moves the whole
+    #: line. A client that could not see the two disagree would redraw a different curve under
+    #: the same trades and have nothing to notice it by.
+    candles_seen: int
+    count: int
+
+    series: list[OverlaySeriesOut]
+
+    #: The regions the run's strategy marked. Empty for the swing setups, which read a curve and
+    #: mark no zones — the two halves of a chart's overlay are independent, and a strategy having
+    #: one says nothing about whether it has the other.
+    zones: list[ZoneOut] = []
+
+
 class CreatedBacktest(_Out):
     """The 202 body: the run exists and is queued; poll `id` or subscribe to its WebSocket."""
 
     id: uuid.UUID
     status: str
+
+
+# --------------------------------------------------------------------------- #
+# Baskets — one strategy across several markets                                 #
+# --------------------------------------------------------------------------- #
+
+# A basket of one is a backtest, and the endpoint that already does that is better at it.
+_MIN_SYMBOLS = 2
+
+# A ceiling, because every list a client controls needs one for the same reason every numeric
+# query parameter does: without it a single POST enqueues as many jobs as the caller likes.
+# Twenty is well past what a human reads off one screen and far short of what hurts the queue.
+_MAX_SYMBOLS = 20
+
+# A sweep's own ceiling (02/10): his markets are chosen a market at a time — every crypto, eighty
+# Brazilian shares — and a sweep of a whole market is the question. Still a ceiling: one POST still
+# writes a sweep's whole grid. A basket keeps twenty: it is a portfolio picked by hand.
+_MAX_SWEEP_SYMBOLS = 500
+
+
+class CreateBasketRequest(BaseModel):
+    """Launch one strategy over several symbols, one run each.
+
+    ⚠️ **No `cost_model`, and that is the design.** Each run is charged the spread measured
+    for *its own* instrument (PR-226), resolved by the server at launch. A single figure
+    across a basket would be meaningless: 8 ticks of EURUSD and 4 of AAPL are not only
+    different numbers, they are counted in tick sizes that differ by a factor of a thousand.
+    A symbol with no measured spread runs uncosted, and the response says which ones did.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: uuid.UUID
+    symbols: list[Symbol] = Field(min_length=_MIN_SYMBOLS, max_length=_MAX_SYMBOLS)
+    timeframe: str
+    date_from: AwareInstant
+    date_to: AwareInstant
+    initial_capital: Decimal = Field(gt=0)
+    collect_missing: bool = True
+    """Collect what each market is missing, and run it once its own downloads have landed.
+
+    ⚠️ **Per market, not per basket.** A basket mixes markets that are covered with markets
+    that are not; a **fully** covered market starts at once and every other one waits for its own
+    windows — including a market covered in part, which waits for the gap rather than running
+    over a window it could only half read. Left false, a market with no candles in the window
+    is skipped and named (`CreatedBasket.skipped`), which is his rule for the answer "no".
+    """
+
+    @field_validator("symbols")
+    @classmethod
+    def _distinct(cls, symbols: list[str]) -> list[str]:
+        """The same symbol twice is a duplicated experiment wearing a comparison's clothes.
+
+        Rejected rather than de-duplicated: silently returning three runs for four requested
+        symbols would leave the caller's own list disagreeing with the basket, and a client
+        that sent a duplicate by accident learns nothing from being quietly corrected.
+        """
+        duplicated = sorted({s for s in symbols if symbols.count(s) > 1})
+        if duplicated:
+            raise ValueError(f"symbols must be distinct; repeated: {', '.join(duplicated)}")
+        return symbols
+
+
+class BasketRunOut(_Out):
+    """One symbol's place in the basket: which run it became, and what it is being charged."""
+
+    backtest_id: uuid.UUID
+    symbol: str
+    status: str
+    cost_model: dict[str, Any]
+    # Null means the catalogue has no measured spread for this symbol, so the run is
+    # uncosted — surfaced per row rather than as a basket-wide footnote, because it is
+    # true of some symbols and not others and the reader has to know which.
+    default_spread_points: Money | None
+
+
+class CreatedBasket(_Out):
+    """The 202 body: the basket exists and its runs are queued, one per symbol that has data."""
+
+    id: uuid.UUID
+    runs: list[BasketRunOut]
+    skipped: list[UncoveredMarket] = Field(default_factory=list)
+    """Symbols left out because the index holds no candle of theirs inside the window.
+
+    ⚠️ **Skipped, not refused — his rule (17/09).** Asked whether to collect first and told no,
+    the basket runs on the markets that have data and names the ones that do not. Refusing the
+    whole basket for one empty market would make the answer "no" useless.
+
+    ⚠️ **Only in this response.** The basket row does not record them, so the result page, read
+    later, lists the runs that exist and cannot say which markets were left out.
+    """
+
+
+class BasketAggregate(BaseModel):
+    """What a basket says once its runs finish — **dispersion, never a combined account.**
+
+    ⚠️ There is no summed equity curve here, and its absence is the most important decision
+    in this schema. Every run in a basket starts with the whole `initial_capital`, so four
+    runs of $10 000 are neither a $10 000 account nor a $40 000 one. Adding the curves would
+    draw a line that looks like a portfolio and is not one — the same failure as the
+    forward-fill rejected in the run comparator, where a fabricated shape is indistinguishable
+    on screen from a measured one.
+
+    What a basket is *for* is the spread of outcomes across markets. A strategy returning 30%
+    on one symbol and -25% on another has a mean near zero and a story the mean destroys, so
+    the extremes are reported by name and the median is reported instead of the average:
+    one spectacular market cannot drag the middle.
+
+    Returns are fractions of `initial_capital`, which the basket fixes for every run — so
+    unlike the general run comparator, these percentages are comparable by construction.
+
+    `null` for every statistic until at least one run finishes. Undefined, not zero: a basket
+    whose runs are still queued has not returned 0%.
+    """
+
+    runs_total: int
+    runs_finished: int
+    runs_failed: int
+
+    # Among the finished runs only. A queued run is not an unprofitable one.
+    runs_profitable: int
+
+    best_symbol: str | None
+    best_return: Money | None
+    worst_symbol: str | None
+    worst_return: Money | None
+    median_return: Money | None
+
+
+class BasketOut(_Out):
+    """A basket read back: how it was launched, every run in it, and the dispersion."""
+
+    id: uuid.UUID
+    strategy_id: uuid.UUID
+    strategy_name: str
+    strategy_version: int
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Money
+    created_at: dt.datetime
+
+    aggregate: BasketAggregate
+    runs: list[BacktestListItem]
+    failed_collections: list[CollectionOut] = Field(default_factory=list)
+    """Downloads that failed under this basket's runs, once each (his rule of 22/09): those runs
+    went ahead on what was on disk, and this is where the basket says so."""
+
+
+class CreateStudyRequest(BaseModel):
+    """Launch one strategy over a grid of its own parameters, one run per combination.
+
+    The mirror of `CreateBasketRequest`: that one lists **symbols** and holds the parameters
+    still, this one lists **parameter values** and holds the symbol still. Holding the market
+    still is what makes the points comparable to each other at all.
+
+    `cost_model` is taken from the request, exactly as `POST /backtests` takes it, because a
+    study is N of those over one instrument — one market, so one cost, and no reason for a
+    second rule. (A basket resolves costs per instrument only because it spans several.)
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: uuid.UUID
+    symbol: Symbol
+    timeframe: str
+    date_from: AwareInstant
+    date_to: AwareInstant
+    initial_capital: Decimal = Field(gt=0)
+    cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+    collect_missing: bool = True
+    """Collect what the market is missing, and run every point once the downloads have landed.
+
+    ⚠️ **One download for the whole grid.** Every point reads the same (symbol, timeframe) over
+    the same window, so each missing window is collected once and linked to all N runs — the
+    sweep's rule (PR-268) with a single pair. Left false, a window with no candles at all refuses
+    the study: there is one market, so there is nothing to skip to (his rule, as for a single
+    backtest)."""
+
+    grid: dict[str, list[Any]] = Field(min_length=1)
+    """Paths into the strategy document, and the values to try at each.
+
+    `{"setup.params.period": [5, 9, 20], "setup.params.take_profit_rr": [2, 3]}` expands to
+    six runs. Dotted paths, with a numeric segment indexing a list, so a DSL strategy's first
+    indicator is `indicators.0.params.period`.
+
+    Only the emptiness is checked here; everything else is `grid.expand`'s, because the answers
+    depend on the document being varied. ⚠️ In particular a path this strategy has *nothing* at
+    is refused there rather than tolerated — substituting at one would add a parameter nothing
+    reads, and the study would run N identical backtests and draw a flat heatmap that looks
+    like a finding about the market.
+    """
+
+
+class StudyPointOut(_Out):
+    """One combination: the run it became, and the strategy that was stored for it."""
+
+    backtest_id: uuid.UUID
+    strategy_id: uuid.UUID
+    label: str
+    """`period=9, take_profit_rr=3` — what makes this point different from the others."""
+
+    values: dict[str, Any]
+    """The same thing keyed by full path, for a client that lays out an axis rather than
+    printing a caption. The label is for people; this is for the heatmap."""
+
+    status: str
+
+
+class PreviewStudyRequest(BaseModel):
+    """Ask what a grid would produce, without producing it.
+
+    The question is about **documents** — the base strategy with values substituted in — so the
+    symbol, the dates and the capital are absent: they belong to the runs and none of them can
+    make a point legal or illegal.
+
+    ⚠️ **The timeframe is the exception, and it is why this field exists.** It looks like another
+    property of the run and it is not: a document carries its own `timeframe`, and a setup builds
+    its higher-timeframe bars out of that one while the loop steps at the run's. A point whose
+    `htf` filter is legal on the saved document can be a filter that quietly stops filtering at
+    the study's timeframe (`runner.timeframe_refusal`). Required rather than optional, because a
+    preview that skipped the check when the field was absent would be a preview that agrees with
+    the launch *except* on the points a person most needs warning about.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: uuid.UUID
+    grid: dict[str, list[Any]] = Field(min_length=1)
+    timeframe: Timeframe
+    """The same shape `CreateStudyRequest.grid` takes, so a caller previews the request it is
+    about to send rather than a translation of it."""
+
+
+class GridRefusal(_Out):
+    """One point of the grid that cannot run, and why."""
+
+    label: str
+    """`period=9, htf=M5` — the point in the words the rest of the study screen uses."""
+
+    values: dict[str, Any]
+    """Keyed by full path, so a client can point at the axis the bad value is on."""
+
+    reason: str
+    """One sentence, from the same validator `POST /studies` refuses with."""
+
+
+class StudyPreview(_Out):
+    """What a grid would produce: how many points, and every one that could not run.
+
+    ⚠️ **`refusals` is a list because the answer has to be complete** — it is exactly the set of
+    points the launch will leave out (since 18/09 a study drops a point that cannot run rather
+    than refusing the grid; only a grid where none can is refused). A preview that named one at a
+    time would make reading a grid the round trip this endpoint exists to remove.
+
+    A 200 with refusals in it is a *successful answer*, not a failure. The endpoint reports; it
+    does not decide, and reporting that the news is bad is still reporting.
+    """
+
+    points: int
+    """How many combinations the grid expands to, or `0` when `grid_error` says why none do."""
+
+    refusals: list[GridRefusal]
+    grid_error: str | None = None
+    """Set when the grid cannot be applied to this strategy at all — a path that leads nowhere,
+    an empty axis, a repeated value. A different kind of no from a refused point: there are
+    no points to report on, rather than points that will not run."""
+
+
+class CreatedStudy(_Out):
+    """The 202 body: the study exists, and every point of the grid is queued."""
+
+    id: uuid.UUID
+    points: list[StudyPointOut]
+
+
+class StudyAggregate(BaseModel):
+    """What a grid says once its runs finish — **dispersion, and never the maximum alone.**
+
+    ⚠️ **The most important thing in this schema is what the headline is not.** A grid always
+    has a best point; a grid of pure noise has a best point. Reporting that number on its own
+    is how an optimiser becomes a machine for producing convincing false results, and the wider
+    the grid the more convincing they get — searching a hundred parameter sets and keeping the
+    winner is, statistically, mostly a search for the luckiest arrangement of the same noise.
+
+    So the honest summary is here in three parts, and they answer different questions:
+
+    * `median_return` — what a parameter set picked *without* hindsight would have returned.
+      This is the closest thing to "does the method work", and it is the number to read first.
+    * `points_profitable` out of `points_finished` — how much of the searched space works at
+      all. Ninety out of a hundred is a property of the method; three out of a hundred is a
+      corner, whatever the best of those three returned.
+    * `best_return` beside `worst_return` — the range, so the best is read as one end of a
+      spread rather than as a result.
+
+    **Every figure here is in-sample**, including the best one: these runs were scored on the
+    same data the grid was searched over, so nothing in this response is evidence that the
+    winning parameters will work next month. Walk-forward (PR-204) is the experiment that can
+    say that — choose on one window, measure on the *next*, and see whether the choice survives
+    being made blind. Until then, this is a description of a past, not a prediction.
+
+    No summed curve, for the same reason a basket has none: every point starts with the whole
+    `initial_capital`, so the runs cannot be added up.
+    """
+
+    points_total: int
+    points_finished: int
+    points_failed: int
+    points_profitable: int
+
+    best_label: str | None
+    best_return: Money | None
+    worst_label: str | None
+    worst_return: Money | None
+    median_return: Money | None
+    """All four are null until at least one run finishes. Null is "nothing has landed yet",
+    never zero — zero would be a measured result of no profit."""
+
+
+class StudyOut(_Out):
+    """A study read back: how it was launched, the grid it searched, and where it landed."""
+
+    id: uuid.UUID
+    strategy_id: uuid.UUID
+    strategy_name: str
+    """The **base** strategy's name — the lineage the grid was built from. Each point has its
+    own stored strategy, named for its own values; those names are on the runs."""
+
+    symbol: str
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Money
+    created_at: dt.datetime
+
+    grid: dict[str, list[Any]]
+    """As declared, in order. Served because it is **not recoverable from the runs**: each
+    point's values survive only as text inside its strategy's name, and a client laying out a
+    heatmap's axes needs the axes, not a parse of captions."""
+
+    points: list[StudyPointOut]
+    """Each run's coordinates on the grid, read back out of the document that ran.
+
+    Parallel to `runs` and in the same order, but it is `points` a heatmap should place cells
+    from — a client that derived coordinates by parsing `strategy_name` would be splitting a
+    caption on commas and equals signs, and that works until a value contains one.
+    """
+
+    aggregate: StudyAggregate
+    runs: list[BacktestListItem]
+
+
+class CreateWalkForwardRequest(BaseModel):
+    """Re-run a study honestly: choose the parameters on one window, score them on the next.
+
+    The only thing named here is the study, and that is the design. This experiment exists to
+    support one comparison — *"the heatmap said this, a blind choice got that"* — and the
+    comparison is only sound if both halves searched the same grid over the same market. Taking
+    a grid again would let the two drift apart with nothing able to notice: a retyped grid that
+    differs by one value still looks like the same experiment.
+
+    Everything else on the wire is about how the period is cut and how a winner is picked.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    study_id: uuid.UUID
+
+    folds: int = Field(default=6, ge=MIN_FOLDS, le=MAX_FOLDS)
+    """How many train→test pairs. Six over a couple of years of H1 leaves each test window a
+    few hundred bars — enough for a result to mean something, and enough folds to see whether
+    the winning parameters stay put."""
+
+    train_multiple: int = Field(default=3, ge=1, le=MAX_FOLDS)
+    """How many times longer the training window is than the test window that follows.
+
+    Three is the usual starting point: the choice is made on three times the evidence it is
+    then scored on. Raising it buys steadier choices and costs test windows, since the period
+    is divided into `train_multiple + folds` parts and the folds get `folds` of them.
+    """
+
+    anchored: bool = False
+    """`False` (rolling, the default) slides a fixed-length training window forward, so every
+    fold chooses from a sample of the same size and the folds are comparable to each other.
+    `True` trains on all history before each test window instead. See `walkforward.split`."""
+
+    metric: SelectionMetric = SelectionMetric.NET_PROFIT
+    """What each fold maximises when it picks its winner. The result is always reported as a
+    *return*, whatever this is set to — selecting by Sharpe and reporting Sharpe would leave a
+    reader unable to answer "so what would this have made?"."""
+
+
+class WalkForwardFoldOut(_Out):
+    """One fold: the windows, the choice, and what the choice was worth on each side of it."""
+
+    index: int
+    study_id: uuid.UUID
+    """The training grid, readable through `GET /studies/{id}` — heatmap included. Fold 1's
+    heatmap beside fold 5's is what over-fitting looks like, and no number states it as
+    plainly."""
+
+    train_from: dt.datetime
+    train_to: dt.datetime
+    test_from: dt.datetime
+    test_to: dt.datetime
+    train_bars: int
+    test_bars: int
+    """The counts the split was cut from. Served because the boundaries were decided by
+    counting candles and expressed as dates: a reader who only saw the dates could not tell an
+    even split from one where a holiday week halved a fold's evidence."""
+
+    chosen_label: str | None
+    """`period=9, take_profit_rr=3` — the point this fold selected, or null if it could not
+    select one. Null is a **result**, not a pending state: it says nothing in the grid traded
+    that window, or nothing that traded had a defined score."""
+
+    chosen_strategy_id: uuid.UUID | None
+    test_backtest_id: uuid.UUID | None
+
+    in_sample_return: Money | None
+    """What the chosen point returned over the window it was chosen on. The promise."""
+
+    out_of_sample_return: Money | None
+    """What it returned over the window that followed — which no part of the choice had seen.
+    The delivery, and the only figure here that is evidence about a future."""
+
+    test_status: str | None
+    test_trades: int | None
+    """How many trades the out-of-sample run actually took. Read before believing its return:
+    a fold that traded twice has a return, not a finding."""
+
+
+class WalkForwardVerdict(BaseModel):
+    """What the folds add up to. See `walkforward.Verdict` for why each figure is this one."""
+
+    folds_total: int
+    folds_decided: int
+    folds_scored: int
+    folds_profitable: int
+
+    in_sample_median: Money | None
+    out_of_sample_median: Money | None
+    degradation: Money | None
+    """`out_of_sample_median - in_sample_median` — **the headline**. Normally negative; a small
+    gap is a method that generalises, a gap that swallows the whole in-sample result is a grid
+    that was fitting noise."""
+
+    compounded: Money | None
+    """The folds multiplied together, `Π(1 + r) - 1`: what an account would have done trading
+    this and re-choosing its parameters every window. An approximation — each run starts from
+    the same capital, so this models an account that scales position size with equity."""
+
+    distinct_choices: int
+    """How many *different* points the folds chose. 1 is the strongest evidence a grid can
+    give; a number near `folds_decided` means there is no "the parameters" to go and trade."""
+
+
+class CreatedWalkForward(_Out):
+    """The 202 body: the walk-forward exists, its folds are cut, and its training runs queued."""
+
+    id: uuid.UUID
+    folds: list[WalkForwardFoldOut]
+    runs_queued: int
+    """`folds x grid points`. Stated back because it is the cost of the request and it grows
+    multiplicatively — a fourth axis on the grid multiplies this, and so does a seventh fold."""
+
+
+class WalkForwardOut(_Out):
+    """A walk-forward read back: how it was cut, what each fold decided, and what it adds up to."""
+
+    id: uuid.UUID
+    study_id: uuid.UUID
+    strategy_id: uuid.UUID
+    strategy_name: str
+    symbol: str
+    timeframe: str
+    initial_capital: Money
+    grid: dict[str, list[Any]]
+
+    folds_requested: int = Field(validation_alias=AliasChoices("folds_requested", "folds"))
+    """Spelled apart from the `folds` list below, which is the same word for a different thing:
+    the number asked for, against the rows that were cut. They agree, and a client showing
+    "3 of 6 decided" needs both to say so."""
+
+    train_multiple: int
+    anchored: bool
+    metric: str
+    status: str
+    error: str | None
+    created_at: dt.datetime
+    started_at: dt.datetime | None
+    finished_at: dt.datetime | None
+
+    folds: list[WalkForwardFoldOut]
+    verdict: WalkForwardVerdict
+
+
+MAX_COLLECTION_SYMBOLS = 20
+"""How many symbols one collection request may ask for.
+
+Deliberately **not** `_MAX_SYMBOLS`, the basket's ceiling, even though both are twenty today.
+The two limits bound work of wildly different cost: twenty backtests are twenty runs of
+seconds over candles already on disk, while twenty collections of H1 since 2009 are some 350
+year slices fetched one at a time from a terminal that downloads as it answers — hours, not
+seconds. Sharing the constant would mean tuning one of them silently retunes the other.
+"""
+
+
+class CollectionItem(BaseModel):
+    """One symbol in a collection request, carrying its own class when the path cannot say.
+
+    ⚠️ **A list of these, rather than a `symbols` list beside a parallel `asset_classes` list.**
+    Parallel arrays can fall out of step — a caller removes one symbol and forgets the class at
+    the same index — and no schema can forbid it. The symbol that then gets catalogued as the
+    wrong kind of instrument fails silently, and the row looks perfectly well-formed forever.
+    A symbol and the class somebody decided for it are one fact, so they are one object.
+    """
+
+    symbol: Symbol
+    broker_symbol: Symbol | None = None
+    """The broker's ticker when the internal name differs (ADR-0032): `{"symbol": "WIN",
+    "broker_symbol": "WIN$"}`. Left out, the terminal is asked for `symbol` itself."""
+    asset_class: AssetClass | None = None
+    """⚠️ Optional, and its absence is **not** a default. It means "the symbol's tree path
+    already says", which is true for 60 of this broker's 84 symbols. For the other 24 — filed
+    under `CFDs`, `Crypto Currency` or `Metals` — the path names no class among the five the
+    system has, so `POST /collections` refuses and the screen asks. Sending a class the path
+    would have decided anyway is allowed and overrides it, which is what makes a mis-filed
+    symbol fixable without a migration."""
+
+
+MAX_COLLECTIONS_PER_REQUEST = 40
+"""How many collections one request may produce — symbols multiplied by rows.
+
+⚠️ **A second ceiling, guarding a different thing from `MAX_COLLECTION_SYMBOLS`.** That one is
+about a list a person reads on one screen; this one is about a queue that drains one job at a
+time on a machine that downloads as it answers. Eight symbols across five timeframes and twenty
+across two are both forty collections, and neither ceiling subsumes the other: twenty-one
+symbols on a single row is under this limit and still refused, while ten symbols across five
+timeframes is under the symbol limit and still refused here.
+
+Forty is a working figure, not a measurement. Forty H1 collections of seven years took about
+three minutes each when measured on 21/08/2026; forty of M1 would be hours, because a year of
+M1 is sixty times the bars. The count cannot express that, which is why the screen shows the
+year-slice estimate beside it — the count is the guardrail, the estimate is the information.
+"""
+
+
+class CollectionRow(BaseModel):
+    """One timeframe over one window: the unit a batch multiplies the symbols by.
+
+    ⚠️ **The window belongs to the row, not to the request.** The bar budget this project
+    measured gives roughly one year for M1 and seventeen for H1 — the same number of bars over
+    wildly different spans, because a year of M1 is sixty times the bars of a year of H1. A
+    single window across several timeframes would therefore be wrong by construction for all
+    but one of them: either a year of H1 (far less history than the budget allows) or seventeen
+    years of M1 (far more than the terminal will even hand over).
+    """
+
+    timeframe: Timeframe
+    date_from: dt.datetime
+    date_to: dt.datetime
+
+    @field_validator("date_from", "date_to")
+    @classmethod
+    def _must_be_aware(cls, value: dt.datetime) -> dt.datetime:
+        """⚠️ A naive instant is refused rather than assumed to be UTC.
+
+        The window reaches MetaTrader, which speaks the *server's* clock and nothing else — the
+        collector shifts UTC into it on the way in and back out on the way home. An instant that
+        arrived without a timezone would be shifted anyway, and every bar in the file would be
+        displaced by hours with nothing raised. This project has already paid for that once:
+        the first real backfill wrote candles 62 hours out of place without an error.
+        """
+        if value.tzinfo is None:
+            raise ValueError("an instant must carry a timezone; send UTC as ...Z")
+        return value
+
+    @model_validator(mode="after")
+    def _window_must_run_forwards(self) -> CollectionRow:
+        if self.date_to < self.date_from:
+            raise ValueError("date_to is before date_from")
+        return self
+
+
+class CreateCollectionRequest(BaseModel):
+    """Go and fetch these symbols' history, over one window per timeframe.
+
+    Symbols are chosen once; each row adds a timeframe with its own window, and the batch is
+    the product — one collection per symbol per row. The class is per symbol, because it is a
+    property of the symbol and not of the request (see `CollectionItem`); the window is per row,
+    because it is a property of the timeframe (see `CollectionRow`).
+
+    ⚠️ **A batch is N independent requests, not one grouped request.** Each item becomes its own
+    `collections` row and its own queued job, exactly as N separate calls would have produced —
+    there is no parent row and no aggregate state. `baskets` groups its runs because the product
+    of a basket is the *comparison* across markets, which does not exist without the group; the
+    product of a collection is candles on disk, which has no cross-symbol answer to compute.
+
+    ⚠️ Acceptance, however, is all-or-nothing: if any item is unusable, nothing is written and
+    nothing is queued. A half-accepted batch would leave the operator reconciling which of the
+    twenty went through against a list they can no longer see.
+    """
+
+    items: list[CollectionItem] = Field(min_length=1, max_length=MAX_COLLECTION_SYMBOLS)
+    rows: list[CollectionRow] = Field(min_length=1, max_length=MAX_COLLECTIONS_PER_REQUEST)
+
+    @field_validator("rows")
+    @classmethod
+    def _distinct_timeframes(cls, rows: list[CollectionRow]) -> list[CollectionRow]:
+        """The same timeframe twice is the same collection queued twice.
+
+        ⚠️ **Different windows do not rescue it.** A collection replaces whole year partitions
+        (`write_candles`), so two rows for H1 over overlapping years would have the second erase
+        what the first wrote — and the symptom would not be a duplicate but a *missing* year.
+        Refused rather than merged, because merging two windows into one is a decision the
+        caller can make and this endpoint cannot.
+        """
+        seen = [line.timeframe for line in rows]
+        repeated = sorted({tf for tf in seen if seen.count(tf) > 1})
+        if repeated:
+            raise ValueError(f"timeframes must be distinct; repeated: {', '.join(repeated)}")
+        return rows
+
+    @model_validator(mode="after")
+    def _within_the_work_ceiling(self) -> CreateCollectionRequest:
+        """The product is what reaches the queue, so the product is what is capped.
+
+        Stated as a model validator rather than as a `max_length` on either list, because
+        neither list is the thing being limited — their product is, and no field constraint can
+        say that.
+        """
+        total = len(self.items) * len(self.rows)
+        if total > MAX_COLLECTIONS_PER_REQUEST:
+            raise ValueError(
+                f"{len(self.items)} symbols across {len(self.rows)} timeframes is {total} "
+                f"collections; at most {MAX_COLLECTIONS_PER_REQUEST} in one request"
+            )
+        return self
+
+    @field_validator("items")
+    @classmethod
+    def _distinct(cls, items: list[CollectionItem]) -> list[CollectionItem]:
+        """The same symbol twice in one batch is the same work queued twice.
+
+        Refused rather than de-duplicated, for the same reason `CreateBasketRequest` refuses it:
+        silently returning nineteen rows for twenty requested symbols leaves the caller's own
+        list disagreeing with the response, and a client that sent a duplicate by accident
+        learns nothing from being quietly corrected.
+
+        Every repeat is named, not just the first — a caller fixing a twenty-symbol list one
+        rejection at a time is a caller the endpoint is fighting.
+        """
+        symbols = [item.symbol for item in items]
+        repeated = sorted({symbol for symbol in symbols if symbols.count(symbol) > 1})
+        if repeated:
+            raise ValueError(f"symbols must be distinct; repeated: {', '.join(repeated)}")
+        return items
+
+
+class CollectionOut(_Out):
+    """One collection request and what became of it.
+
+    ⚠️ Carries the **requested** window, which is not what was found. Asking for 2015 on a
+    symbol listed in 2018 is an ordinary request with an ordinary answer, and a body that
+    reported only the outcome could never explain why the window on screen came back shorter
+    than the one that was asked for. What exists is `datasets`, read through `/instruments`.
+    """
+
+    id: uuid.UUID
+    symbol: str
+    broker_symbol: str | None = None
+    timeframe: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    asset_class: str | None = None
+    status: str
+    years_done: int
+    years_total: int
+    candles: int | None = None
+    gaps: int | None = None
+    error: str | None = None
+    requested_at: dt.datetime
+    started_at: dt.datetime | None = None
+    finished_at: dt.datetime | None = None
+
+
+class PlanCollectionRequest(BaseModel):
+    """Which of these markets still need collecting before a run over this window.
+
+    ⚠️ **One window for every timeframe, unlike `CreateCollectionRequest`.** That request sizes
+    a download, and a year of M1 is not seventeen years of H1. This one describes a run someone
+    is about to launch, and a run reads the same dates whatever chart it is on — the plan is what
+    turns that into per-timeframe work.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SWEEP_SYMBOLS)
+    timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
+    date_from: dt.datetime
+    date_to: dt.datetime
+
+    @field_validator("symbols", "timeframes")
+    @classmethod
+    def _distinct(cls, values: list[Any], info: ValidationInfo) -> list[Any]:
+        return _distinct_axis(values, info)
+
+    @field_validator("date_from", "date_to")
+    @classmethod
+    def _must_be_aware(cls, value: dt.datetime) -> dt.datetime:
+        """⚠️ Refused rather than assumed UTC, for `CollectionRow`'s reason: the windows this
+        answers with are meant to be sent to `POST /collections` as they are."""
+        if value.tzinfo is None:
+            raise ValueError("an instant must carry a timezone; send UTC as ...Z")
+        return value
+
+    @model_validator(mode="after")
+    def _window_must_run_forwards(self) -> PlanCollectionRequest:
+        if self.date_to < self.date_from:
+            raise ValueError("date_to is before date_from")
+        return self
+
+
+class PlannedWindow(BaseModel):
+    """One span to collect, inclusive at both ends: whole calendar years in UTC, except that the
+    current year stops at the moment the plan was made."""
+
+    date_from: dt.datetime
+    date_to: dt.datetime
+
+
+class PlannedCollection(BaseModel):
+    """One (symbol, timeframe) that is not fully on disk, and what to fetch for it."""
+
+    symbol: str
+    timeframe: str
+    covers: str | None
+    """What the index holds today, as `2020-01-02 to 2026-09-10`, or `None` when nothing has
+    ever been collected — the reason each window is there, in the words `UncoveredMarket` uses."""
+    in_window: bool
+    """Whether the index holds any candle **inside the window asked about** — that is, whether a
+    run over it would read anything at all.
+
+    ⚠️ **Not derivable from `covers`, and a screen that tried would be wrong the useful half of
+    the time.** A pair collected for 2019 under a window in 2024 has a `covers` string and not one
+    candle to run: the launch refuses it (`coverage.uncovered_markets`, the same question asked
+    here), and offering "run with what there is" for it offers nothing."""
+    windows: list[PlannedWindow]
+    """⚠️ Possibly wider than the request: a window always reaches the data already on disk,
+    so the index never has to describe a hole it cannot represent (`collection_plan`)."""
+    time: TimeEstimate | None = None
+    """How long these windows would take to download, or `None` with no finished download to
+    measure by (his call, 22/09). Set by `POST /collections/plan`, which is what a screen asks
+    before collecting; the launch's own use of the plan has nothing to show it to."""
+    at_broker: bool | None = None
+    """Whether the broker's symbol list names this symbol — **three answers, not two**.
+
+    `False` only when the list has been synced and does not name it: a download would ask
+    MetaTrader for bars of a symbol it does not have and fail with "no bars anywhere", which is
+    what the first real sweep with "collect" did for AAPL and US500 (18/09) — catalogue seeds,
+    not symbols of this broker. Such a pair is never collected (`coverage.to_collect`): the basket
+    and the sweep skip and name it, the single backtest refuses it.
+
+    ⚠️ `None` when the list has never been synced, and that is "I do not know", not "yes". It is
+    still offered for collection, as before this field existed: refusing on an unanswered
+    question would block every collection on a machine whose agent has not run a sync yet."""
+
+
+class KillSwitchOut(BaseModel):
+    """The state of the **one** kill-switch layer this API can see and write.
+
+    ⚠️ **`engaged: false` does not mean the executor is trading.** Two of the three layers are
+    invisible from here — a file on the executor's disk and a flag in its memory — and either
+    one engaged stops everything while this body reports `false`. That is why `layer` is on the
+    body rather than implied: whatever renders this must say *which* handle it is showing, or it
+    will tell an operator the machine is live when it is not.
+
+    ⚠️ **And engaged does not mean flat.** The switch refuses new risk; exits, cancels and
+    tightening stops are cleared before the switches are ever consulted (`safety.admits`), so
+    open positions stay open, protected by the stop already sitting at the venue.
+    """
+
+    engaged: bool
+    engaged_at: dt.datetime | None = None
+    layer: str
+
+
+class OpenPositionOut(BaseModel):
+    """A trade this session opened and has not closed.
+
+    ⚠️ Read from `trades` with no exit, which is what the table means by an open position — the
+    model's own comment says so: *"An open position has no exit yet"*. Not read from the venue:
+    what MetaTrader holds is the whole account, and an account can carry a position this session
+    did not take.
+    """
+
+    id: int
+    direction: str
+    entry_time: dt.datetime
+    entry_price: Money
+    volume: Money
+    stop_loss: Money | None = None
+    take_profit: Money | None = None
+
+
+class LiveSessionOut(BaseModel):
+    """One session as the panel sees it: the row, plus the two things the row cannot say.
+
+    ⚠️ **`status: running` is not "alive".** The thing that would change a status is the process,
+    so a session that died leaves the row saying `running` for ever — which is exactly why
+    `heartbeat_at` exists and why `stale` is on this body. A panel that showed only `status`
+    would report a dead session as healthy, and the failure is silent by construction.
+
+    ⚠️ `stale` is `tradeforge_db.live_sessions.is_stale`, called, not re-derived here. That rule
+    owns its own boundary (`>=`, at `BEAT_EVERY * 4`) and had a mutant survive once because the
+    only test of it wrote the comparison out in its own body.
+    """
+
+    id: uuid.UUID
+    strategy_id: uuid.UUID
+    instrument_id: uuid.UUID
+    symbol: str
+    timeframe: str
+    mode: str
+    status: str
+    initial_capital: Money
+    engine_version: str
+    warmup_bars: int
+    started_at: dt.datetime
+    stopped_at: dt.datetime | None = None
+    heartbeat_at: dt.datetime | None = None
+    last_bar_time: dt.datetime | None = None
+    error: str | None = None
+
+    stale: bool
+    silent_for_seconds: int
+    """How long since it was last heard from — from the last beat, or from `started_at` when
+    there has never been one. Reported beside `stale` rather than instead of it: the number is
+    what an operator judges by, the boolean is what the system decided."""
+
+
+class LiveSessionsPage(BaseModel):
+    total: int
+    sessions: Sequence[LiveSessionOut]
+
+
+class LiveSessionDetail(LiveSessionOut):
+    """One session, plus what it is holding, what it realised today, and whether it was asked
+    to stop.
+
+    ⚠️ **`stop_requested_at` is why this body needs Redis and the list does not.** The list is
+    pure Postgres on purpose: a panel that cannot enumerate its sessions because Redis blinked is
+    a panel that fails at the moment it is most needed. The detail is the screen somebody is on
+    when they are about to press stop, so *that* one refuses to answer rather than misreport.
+    """
+
+    stop_requested_at: dt.datetime | None = None
+    """When somebody asked it to stop, if anybody has. `None` is "nobody asked" — and it is only
+    ever that, because a Redis this endpoint could not read is a 503 rather than a `None`.
+
+    A request standing here while `status` is still `running` is not a contradiction: it is the
+    honest picture of a session that has not reached its next read yet, which on a blocked stream
+    is up to `DEFAULT_BLOCK_MS` away."""
+
+    open_positions: Sequence[OpenPositionOut]
+
+    realised_today: Money
+    """Net P&L of the trades this session **closed** today, UTC.
+
+    ⚠️ UTC, the same midnight the executor's daily loss cap counts from (`router.start_of_day`).
+    Three clocks are in play in this system — the operator's UTC-3, the database's UTC and the
+    broker's UTC+3 — and a panel that totalled a different day from the cap that stops trading
+    would explain neither number.
+
+    ⚠️ Realised, so an open position contributes nothing. Zero here is a real statement ("nothing
+    was closed today"), which is why `trades_closed_today` is beside it: zero from no trades and
+    zero from two trades that cancelled out are different days.
+    """
+
+    trades_closed_today: int
+
+
+class SessionEventOut(BaseModel):
+    """One row of `order_audit` — every order this session's executor was asked to send.
+
+    The event log of the panel, and it is an outcome log rather than a progress log: *"Every
+    value is an outcome, never a stage"*. A refusal is here with the rule that refused it, which
+    is what answers "why did my strategy stop trading at 11am".
+    """
+
+    id: uuid.UUID
+    client_id: str
+    status: str
+    reason: str | None = None
+    requested_at: dt.datetime
+    resolved_at: dt.datetime | None = None
+    request: dict[str, Any]
+    response: dict[str, Any] | None = None
+
+
+class SessionEventsPage(BaseModel):
+    total: int
+    events: Sequence[SessionEventOut]
+
+
+def session_fields(row: LiveSession, symbol: str, *, now: dt.datetime) -> dict[str, Any]:
+    """The fields every view of a session shares, including the two the row cannot state.
+
+    Public and here rather than private in the router, because it has two callers that must not
+    drift: `/live-sessions` and the WebSocket. A panel that got `stale` from one shape over HTTP
+    and a different shape over the socket would flicker between two truths on every event.
+    """
+    return {
+        "id": row.id,
+        "strategy_id": row.strategy_id,
+        "instrument_id": row.instrument_id,
+        "symbol": symbol,
+        "timeframe": row.timeframe,
+        "mode": row.mode.value,
+        "status": row.status.value,
+        "initial_capital": row.initial_capital,
+        "engine_version": row.engine_version,
+        "warmup_bars": row.warmup_bars,
+        "started_at": row.started_at,
+        "stopped_at": row.stopped_at,
+        "heartbeat_at": row.heartbeat_at,
+        "last_bar_time": row.last_bar_time,
+        "error": row.error,
+        # ⚠️ Called, never re-derived. `is_stale` owns the boundary — silent for *exactly*
+        # `STALE_AFTER` counts — and the last test that wrote that comparison out in its own body
+        # pinned itself instead of the rule, letting a mutant through both suites.
+        "stale": is_stale(heartbeat_at=row.heartbeat_at, started_at=row.started_at, now=now),
+        "silent_for_seconds": int(
+            silence(
+                heartbeat_at=row.heartbeat_at, started_at=row.started_at, now=now
+            ).total_seconds()
+        ),
+    }
+
+
+class CreateCatalogEntry(BaseModel):
+    """Put a strategy on the shelf, with the sweep it is meant to be asked."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: StorableText = Field(min_length=1, max_length=120)
+    """The label a person writes, and the one the shelf is read by.
+
+    ⚠️ Deliberately **not** the strategy's name. `strategies.name` is a generated column
+    projected out of the document, so it is whatever the builder stamped — this database is full
+    of `MME9-20260910-172055`. Unique in the table, because two entries called `9.1 com filtro`
+    is a catalogue nobody can speak about."""
+
+    description: StorableText | None = Field(default=None, max_length=2000)
+    """Optional. `None` means nobody wrote one, which is not the same as an empty one."""
+
+    strategy_id: uuid.UUID
+    """The exact version, never the lineage — a grid is only meaningful against the document it
+    expands, and every path in it has to exist there."""
+
+    grid: dict[str, list[Any]] = Field(default_factory=dict)
+    """Dotted paths and the values to try at each, in the shape a study takes.
+
+    Empty is the ordinary case and needs no special word for it: `9.1 sem filtro` is one
+    document with nothing to vary, and `{}` says so. What separates a simple entry from a swept
+    one is how many axes it has."""
+
+
+class UpdateCatalogEntry(BaseModel):
+    """Change what a shelf entry says, in place — its label, its description, its grid (29/09).
+
+    Only what is sent changes. `description: null` clears it; `name` and `grid` cannot be null.
+    **The strategy is not here, and that is his choice**: which document an entry points at is
+    changed by saving a new version in the builder, not by editing the label.
+
+    ⚠️ **A grid edited is a different question from then on**, never a rewrite of the past: every
+    sweep already launched keeps the points it expanded (`sweep_points`) and the grids it expanded
+    (`Sweep.entry_grids`), so it reads as it ran, and `combine` refuses to join it with one
+    launched after the edit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: StorableText | None = Field(default=None, min_length=1, max_length=120)
+    description: StorableText | None = Field(default=None, max_length=2000)
+    grid: dict[str, list[Any]] | None = None
+
+
+class CatalogEntryOut(BaseModel):
+    """One shelf entry, with enough of its strategy to be chosen without opening it."""
+
+    id: uuid.UUID
+    name: str
+    description: str | None
+    strategy_id: uuid.UUID
+    strategy_name: str
+    """The document's own name — carried beside the label rather than instead of it, because the
+    two are different facts and a reader comparing them is the reader who renamed something."""
+    strategy_version: int
+    setup: str | None
+    """The named setup the document runs, or `None` for one built from indicators. Read from the
+    document, never from either name: a name is typed by a person, a setup is executed."""
+    grid: dict[str, Any]
+    points: int
+    """How many backtests one sweep of this entry would be — the number that decides whether it
+    is a click or an afternoon. Computed from the grid rather than stored, so it cannot disagree
+    with it; `1` for an entry with no axes."""
+    created_at: dt.datetime
+
+
+class CatalogPage(BaseModel):
+    total: int
+    items: list[CatalogEntryOut]
+
+
+class CreateSweep(BaseModel):
+    """Run several catalogue entries, over several charts, over several markets."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
+    """Which entries to sweep. One is the ordinary case and is not a special case."""
+
+    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SWEEP_SYMBOLS)
+    """The markets. Unlike a basket, one market is legal here: a sweep of one entry over one
+    market across three timeframes is a coherent question, and it is a study's shape plus a
+    chart axis."""
+
+    timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
+    """The charts. ⚠️ Each becomes a **document** of its own, not merely a run parameter — since
+    PR-238 a document and its run must agree under a higher-timeframe filter."""
+
+    date_from: AwareInstant
+    date_to: AwareInstant
+    initial_capital: Decimal = Field(gt=0)
+    cost_model: dict[str, Any]
+    collect_missing: bool = True
+    keep_all_trades: bool = False
+    """Every run keeps its trades, won or lost (02/10) — a base for meta-labeling (ADR-0031).
+    Off, a run keeps them only when it passed the bar (`retention`). Never pictures or curves."""
+    """Collect what each (market, chart) is missing, and run once those downloads have landed.
+
+    ⚠️ **One collection per pair, not per run.** A pair here is shared by every point of every
+    entry — sixty runs is an ordinary sweep — and a download per run would fetch the same window
+    sixty times. Each window of a pair is collected once and every run over that pair waits for
+    it; a pair that is covered whole waits for nothing. Left false, a pair with no candles in the
+    window is skipped and named (`CreatedSweep.skipped`, PR-269) — the whole sweep is refused only
+    when every pair is.
+    """
+
+    @field_validator("entry_ids", "symbols", "timeframes")
+    @classmethod
+    def _distinct(cls, values: list[Any], info: ValidationInfo) -> list[Any]:
+        return _distinct_axis(values, info)
+
+
+def _distinct_axis(values: list[Any], info: ValidationInfo) -> list[Any]:
+    """Refuse a sweep axis that names the same value twice.
+
+    ⚠️ **Each of the three breaks something different, and none of them loudly enough.** A
+    repeated symbol enqueues every run twice. A repeated timeframe writes two identical documents
+    that collide on `(name, version)` inside the launch. A repeated entry does the first on a
+    shelf whose strategies already exist, and the second on one whose do not — and on a read, it
+    heads two sections with the same summary of twice the runs. Rejected rather than
+    de-duplicated, for the basket's reason: a caller whose own list disagrees with the sweep it
+    got learns nothing from being quietly corrected.
+    """
+    duplicated = sorted({str(one) for one in values if values.count(one) > 1})
+    if duplicated:
+        raise ValueError(f"{info.field_name} must be distinct; repeated: {', '.join(duplicated)}")
+    return values
+
+
+class PreviewSweepRequest(BaseModel):
+    """Ask what a sweep would enqueue, before any of it is enqueued.
+
+    ⚠️ **The window is here, and the first draft left it out.** That draft's comment said the
+    dates "only decide how long each run reads for" — and the first real sweep launched against
+    this project's own data proved it false: nine of twelve runs failed because the symbol had no
+    candles in the window at all, each at the cost of a worker discovering what the `datasets`
+    index already knew. Coverage is per (symbol, timeframe), so the window decides whether a run
+    can happen at all, not merely how much it reads.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
+    symbols: list[Symbol] = Field(min_length=1, max_length=_MAX_SWEEP_SYMBOLS)
+    timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
+    date_from: AwareInstant
+    date_to: AwareInstant
+
+    @field_validator("entry_ids", "symbols", "timeframes")
+    @classmethod
+    def _distinct(cls, values: list[Any], info: ValidationInfo) -> list[Any]:
+        # The launch's rule, from the same function: a preview that accepted a repeat would
+        # promise twice the runs the launch then refuses to create.
+        return _distinct_axis(values, info)
+
+
+class RefusalGroup(BaseModel):
+    """Every combination of one entry refused for one reason: how many, and a few of them."""
+
+    reason: str
+    """One sentence, from the same validator `POST /studies` refuses with."""
+    count: int
+    examples: list[str]
+    """The labels of the first few refused for it (`REFUSAL_EXAMPLES`), in launch order."""
+
+
+class SweepEntryPreview(BaseModel):
+    """What one entry contributes, and why some of it may not run."""
+
+    entry_id: uuid.UUID
+    name: str
+    points: int
+    """Its grid's own size — before the timeframes and the markets multiply it."""
+    refusals: list[RefusalGroup]
+    """Combinations this entry cannot run, grouped by the reason in the DSL's own words.
+
+    ⚠️ Reported per entry rather than pooled, because a sweep holds several and `htf must be
+    coarser than H4` says nothing about which shelf label caused it.
+
+    ⚠️ **Grouped, not one per point** (26/09). One item per refused point made a preview of a
+    grid with 435 thousand points per chart answer 1.09 GB, and it once took the API down."""
+
+
+class TimeEstimate(BaseModel):
+    """How long something is expected to take, and what the expectation rests on (`estimates`).
+
+    ⚠️ **An order of magnitude, not a promise** — a median rate over this installation's own
+    history, multiplied out. `based_on` is how many past runs or downloads the rate is the median
+    of: a screen shows it, because an estimate from three is a smaller claim than one from two
+    hundred.
+    """
+
+    seconds: float
+    based_on: int
+
+
+class UncoveredMarket(BaseModel):
+    """One (symbol, timeframe) with no candles inside the requested window."""
+
+    symbol: str
+    timeframe: str
+    covers: str | None
+    """What the dataset does hold, as `2025-01-01 to 2026-07-31` — or `None` when nothing of
+    this pair has ever been collected. ⚠️ The two are different failures with different fixes:
+    one is a window to move, the other is a backfill to run."""
+
+
+class SweepPreview(BaseModel):
+    """What a sweep would produce, asked before anything is produced.
+
+    ⚠️ `runs` counts what would actually be **enqueued** — refused combinations are already
+    subtracted. A number that included them would be a promise the launch does not keep.
+    """
+
+    runs: int
+    """What a launch **without collecting** enqueues: refused combinations and the pairs in
+    `uncovered` are both subtracted. ⚠️ Told to collect, the launch runs the uncovered pairs too
+    (those with anything to fetch), so this is the smaller of the two answers."""
+    documents: int
+    """Strategy documents the sweep would write: entries x timeframes x points, before markets."""
+    shared: int = 0
+    """Runnable points that run nothing of their own, because another point of the same entry
+    runs the same (24/09): they differ only in a parameter their entry point never reads. Their
+    runs are **not** in `runs`; each is answered by that other point's (`SweepRunOut.equivalents`),
+    and the dataset keeps a row for each."""
+    entries: list[SweepEntryPreview]
+    uncovered: list[UncoveredMarket]
+    """Markets and charts with no data in this window — skipped by the launch and named, unless
+    it is told to collect them (his rule, 18/09). Kept on the sweep as `SweepOut.skipped`."""
+    backtest_time: TimeEstimate | None = None
+    """How long `runs` would take one after another, or `None` with no finished run to measure by.
+    His call (22/09): shown beside the count, never used to refuse it. ⚠️ For the runs counted
+    here, so like `runs` it leaves out the uncovered pairs a launch told to collect would add."""
+    error: str | None = None
+    """Set when the sweep cannot be launched at all — a grid that leads nowhere, nothing
+    runnable, every pair without data. Never for its size (no cap since 18/09). A different kind
+    of no: there is
+    nothing to run."""
+
+
+class SweepPoint(BaseModel):
+    """A point of a sweep answered by another point's run: where it sits, nothing else."""
+
+    label: str
+    values: dict[str, Any]
+
+
+class SweepRunOut(BaseModel):
+    """One run of a sweep: where it sits on the axes, wrapped around the run itself.
+
+    ⚠️ **The run is carried whole rather than flattened.** `BacktestListItem` is what the run log
+    already renders — symbol, window, costs, status, metrics — and copying those fields up here
+    would be a second description of a run that drifts from the first. What a sweep adds is the
+    *coordinates*, which nothing else knows.
+    """
+
+    entry_id: uuid.UUID
+    entry_name: str
+    """The label from the shelf, which is what makes a sweep readable. It is **not** the
+    strategy's name: that one is inside `run` and is generated from the document."""
+
+    label: str
+    """`M15 · period=9` — a caption. ⚠️ Place a heatmap cell from `values`, never by splitting
+    this: splitting a caption works until a value contains a separator."""
+
+    values: dict[str, Any]
+    """The coordinates, keyed by the grid's own dotted paths plus `timeframe`."""
+
+    run: BacktestListItem
+
+    equivalents: list[SweepPoint] = Field(default_factory=list)
+    """The other points this run answers: same entry and timeframe, differing only in parameters
+    their entry point never reads, so they were not run again (24/09). Listed here rather than
+    as rows of their own, because a row is a run — counted, paged, linked — and these share one.
+    The dataset is where each of them is a row."""
+
+    clones: int = 0
+    """How many runs of the same entry, chart and market did exactly what this one did
+    (`holdout.behaviour`) and were launched after it (01/10) — hidden behind it on the ranked page
+    unless `show_clones`. Unlike `equivalents`, each of them did run: its trades are this run's
+    trades because no trade reached the dial that tells them apart."""
+
+
+class SweepEntryOut(BaseModel):
+    """One shelf entry's share of a sweep, summarised **on its own**.
+
+    ⚠️ **Per entry, never pooled, and that is the decision this schema exists to hold.** Entries
+    are alternatives — `9.1 sem filtro` beside `choch com filtro H4` — so the median of both
+    together is the median of two methods, which describes neither. It is the same refusal a
+    basket makes about summing curves: a number with the shape of an answer to a question
+    nobody asked.
+
+    The summary is the study's, computed by the study's function, so a sweep entry and a study
+    say "median" in the same words and by the same rule. A "point" here is one run: a grid point
+    on one chart over one market.
+    """
+
+    entry_id: uuid.UUID
+    entry_name: str | None
+    """Null when the entry has since been removed from the shelf. Not the name of one of its
+    generated strategies: those carry one point's label, and a section headed by it would read
+    as that point's result."""
+
+    aggregate: StudyAggregate
+    """`best_label` and `worst_label` lead with the symbol (`EURUSD · M15 · period=9`), because
+    the point label alone repeats once per market and would name several runs at once."""
+
+    targets: list[TargetRungOut] = Field(default_factory=list)
+    """The target ladder across this entry's runs, one rung per row, lowest target first."""
+
+
+class CreateHoldout(BaseModel):
+    """Test a sweep's best points on a window none of them was chosen on (24/09).
+
+    ⚠️ **The window must not touch the one searched**, and that is refused rather than warned: a
+    test that shares bars with the search is partly the search again, and would read as a second
+    opinion it is not.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    date_from: AwareInstant
+    date_to: AwareInstant
+    top_n: int = Field(default=3, ge=1, le=100)
+    """How many points to test per (entry, chart, market)."""
+    metric: HoldoutRank = HoldoutRank.NET_PROFIT
+    """What "best" means. A run with no value for it is not ranked, never ranked as zero."""
+    max_drawdown_r: Decimal | None = Field(default=None, gt=0)
+    """Only runs whose deepest drawdown in R is at most this (25/09). A run recorded before its
+    risk in R existed never passes."""
+    min_positive_year_share: Decimal | None = Field(default=None, gt=0, le=1)
+    """Only runs with at least this share of their years positive (25/09). A run with fewer
+    than two years that traded has no share, and never passes."""
+    min_trades: dict[Timeframe, Annotated[int, Field(ge=1, le=1_000_000)]] = Field(
+        default_factory=dict
+    )
+    """The fewest trades a run needs to be ranked, per chart, over the ranking floor
+    (`ranking_floor.RANK_MIN_TRADES`, never below 1). His ask (24/09): the first test ranked D1 and
+    W1 runs of one to four trades. Since 01/10 the default is that floor — 20 on H4, 10 on D1, 5 on
+    W1 — and no longer the keeping one (`retention.MIN_TRADES`), which is zero there."""
+    distinct: bool = True
+    """Skip a run whose record is the same as a better-ranked one's (`holdout.behaviour`), so the N
+    tested are N different behaviours and not one run N times (28/09) — and, since 02/10, one whose
+    entries all lie within a better-ranked one's, or hold all of them, however it closed them
+    (`nested_entries` in the rule)."""
+    retest: bool = False
+    """Test again a window an earlier test of this sweep already used (01/10). Without it such a
+    launch is refused with a 409 naming those tests; with it the test is kept with `retest` and
+    `retest_of` in its rule, so it never reads as a first look.
+
+    ⚠️ **Not a free second opinion.** The reserved window is used once: a second look after
+    adjusting is a choice made on it, and the flag only keeps that visible."""
+
+
+class HoldoutSide(BaseModel):
+    """One run's result, on one side of the comparison."""
+
+    run_id: uuid.UUID
+    status: str
+    net_return: Money | None
+    """Net profit over the initial capital, as the dataset's `return`."""
+    total_trades: int | None
+    profit_factor: Money | None
+    max_drawdown_pct: Money | None
+
+
+class HoldoutRow(BaseModel):
+    """A tested point: where it sits, what it made where it was chosen, and what it made after."""
+
+    entry_id: str
+    entry_name: str | None
+    symbol: str
+    timeframe: str
+    label: str
+    values: dict[str, Any]
+    in_sample: HoldoutSide | None
+    """The run it was chosen by. `None` only if that sweep is gone."""
+    out_of_sample: HoldoutSide
+
+
+class HoldoutGroup(BaseModel):
+    """One (entry, chart) of the test, summed up both ways.
+
+    ⚠️ **Medians, never the best.** The best out-of-sample run is again the best of several draws;
+    whether the method held is what the median and the share still positive say.
+    """
+
+    entry_id: str
+    entry_name: str | None
+    timeframe: str
+    points: int
+    done: int
+    in_sample_median_return: Money | None
+    out_of_sample_median_return: Money | None
+    out_of_sample_positive: Money | None
+    """The fraction of the finished tests that made money on the reserved window — of those that
+    traded there (`no_trades_out`)."""
+    no_trades_out: int = 0
+    """Finished tests that made no trade on the reserved window (01/10). Left out of the median and
+    the positive share: a run that never traded returned zero without being measured, and a group
+    of them read as a method that "held flat".
+
+    ⚠️ Still counted in `done` — they did finish."""
+
+
+class WindowUseOut(BaseModel):
+    """An earlier look at a reserved window (01/10, `holdout.WindowUse`): a test of the same sweep,
+    or a fold of a walk-forward of it."""
+
+    kind: Literal["holdout", "walk_forward"]
+    id: uuid.UUID
+    """The test, or the walk-forward the fold belongs to."""
+    test_id: uuid.UUID | None
+    """The test sweep — `None` for a fold still training."""
+    fold: int | None
+    date_from: dt.datetime
+    date_to: dt.datetime
+    created_at: dt.datetime
+
+
+class HoldoutOut(BaseModel):
+    """A reserved-window test read against the sweep it came from."""
+
+    id: uuid.UUID
+    holdout_of: uuid.UUID | None
+    rule: dict[str, Any]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    searched_from: dt.datetime | None
+    searched_to: dt.datetime | None
+    groups: list[HoldoutGroup]
+    rows: list[HoldoutRow]
+    retest_of: list[WindowUseOut] = Field(default_factory=list)
+    """The earlier looks at this window this test was launched over (01/10), read live: a look
+    since deleted is left out here and still counted in `earlier_uses`."""
+    earlier_uses: int = 0
+    """How many earlier tests had used this window when this one was launched — zero for a first
+    look. A walk-forward counts once, however many of its folds overlap."""
+
+
+class CreateSlicing(BaseModel):
+    """Judge a finished reserved-window test in pieces (25/09): by calendar year, or by blocks of
+    `block_trades` trades — and the bar a point must clear, set before the result is seen."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: SliceMode
+    block_trades: int | None = Field(default=None, ge=5, le=10_000)
+    """Trades per block. Required when cutting by trades, refused by calendar."""
+    pass_share: Decimal = Field(default=Decimal("0.7"), gt=0, le=1)
+    """The share of counted slices that must end above zero R for a point to pass."""
+
+    @model_validator(mode="after")
+    def _blocks_only_by_trades(self) -> CreateSlicing:
+        if (self.mode is SliceMode.TRADES) != (self.block_trades is not None):
+            raise ValueError(
+                "block_trades is how big a block is: give it when cutting by trades, and only then"
+            )
+        return self
+
+
+class SliceOut(BaseModel):
+    """One piece of a point's out-of-sample run."""
+
+    label: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    trades: int
+    net_r: Money
+    counted: bool
+
+
+class SlicedPoint(BaseModel):
+    """One tested point cut into pieces, with its verdict."""
+
+    run_id: uuid.UUID
+    entry_id: str
+    entry_name: str | None
+    symbol: str
+    timeframe: str
+    label: str
+    trades_kept: bool
+    """False for a run that kept no trades — a test run before 25/09 that lost. Not sliced, and
+    never counted as failing: nobody looked."""
+    unscored: int
+    """Trades with no stop, hence no R: left out of every slice."""
+    net_r: Money
+    slices: list[SliceOut]
+    counted: int
+    positive: int
+    share: Money | None
+    passed: bool
+
+
+class SlicedGroup(BaseModel):
+    """How many of one (entry, chart)'s tested points passed."""
+
+    entry_id: str
+    entry_name: str | None
+    timeframe: str
+    points: int
+    judged: int
+    passed: int
+
+
+class SlicingOut(BaseModel):
+    """A slicing as it was asked and as it came out."""
+
+    id: uuid.UUID
+    sweep_id: uuid.UUID
+    mode: SliceMode
+    block_trades: int | None
+    pass_share: Money
+    created_at: dt.datetime
+    groups: list[SlicedGroup]
+    points: list[SlicedPoint]
+
+
+RankBy = Literal[
+    "return",
+    "profit_factor",
+    "win_rate",
+    "expectancy",
+    "drawdown",
+    "net_r",
+    "recovery_r",
+    "positive_years",
+    "drawdown_r",
+]
+"""What a sweep's runs are ranked by — on its page (`GET /sweeps/{id}/runs`) and when the top of
+that ranking is resampled (01/10)."""
+
+MONTECARLO_MAX_TOP_N = 20
+"""The most runs per entry a ranking's Monte Carlo resamples: two pages of the screen. Each point
+costs a fraction of a second twice over, and the request waits for all of them."""
+
+
+class MonteCarloRanking(BaseModel):
+    """Which runs of a sweep's ranking are resampled (01/10): the first `top_n` of each entry,
+    ranked by `rank_by` exactly as the sweep's page ranks them — finished, over their chart's trade
+    floor, one run per clone group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rank_by: RankBy = "return"
+    top_n: int = Field(default=10, ge=1, le=MONTECARLO_MAX_TOP_N)
+
+
+class CreateMonteCarlo(BaseModel):
+    """Resample a finished sweep's points (25/09, `montecarlo`): every point of a reserved-window
+    test, or — since 01/10 — the top of an ordinary sweep's ranking (`ranking`).
+
+    ⚠️ **`ranking` is required on an ordinary sweep and refused on a test.** A test's points are
+    few and were all chosen on other data, so all of them are resampled; a sweep can hold hundreds
+    of thousands of runs, and only its ranking's top is worth the seconds.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: int = Field(default=1000, ge=100, le=5000)
+    """How many paths each point's trades are drawn into — by each of the two draws."""
+    seed: str | None = Field(default=None, min_length=1, max_length=64)
+    """Any string; blank draws one, which is stored — the answer is repeatable either way."""
+    block_trades: int | None = Field(default=None, ge=MIN_BLOCK_TRADES, le=MAX_BLOCK_TRADES)
+    """The trades in a row each block of the second draw holds (01/10). Blank takes each point's
+    own (`montecarlo.default_block_trades`: the cube root of its trades, rounded, at least 2). A
+    block of half a point's trades or more is refused with a 422 naming the point."""
+    ranking: MonteCarloRanking | None = None
+    """Which runs of an ordinary sweep: the first `top_n` of each entry by `rank_by`."""
+
+
+class SpreadOut(BaseModel):
+    """Percentiles of one measure across the simulated paths."""
+
+    p5: Money
+    p50: Money
+    p95: Money
+    p99: Money
+
+
+class SimulatedOut(BaseModel):
+    paths: int
+    trades: int
+    drawdown_r: SpreadOut
+    losing_streak: SpreadOut
+    net_r: SpreadOut
+    negative_share: Money
+    """The share of paths that ended below zero R."""
+    block_trades: int | None = None
+    """The trades in a row each block held; `None` when drawn trade by trade."""
+
+
+class MonteCarloPoint(BaseModel):
+    """One point: what happened, and the spread of what could have — drawn trade by trade
+    (`simulated`) and, since 01/10, in blocks of trades in a row (`in_blocks`)."""
+
+    run_id: uuid.UUID
+    entry_id: str
+    entry_name: str | None
+    symbol: str
+    timeframe: str
+    label: str
+    trades_kept: bool
+    """False for a run that kept no trades to resample: a test run from before 25/09 that lost,
+    or a sweep's run under the bar for keeping them (`retention`) — "no trades kept"."""
+    trades: int
+    observed_net_r: Money
+    observed_drawdown_r: Money
+    observed_losing_streak: int
+    simulated: SimulatedOut | None
+    """Trade by trade. `None` below `montecarlo.MIN_TRADES` trades, or with none kept."""
+    in_blocks: SimulatedOut | None = None
+    """In blocks (01/10), with the block it used. `None` when `simulated` is, and on every point
+    resampled before 01/10 — those were drawn trade by trade only."""
+
+
+class MonteCarloOut(BaseModel):
+    id: uuid.UUID
+    sweep_id: uuid.UUID
+    paths: int
+    seed: str
+    block_trades: int | None = None
+    """The block asked for (01/10); `None` took each point's own, or predates blocks."""
+    ranking: MonteCarloRanking | None = None
+    """Which runs of the ranking were resampled (01/10); `None` for a reserved-window test."""
+    created_at: dt.datetime
+    points: list[MonteCarloPoint]
+
+
+class ClusterMemberIn(BaseModel):
+    """One finished run in a cluster, and the risk its trades are sized by."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    backtest_id: uuid.UUID
+    risk_percent: Decimal | None = Field(default=None, gt=0, le=100)
+    """Percent of the shared balance each trade risks. Blank takes the member's own document's
+    (`risk.sizing.params.percent`)."""
+
+
+class CreateCluster(BaseModel):
+    """Replay several finished runs on one shared account (25/09)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=200)
+    members: list[ClusterMemberIn] = Field(min_length=1, max_length=200)
+    initial_capital: Decimal = Field(default=Decimal(10000), gt=0)
+    max_open_positions: int = Field(default=5, ge=1, le=1000)
+    max_open_risk_percent: Decimal = Field(default=Decimal(5), gt=0, le=100)
+
+    @field_validator("members")
+    @classmethod
+    def _each_run_once(cls, members: list[ClusterMemberIn]) -> list[ClusterMemberIn]:
+        seen = [one.backtest_id for one in members]
+        if len(set(seen)) != len(seen):
+            raise ValueError("a run can be a member once: its trades would be replayed twice")
+        return members
+
+
+class ClusterMemberOut(BaseModel):
+    """A member as the cluster used it, and what the shared account did with its trades."""
+
+    backtest_id: uuid.UUID
+    rerun_of: uuid.UUID | None = None
+    """The run asked for, when it kept no trades and this is its twin run again to keep them."""
+    risk_percent: Money
+    label: str
+    symbol: str
+    timeframe: str
+    offered: int | None = None
+    taken: int | None = None
+    skipped: dict[str, int] | None = None
+    """Why trades were not taken: `positions`, `risk`, `no_stop`, `empty`."""
+    net_pnl: Money | None = None
+
+
+class ClusterPointOut(BaseModel):
+    time: dt.datetime
+    balance: Money
+    equity: Money
+
+
+class ClusterOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    status: str
+    error: str | None
+    initial_capital: Money
+    max_open_positions: int
+    max_open_risk_percent: Money
+    created_at: dt.datetime
+    finished_at: dt.datetime | None
+    members: list[ClusterMemberOut]
+    final_balance: Money | None = None
+    net_return: Money | None = None
+    max_drawdown_pct: Money | None = None
+    max_drawdown_abs: Money | None = None
+    most_open: int | None = None
+    yearly_return: dict[str, Money] | None = None
+    curve: list[ClusterPointOut] | None = None
+    """The marked equity at the end of each day. The drawdown was measured on every point."""
+
+
+class ClusterListItem(BaseModel):
+    id: uuid.UUID
+    name: str
+    status: str
+    members: int
+    created_at: dt.datetime
+    net_return: Money | None = None
+    max_drawdown_pct: Money | None = None
+
+
+class CreateSweepWalkForward(BaseModel):
+    """Walk a finished sweep forward (25/09): windows of whole years and each fold's choice rule —
+    a reserved-window test's, without its window, which each fold's own test supplies."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_year: int = Field(ge=1970, le=2100)
+    train_years: int = Field(ge=1, le=50)
+    test_years: int = Field(ge=1, le=50)
+    folds: int = Field(ge=2, le=20)
+    anchored: bool = True
+    top_n: int = Field(default=3, ge=1, le=100)
+    metric: HoldoutRank = HoldoutRank.NET_PROFIT
+    min_trades: dict[Timeframe, Annotated[int, Field(ge=1, le=1_000_000)]] = Field(
+        default_factory=dict
+    )
+    """Each fold's floor of trades per chart, over the ranking floor
+    (`ranking_floor.RANK_MIN_TRADES`, 01/10) — as a reserved-window test's (`CreateHoldout`)."""
+    max_drawdown_r: Decimal | None = Field(default=None, gt=0)
+    min_positive_year_share: Decimal | None = Field(default=None, gt=0, le=1)
+    distinct: bool = True
+    """Each fold skips clones, as a reserved-window test does (`CreateHoldout.distinct`)."""
+    retest: bool = False
+    """Walk forward over test windows an earlier test of this sweep already used (01/10) — as a
+    reserved-window test's (`CreateHoldout.retest`). The folds of one walk-forward never count
+    against each other."""
+    timeframes: list[Timeframe] | None = Field(default=None, min_length=1)
+    """The charts to walk (28/09); blank is every chart of the sweep. Each fold trains only these —
+    a sweep over M5 and M15 walked on M5 alone does not re-run M15 in every window."""
+    mode: Literal["rerun", "cut"] = "rerun"
+    """`rerun` runs every fold's training and test again; `cut` (01/10) answers every fold from the
+    sweep's own runs cut to whole years in R (`sweep_walkforward_cut`), with nothing run. ⚠️ By cut
+    the windows must be whole years inside the sweep's, the ranking is net R alone (another
+    `metric` is a 422) and there is no drawdown limit (`max_drawdown_r` is a 422)."""
+
+
+class CreatedSweepWalkForward(BaseModel):
+    id: uuid.UUID
+    folds: int
+    runs: int
+    """Training runs queued now; each fold's test runs are queued when its training ends."""
+
+
+class SweepWalkForwardGroupOut(BaseModel):
+    """One (entry, chart) across the folds: each fold's out-of-sample median, and stability."""
+
+    entry_id: str
+    entry_name: str | None
+    timeframe: str
+    medians: list[Money | None]
+    """Per fold, in order; null where the fold has no test for this group yet."""
+    folds: int
+    positive_folds: int
+    most_chosen: str | None
+    most_chosen_folds: int
+    in_sample_medians: list[Money | None] | None = None
+    """By cut only (01/10), per fold: the median net R of the chosen runs on the training years.
+    Null for a walk-forward that re-runs — its in-sample side is its test's to show."""
+    positive_shares: list[Money | None] | None = None
+    """By cut only, per fold: the share of the chosen whose test years ended above zero R."""
+    no_trades_out: list[int | None] | None = None
+    """By cut only, per fold: chosen runs with no trade in the test years — out of the median and
+    the share (01/10)."""
+
+
+class SweepWalkForwardFoldOut(BaseModel):
+    index: int
+    train_from: dt.datetime
+    train_to: dt.datetime
+    test_from: dt.datetime
+    test_to: dt.datetime
+    train_sweep_id: uuid.UUID | None
+    test_sweep_id: uuid.UUID | None
+    stage: str
+    """`training`, `testing`, `done` or `failed`."""
+    error: str | None
+    candidates: int | None = None
+    """By cut only (01/10): the parent's finished runs this fold could rank."""
+    chosen: int | None = None
+    """By cut only: the runs chosen on the training years."""
+    excluded: dict[str, int] | None = None
+    """By cut only: the runs left out of the ranking, by reason — `no_counts` (recorded before they
+    kept trades by year), `refused_cut` (the cut's guard), `under_floor`, `positive_years`."""
+
+
+class SweepWalkForwardOut(BaseModel):
+    id: uuid.UUID
+    parent_sweep_id: uuid.UUID | None
+    start_year: int
+    train_years: int
+    test_years: int
+    anchored: bool
+    mode: Literal["rerun", "cut"] = "rerun"
+    """`cut` (01/10): every median is in R, read from the sweep's own runs — nothing was run."""
+    rule: dict[str, Any]
+    status: str
+    error: str | None
+    created_at: dt.datetime
+    finished_at: dt.datetime | None
+    folds: list[SweepWalkForwardFoldOut]
+    groups: list[SweepWalkForwardGroupOut]
+
+
+class CreateSweepTemplate(BaseModel):
+    """A sweep without its markets, kept to run one market at a time (26/09)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=200)
+    entry_ids: list[uuid.UUID] = Field(min_length=1, max_length=50)
+    timeframes: list[Timeframe] = Field(min_length=1, max_length=8)
+    date_from: AwareInstant
+    date_to: AwareInstant
+    initial_capital: Decimal = Field(default=Decimal(10000), gt=0)
+
+
+class QueueMarket(BaseModel):
+    """One market to queue, with its costs. A blank spread is the market's measured one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: Symbol
+    spread_points: Decimal | None = Field(default=None, ge=0)
+    commission_per_unit: Decimal = Field(default=Decimal(0), ge=0)
+    swap_long_per_lot: Decimal | None = None
+    swap_short_per_lot: Decimal | None = None
+
+
+class QueueMarkets(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    markets: list[QueueMarket] = Field(min_length=1, max_length=200)
+
+
+class TemplateItemOut(BaseModel):
+    id: uuid.UUID
+    symbol: str
+    timeframe: str | None
+    """The one chart this item runs, or `None` for an item queued before 26/09 (every chart)."""
+    cost_model: dict[str, Any]
+    position: int
+    status: str
+    """`waiting`, `launched`, `failed` or `removed`."""
+    sweep_id: uuid.UUID | None
+    error: str | None
+    runs: int
+    done: int
+    failed: int
+    finished: bool
+    """Its sweep exists and nothing of it is still queued or running."""
+
+
+class SweepTemplateOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    entry_ids: list[uuid.UUID]
+    entry_names: list[str | None]
+    timeframes: list[str]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Money
+    paused: bool
+    created_at: dt.datetime
+    items: list[TemplateItemOut]
+
+
+class SweepTemplateListItem(BaseModel):
+    id: uuid.UUID
+    name: str
+    timeframes: list[str]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    paused: bool
+    waiting: int
+    launched: int
+    failed: int
+    created_at: dt.datetime
+
+
+class SweepOut(BaseModel):
+    """A sweep read back: the question that was asked, and every run it became."""
+
+    id: uuid.UUID
+    entry_ids: list[uuid.UUID]
+    symbols: list[str]
+    timeframes: list[str]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    initial_capital: Decimal
+    created_at: dt.datetime
+    holdout_of: uuid.UUID | None = None
+    """Set on a sweep that tests another's best points on a reserved window: the sweep they were
+    chosen from. Its comparison is `GET /sweeps/{id}/holdout`."""
+    holdout_rule: dict[str, Any] | None = None
+    combines: list[uuid.UUID] | None = None
+    """The sweeps this one reads together (26/09); null for a sweep that ran."""
+    template_id: uuid.UUID | None = None
+    """How those points were chosen — `metric`, `top_n`, `min_trades` per chart."""
+    keep_all_trades: bool = False
+    """Every run keeps its trades, won or lost (02/10): a base for meta-labeling (ADR-0031)."""
+    trimmed: list[TrimmedMarket] = Field(default_factory=list)
+    """Pairs whose runs start at their first month of real bars, later than the window (02/10)."""
+    paused_at: dt.datetime | None = None
+    """When the sweep was paused: its waiting runs are out of the queue until resumed (02/10)."""
+    counts: SweepRunCounts | None = None
+    """How many runs sit in each status — what a screen polls on, without the runs themselves."""
+    summary_as_of: dt.datetime | None = None
+    """When `entries` was computed (05/10): a large sweep's summary is the last one kept while it
+    runs, computed again every few minutes, never on the screen's poll."""
+    entries: list[SweepEntryOut]
+    """In the order the request listed the entries — which, from the launch screen, is the order
+    they were **ticked**, not the order the shelf shows them in."""
+
+    runs: list[SweepRunOut]
+    skipped: list[UncoveredMarket] = Field(default_factory=list)
+    failed_collections: list[CollectionOut] = Field(default_factory=list)
+    """Downloads that failed under this sweep's runs, once each (his rule of 22/09). Apart from
+    `skipped`, which is markets the launch never ran: these runs *did* run, on what was on disk."""
+    """Pairs of `symbols` x `timeframes` left out for having no candles in the window.
+
+    ⚠️ **Read this before reading `symbols` and `timeframes` as the space that was measured.**
+    Those are what was asked; a pair named here has no runs because there was nothing to read,
+    not because it was measured and came back empty."""
+
+
+class SweepRunsPage(BaseModel):
+    """One page of a sweep's runs, best first by the measure asked (`GET /sweeps/{id}/runs`)."""
+
+    total: int
+    """How many runs the filter holds, across every page — the runs `items` pages through."""
+    offset: int
+    limit: int
+    items: list[SweepRunOut]
+    below_floor: int = 0
+    """How many of the filter's runs are under the ranking floor (01/10) — hidden from `total` and
+    `items` unless `all_runs` was asked, and counted the same either way.
+
+    ⚠️ **"Under the floor" includes every run not finished**: a queued, running or failed run has no
+    trades to count, so it is not ranked until it has. With `all_runs` they come back, last, as
+    before."""
+    clones_hidden: int = 0
+    """How many of the runs the page ranks are clones of a run launched before them (01/10,
+    `SweepRunOut.clones`) — left out of `total` and `items` unless `show_clones`, and counted the
+    same either way, so the screen can name them in both states. Counted after the floor: with
+    `all_runs` it counts the clones among every run."""
+
+
+class SweepRunCounts(BaseModel):
+    """How many of a sweep's runs sit in each status: `done + running + queued + failed == total`.
+
+    One field per `BacktestStatus`, held by `test_a_sweeps_counts_name_every_status_a_run_can_have`.
+    """
+
+    total: int
+    done: int
+    running: int
+    queued: int
+    failed: int
+
+
+class SweepListEntry(BaseModel):
+    """One entry a listed sweep ran, named the way the shelf names it today."""
+
+    entry_id: uuid.UUID
+    name: str | None
+    """Null when the entry has since been removed from the shelf — an entry is a removable label,
+    and a finished sweep must stay readable without it (see `Sweep.entry_ids`)."""
+
+
+class SweepListItem(BaseModel):
+    """One sweep as a line of history: enough to recognise it, and how far along it is.
+
+    ⚠️ **No runs and no summaries, and that is what makes the list affordable.** Reading a sweep
+    in full is every one of its runs, joined and serialised; a line that only needs "480 of 500
+    done" is one grouped count. The full read is one click away, at `/sweeps/{id}`.
+    """
+
+    id: uuid.UUID
+    created_at: dt.datetime
+    entries: list[SweepListEntry]
+    """In the order the request listed them, as on the sweep's own page."""
+
+    symbols: list[str]
+    timeframes: list[str]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    runs: SweepRunCounts
+    combines: int | None = None
+    """How many sweeps a combination reads together; null for a sweep that ran."""
+    template_id: uuid.UUID | None = None
+
+
+class CombineSweeps(BaseModel):
+    """Read several finished sweeps of one template as one (26/09)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sweep_ids: list[uuid.UUID] = Field(min_length=2, max_length=500)
+
+
+class SweepsPage(BaseModel):
+    """A page of sweeps, newest first. `total` lets a client size the pager."""
+
+    total: int
+    limit: int
+    offset: int
+    items: list[SweepListItem]
+
+
+class DashboardSlice(BaseModel):
+    """One group of a dashboard's runs — an entry, a market, a chart, or all of them.
+
+    `winners + losers + flat == finished`, split by the sign of the net profit. A run with no
+    metrics yet is in `runs` and in none of those: it has not won or lost anything.
+    """
+
+    key: str
+    """The entry's id, the symbol, or the timeframe; `all` for the whole dashboard."""
+
+    label: str | None
+    """What a person reads. Null only for an entry since removed from the shelf."""
+
+    runs: int
+    finished: int
+    failed: int
+    winners: int
+    losers: int
+    flat: int
+    median_return: Money | None
+    mean_return: Money | None
+    best_return: Money | None
+    worst_return: Money | None
+    """Returns are fractions of each run's own starting capital. All null until a run finishes."""
+
+    median_drawdown: Money | None
+    worst_drawdown: Money | None
+    """The largest fall from a peak measured as a fraction of that peak — not necessarily the
+    deepest fall in money, which the engine tracks separately."""
+
+
+class DashboardRatio(BaseModel):
+    """A per-run ratio's median, and over how many runs it exists at all."""
+
+    median: Money | None
+    runs: int
+    """A win rate needs a trade and a profit factor needs a loss, so each ratio is defined over
+    its own subset. A median over five runs is a smaller claim than one over five hundred."""
+
+
+class DashboardTotals(BaseModel):
+    sweeps: int
+    entries: int
+    symbols: list[str]
+    timeframes: list[str]
+    runs: SweepRunCounts
+    """Every run launched, copies included."""
+
+    measurements: int
+    """Distinct measurements among those runs. Every other figure of the dashboard, except the
+    per-sweep timeline, counts each measurement once."""
+
+    trades: int
+    """Closed trades, summed over finished measurements."""
+
+    runs_without_trades: int
+    """Finished measurements that never traded — flat by construction, not evidence of anything."""
+
+    left_out: list[DashboardLeftOut] = Field(default_factory=list)
+    """Pairs some sweep in the period asked for and skipped for having no candles (PR-269). They
+    have no runs, so no table below can show them — and without this list the market and chart
+    breakdowns read as the whole space that was asked for. His call, 22/09."""
+
+
+class DashboardLeftOut(BaseModel):
+    """One pair the period's sweeps left out, and in how many of them."""
+
+    symbol: str
+    timeframe: str
+    sweeps: int
+
+
+class DashboardSweep(BaseModel):
+    """One sweep on the dashboard's timeline.
+
+    ⚠️ Its median pools the sweep's entries. It says how that search went, not whether a method
+    works — that is `SweepDashboardOut.by_entry`.
+    """
+
+    id: uuid.UUID
+    created_at: dt.datetime
+    entry_names: list[str | None]
+    runs: int
+    finished: int
+    winners: int
+    median_return: Money | None
+    left_out: int = 0
+    """Pairs this sweep asked for and skipped for having no candles — its `skipped`, counted."""
+
+
+class SweepDashboardOut(BaseModel):
+    """Every sweep launched in a window, summarised at once.
+
+    ⚠️ **Every figure is in-sample**, and the best of them is the best of the widest search this
+    project runs. Read the medians and the share of winners first.
+    """
+
+    launched_from: dt.datetime | None
+    launched_to: dt.datetime | None
+    totals: DashboardTotals
+    overall: DashboardSlice
+    win_rate: DashboardRatio
+    profit_factor: DashboardRatio
+    expectancy: DashboardRatio
+    """Per trade, as a fraction of the run's starting capital, as in the dataset."""
+
+    by_entry: list[DashboardSlice]
+    """Best median first. Never pooled across entries: each is its own method.
+
+    ⚠️ Returns are over each run's whole window, and one entry's sweeps may have used windows of
+    different lengths — a six-year return and a one-year return sit in the same median."""
+
+    by_symbol: list[DashboardSlice]
+    by_timeframe: list[DashboardSlice]
+    sweeps: list[DashboardSweep]
+    """Oldest first, which is the order a timeline is read in. Each counts all its own runs,
+    copies of another sweep's included."""
+
+
+class DatasetColumnOut(BaseModel):
+    """One column of a sweep's dataset, as the file names it."""
+
+    name: str
+    role: Role
+    """`identity`, `choice`, `condition` or `outcome` — which is what separates a knob from a
+    result, and the one thing a reader cannot infer from a column's name."""
+
+    unit: str
+    description: str
+
+
+class DatasetOmissionOut(BaseModel):
+    """A fact the dataset leaves out on purpose, and why.
+
+    Listed so that its absence is not read as an oversight — and not fetched from elsewhere by a
+    reader who assumed it was forgotten."""
+
+    name: str
+    reason: str
+
+
+class DatasetDictionaryOut(BaseModel):
+    """What every column of `/sweeps/{id}/dataset.csv` is, served beside the file.
+
+    ⚠️ Generated from the list that writes the file's header (`sweep_dataset.columns_for`), and
+    per sweep, because the grid columns are: a dictionary shared by every sweep would describe
+    columns this file does not have.
+    """
+
+    row: str
+    caveats: list[str]
+    columns: list[DatasetColumnOut]
+    omitted: list[DatasetOmissionOut]
+
+
+class TrimmedMarket(BaseModel):
+    """A pair whose runs start later than the sweep's window: at its first month of real bars."""
+
+    symbol: str
+    timeframe: str
+    date_from: dt.datetime
+
+
+class CreatedSweep(BaseModel):
+    id: uuid.UUID
+    runs: int
+    shared: int = 0
+    """Points answered by another point's run rather than their own — `SweepPreview.shared`."""
+    skipped: list[UncoveredMarket] = Field(default_factory=list)
+    """Pairs left out for having no candles in the window — his answer "do not collect" (18/09).
+    The same list the sweep keeps (`SweepOut.skipped`), so the launch and a later read agree."""
+    trimmed: list[TrimmedMarket] = Field(default_factory=list)
+    """Pairs whose runs start at their first month of real bars, later than the window asked
+    (02/10): before it the broker's intraday history is one bar a day stored as the chart."""
+
+
+class BestMapCell(BaseModel):
+    """The best run of one (market, setup, chart) — a cell of `GET /best/map` (02/10)."""
+
+    market: str
+    """The first folder of the broker's tree (`Forex`, `Metals`, `Cash Indices`…), or the asset
+    class for a symbol the broker's list does not hold (`best.market_of`)."""
+    symbol: str
+    entry_id: str
+    entry_name: str | None
+    """`None` once the catalogue entry was removed: its runs still rank."""
+    timeframe: str
+    value: Decimal | None
+    """The run's value under the metric asked; `None` when `unbounded`."""
+    unbounded: bool = False
+    """A drawdown ratio with a gain and no drawdown: above every finite one, with no number."""
+    run_id: uuid.UUID
+    sweep_id: uuid.UUID | None
+    engine_version: str
+    """The engine the best run was measured on (23/10, #476's fallout): runs of every engine rank
+    side by side, so a cell may be won by a run from an older one."""
+    ranked: int
+    """How many runs of the cell were ranked — the draws its best is the best of."""
+
+
+class BestMapOut(BaseModel):
+    metric: BestMetric
+    every_run: bool
+    """Every run with a value, not only those over the chart's ranking floor."""
+    engine_version: str
+    """The engine the API is running (23/10): runs of every engine rank now, so this is only the
+    current reference; each cell carries its own `engine_version` with the run that won it."""
+    cells: list[BestMapCell]
+    as_of: dt.datetime | None = None
+    """When the map was computed (05/10): it is served from the last one kept, computed again
+    every few minutes when runs have finished — ranking every run took 30 s an opening."""
+    refreshing: bool = False
+    """This map had not been opened for a day, so nothing kept it current: it is `as_of` old and
+    being computed again now (08/10). The screen says so and asks again until it is not."""
+
+
+class BestTestOut(BaseModel):
+    """One reserved-window test of a point — the validation the page names beside it."""
+
+    sweep_id: uuid.UUID | None
+    status: str
+    date_from: dt.datetime
+    date_to: dt.datetime
+    net_r: Decimal | None
+    total_trades: int | None
+
+
+class BestPointOut(BaseModel):
+    """One of a cell's top runs, with every measure the page can rank by."""
+
+    run_id: uuid.UUID
+    sweep_id: uuid.UUID | None
+    strategy_id: uuid.UUID
+    label: str
+    values: dict[str, Any]
+    """The point's coordinates on its sweep's grid."""
+    date_from: dt.datetime
+    date_to: dt.datetime
+    value: Decimal | None
+    unbounded: bool = False
+    net_r: Decimal | None
+    net_r_per_year: Decimal | None
+    recovery_r: Decimal | None
+    positive_year_share: Decimal | None
+    max_drawdown_r: Decimal | None
+    total_trades: int
+    profit_factor: Decimal | None
+    return_pct: Decimal | None = None
+    """The net profit over the starting capital (05/10)."""
+    cagr: Decimal | None = None
+    win_rate: Decimal | None = None
+    sharpe: Decimal | None = None
+    worst_year_r: Decimal | None = None
+    positive_month_share: Decimal | None = None
+    """Months ending above zero R over months with a trade; none for a run before 05/10."""
+    yearly_r: dict[str, Any]
+    tests: list[BestTestOut]
+    """Its reserved-window tests, oldest window first; empty for a point never validated."""
+
+
+class BestCellOut(BaseModel):
+    symbol: str
+    entry_id: str
+    entry_name: str | None
+    timeframe: str
+    metric: BestMetric
+    every_run: bool
+    ranked: int
+    """How many runs of the cell were ranked, before clones and near-clones gave their place."""
+    points: list[BestPointOut]
+
+
+class SweepPauseOut(BaseModel):
+    """What a pause or a resume did, and what is left (02/10)."""
+
+    paused_at: dt.datetime | None
+    """When the sweep was paused; null once resumed."""
+    queued: int
+    """The sweep's runs waiting: out of the queue while paused, back in it once resumed."""
+    running: int
+    """Runs a worker still holds. Safe to turn the machines off when this is zero and paused."""
+    withdrawn: int = 0
+    """Jobs a pause took out of the queue."""
+    requeued_jobs: int = 0
+    """Jobs a resume queued, a batch counting once."""
+    released: int = 0
+    """Runs a resume found `running` with no worker holding any job, and queued again."""
+
+
+class MarketOut(BaseModel):
+    """One market of the symbol browser's tabs, and how many symbols the broker lists in it."""
+
+    key: str
+    label: str
+    count: int
+    collected: int = 0
+    """How many of them have candles — the ones a sweep can run today."""
+
+
+class MarketsOut(BaseModel):
+    markets: list[MarketOut]
+    """Every market in the browser's order — those with no symbol too, so the tabs never move."""
+    snapshot: SymbolSnapshotOut | None = None
+    """Where the list came from; null when the broker was never synced."""
+
+
+class BrowsedSymbolOut(BaseModel):
+    symbol: str
+    """What a run is launched over: the system's name once collected (`WIN`), else the ticker."""
+    ticker: str | None = None
+    """The broker's own ticker (`WIN$`) — shown beside `symbol` when the two differ."""
+    description: str | None = None
+    path: str | None = None
+    market: str
+    catalogued: bool
+    """Whether the system has collected it: a launch over one that is not collects it first."""
+    spread_points: Decimal | None = None
+    broker: str | None = None
+    """The broker whose terminal lists it (ADR-0032); null for a server nobody registered."""
+
+
+class SymbolBrowseOut(BaseModel):
+    """One page of a market's symbols, matching the search, alphabetical."""
+
+    total: int
+    offset: int
+    limit: int
+    items: list[BrowsedSymbolOut]
+
+
+class LiveSetupFromRun(BaseModel):
+    """Follow what a finished run was (09/10). A setup already following its strategy and
+    timeframe gains the run's market instead."""
+
+    backtest_id: uuid.UUID
+    no_target_r: Decimal = Field(default=Decimal(5), gt=0, le=100)
+
+
+class LiveSetupCreate(BaseModel):
+    """A setup registered by hand: a strategy version, one timeframe, the markets it follows."""
+
+    strategy_id: uuid.UUID
+    timeframe: Timeframe
+    instrument_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
+    name: StorableText | None = Field(default=None, max_length=200)
+    cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+    no_target_r: Decimal = Field(default=Decimal(5), gt=0, le=100)
+
+
+class LiveSetupNew(BaseModel):
+    """A setup registered from scratch (09/10): a strategy document, its chart and its markets."""
+
+    definition: dict[str, Any]
+    timeframe: Timeframe
+    instrument_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
+    cost_model: dict[str, Any] = Field(default_factory=lambda: {"type": "none"})
+    no_target_r: Decimal = Field(default=Decimal(5), gt=0, le=100)
+
+
+class LiveSetupPatch(BaseModel):
+    """Rename it, switch it on or off, change its no-target R or note. Left out is kept."""
+
+    name: StorableText | None = Field(default=None, min_length=1, max_length=200)
+    active: bool | None = None
+    no_target_r: Decimal | None = Field(default=None, gt=0, le=100)
+    note: StorableText | None = Field(default=None, max_length=500)
+
+
+class LiveSetupVersion(BaseModel):
+    """The setup's strategy, edited: becomes a new version, and the setup runs it (09/10)."""
+
+    definition: dict[str, Any]
+
+
+class LiveMarketAdd(BaseModel):
+    instrument_id: uuid.UUID
+
+
+class LiveMarketPatch(BaseModel):
+    active: bool
+
+
+class LiveMarketOut(BaseModel):
+    instrument_id: uuid.UUID
+    symbol: str
+    broker: str | None = None
+    active: bool
+
+
+class LiveMetricsOut(BaseModel):
+    """A setup's history summed up, in R only (his call, 09/10)."""
+
+    signals: int
+    closed: int
+    open: int
+    cancelled: int
+    wins: int
+    win_rate: Money | None = None
+    net_r: Money
+    average_r: Money | None = None
+    profit_factor: Money | None = None
+    max_drawdown_r: Money
+    r_by_month: dict[str, Money] = Field(default_factory=dict)
+
+
+class LiveSetupOut(BaseModel):
+    """One followed setup: what it runs, where, and what it has posted."""
+
+    id: uuid.UUID
+    name: str
+    strategy_id: uuid.UUID
+    strategy_name: str
+    timeframe: str
+    no_target_r: Money
+    active: bool
+    note: str | None = None
+    source_backtest_id: uuid.UUID | None = None
+    created_at: dt.datetime
+    markets: list[LiveMarketOut]
+    metrics: LiveMetricsOut
+
+
+class SignalOut(_Out):
+    """One signal of a setup's history."""
+
+    number: int
+    symbol: str
+    timeframe: str
+    side: str
+    status: str
+    order_type: str | None = None
+    entry: Money | None = None
+    stop: Money | None = None
+    target: Money | None = None
+    exit_price: Money | None = None
+    result_r: Money | None = None
+    reason: str | None = None
+    armed_at: dt.datetime | None = None
+    triggered_at: dt.datetime | None = None
+    ended_at: dt.datetime | None = None
+    strategy_id: uuid.UUID | None = None
+
+
+# --------------------------------------------------------------------------- signals by market
+
+
+class SupervisorOut(BaseModel):
+    """Whether the signals supervisor is supervising, as its own last word says (ADR-0033)."""
+
+    alive: bool
+    """It spoke within its last few rounds. `False`: nobody restarts a session that fails."""
+    at: dt.datetime | None = None
+    reachable: bool = True
+    """`False` when Redis could not be read, so nothing is known either way."""
+
+
+class MarketProcessOut(BaseModel):
+    """One process of a market: what it last said and how many sessions it carries."""
+
+    key: str
+    phase: str | None = None
+    """`warming`, `live`, or `None` when it has not said anything readable yet."""
+    heard_at: dt.datetime | None = None
+    sessions: int
+
+
+LiveSessionState = Literal[
+    "running", "warming", "starting", "stopping", "waiting", "off", "unknown"
+]
+
+
+class LiveMarketSetupOut(BaseModel):
+    """One setup on one market: its switch, its session's state, what is under way, its record."""
+
+    setup_id: uuid.UUID
+    name: str
+    strategy_name: str
+    setup_active: bool
+    active: bool
+    """This market's own switch on the setup."""
+    no_target_r: Money
+    state: LiveSessionState
+    retry_in: int | None = None
+    """Seconds before a session that failed is tried again (`state` is `waiting`)."""
+    under_way: list[SignalOut]
+    """Signals still armed or in a trade, oldest first."""
+    metrics: LiveMetricsOut
+    """This setup's record on this market alone."""
+
+
+class LiveTimeframeOut(BaseModel):
+    """One market — an instrument on a timeframe — and the processes that run it."""
+
+    timeframe: str
+    processes: list[MarketProcessOut]
+    """Usually one; two or more while a setup added since the last restart still runs apart."""
+    restarting: bool
+    setups: list[LiveMarketSetupOut]
+
+
+class LiveAssetOut(BaseModel):
+    """An instrument and its markets, one per timeframe."""
+
+    instrument_id: uuid.UUID
+    symbol: str
+    broker: str | None = None
+    timeframes: list[LiveTimeframeOut]
+
+
+class LiveMarketsOut(BaseModel):
+    """The signals screen by asset: the supervisor's word, then every asset followed."""
+
+    supervisor: SupervisorOut
+    assets: list[LiveAssetOut]
+
+
+class RestartMarketRequest(BaseModel):
+    """Restart one market's sessions together, in one process."""
+
+    instrument_id: uuid.UUID
+    timeframe: Timeframe

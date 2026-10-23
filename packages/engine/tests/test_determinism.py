@@ -26,6 +26,8 @@ from dataclasses import asdict
 from decimal import Decimal, getcontext, localcontext
 from typing import Any
 
+from tradeforge_engine.backtest_broker import BacktestBroker
+from tradeforge_engine.domain import Candle
 from tradeforge_engine.loop import RunResult, run
 from tradeforge_engine.testing import (
     AAPL,
@@ -34,12 +36,25 @@ from tradeforge_engine.testing import (
     FixedRisk,
     ImmediateFillBroker,
     ScriptedStrategy,
+    bar,
     close_out,
     entry,
+    modify_stop,
     rising,
 )
 
 SCRIPT = {5: [entry()], 12: [close_out()], 20: [entry()], 33: [close_out()]}
+
+
+def up_then_down() -> list[Candle]:
+    """Twelve bars up, eight giving it back. `rising()` alone cannot exercise a trailing stop:
+    in a market that only goes up, the only stop that ever fills is one placed above it."""
+    peak = 12
+    path = [
+        Decimal("1.10000") + Decimal("0.00100") * (index if index <= peak else 2 * peak - index)
+        for index in range(21)
+    ]
+    return [bar(index, open_=str(path[index]), close=str(path[index + 1])) for index in range(20)]
 
 
 def canonical(result: RunResult) -> bytes:
@@ -190,3 +205,42 @@ def test_a_stock_and_a_pair_are_both_deterministic() -> None:
         )
 
     assert canonical(stock_run()) == canonical(stock_run())
+
+
+def test_a_run_that_trails_its_stop_is_deterministic() -> None:
+    """The verb added in ADR-0018, inside the corpus this suite sweeps.
+
+    `ImmediateFillBroker` refuses a modification — it holds no protective level — so the run
+    above never exercises `modify_stop` at all. This one goes through `BacktestBroker`, where
+    the stop is real, tightens twice, and the trade ends on the trailed level.
+
+    Same process is enough here, and it is worth saying why rather than assuming it: the
+    cross-process test upstairs exists to catch a `set` or `dict` iteration feeding a result,
+    whose order is fixed per process by `PYTHONHASHSEED`. `modify_stop` iterates nothing — it
+    replaces one frozen dataclass and assigns another — so a differing hash seed has nothing to
+    act on. What can still go wrong here is a `Decimal` losing exactness or a level rebuilt
+    from a mutable that moved, and both show up in these bytes.
+    """
+
+    def trailing_run() -> RunResult:
+        return run(
+            candles=up_then_down(),
+            timeframe=HOUR,
+            instrument=EURUSD,
+            strategy=ScriptedStrategy(
+                script={
+                    2: [entry(price="1.10300", stop="1.09000")],
+                    8: [modify_stop(stop="1.10500")],
+                    13: [modify_stop(stop="1.11000")],
+                }
+            ),
+            broker=BacktestBroker(instrument=EURUSD, initial_capital=Decimal(10_000)),
+            risk=FixedRisk(volume=Decimal("0.5")),
+        )
+
+    first = trailing_run()
+
+    # Not a tautology only because the trade really was trailed out: without the modifications
+    # the 1.09000 stop is never touched by a market that only rises, and the run ends holding.
+    assert [trade.reason for trade in first.trades] == ["sl"]
+    assert canonical(first) == canonical(trailing_run())

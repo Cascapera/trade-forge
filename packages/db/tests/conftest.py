@@ -7,22 +7,61 @@ for them, so `uv run pytest` still runs with no Docker anywhere.
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from tradeforge_db.config import PostgresSettings
 from tradeforge_db.migrate import upgrade
 from tradeforge_db.session import create_db_engine, create_session_factory
+from tradeforge_db.testing import truncate
 
 # Children first: TRUNCATE ... CASCADE would do this for us, but naming the order
 # makes the dependency between the tables visible where someone will read it.
 TABLES_CHILD_FIRST = (
+    # ⚠️ First of all: it points at `backtests` and at `collections`, and both are emptied below.
+    # Signals point at setups, setups at strategies, instruments and backtests, all emptied below.
+    "signals",
+    "live_setup_markets",
+    "live_setups",
+    "backtest_collections",
+    # ⚠️ Append-only, and the only table here whose trigger has to be lifted to empty it
+    # at all — see `tradeforge_db.testing.truncate`. Listed because a row left behind is
+    # a parent the next test could attach to, exactly like `live_sessions`.
+    "order_audit",
     "trades",
+    # Before `strategies` and `instruments`, which it points at, and after `trades`, which
+    # points at it. Listed for the same reason `symbol_history` is: a session row left
+    # behind is not inert, it is a parent the next test's trades could attach to.
+    "live_sessions",
     "backtest_metrics",
     "backtests",
+    "baskets",
+    # The third grouping, beside `baskets` and `studies`, and here for the reason they are:
+    # after `backtests`, which points at it. A sweep row left behind is not inert — it is a
+    # parent the next test's runs could attach to. ⚠️ Unlike `catalog_entries` below it, this
+    # table holds **no** foreign key to `strategies`, and neither do its points: the trade
+    # `rev_0018` makes so a finished sweep stays readable.
+    "sweep_points",
+    "sweeps",
+    # ⚠️ Before `strategies`, which it points at with a RESTRICT foreign key — so a row
+    # left behind does not merely linger, it makes the next test unable to empty
+    # `strategies` at all. Added with the table; the two lists above it drifted once
+    # before for exactly this reason (`live_sessions`).
+    "catalog_entries",
     "strategies",
     "datasets",
+    # Before `instruments`, which it points at with a RESTRICT foreign key (rev_0059).
+    "stock_splits",
     "instruments",
+    # ⚠️ Not a child of anything, and listed anyway. `broker_symbols` deliberately has no
+    # foreign key — that is what lets a sync replace it wholesale — so no CASCADE reaches it
+    # and a test that syncs would leak its rows into the next one.
+    "broker_symbols",
+    # The same argument, and the same absence of a foreign key. `symbol_history` is keyed on
+    # (symbol, timeframe), so a row left behind is not inert — it is the answer the next test
+    # reads. It was missed when the table was added, which is what this comment is for.
+    "symbol_history",
+    "collections",
 )
 
 
@@ -51,9 +90,7 @@ def session(migrated_engine: Engine) -> Iterator[Session]:
     be inspected — and the next test still starts from a known state.
     """
     with migrated_engine.begin() as connection:
-        connection.execute(
-            text(f"TRUNCATE {', '.join(TABLES_CHILD_FIRST)} RESTART IDENTITY CASCADE")
-        )
+        truncate(connection, TABLES_CHILD_FIRST)
 
     db = create_session_factory(migrated_engine)()
     try:

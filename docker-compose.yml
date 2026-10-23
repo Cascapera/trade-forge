@@ -6,13 +6,57 @@
 # an unset password must be a loud error, never an empty string that quietly
 # becomes a passwordless database.
 
+# Shared connection settings for the Python services (api, worker, migrate). They point at the
+# in-network service names and internal ports, overriding the .env values — which target localhost
+# and the published ports, for processes a developer runs on the host instead of in compose.
+x-backend-env: &backend-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: '5432'
+  POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+  POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+  REDIS_HOST: redis
+  REDIS_PORT: '6379'
+  # Where the collector wrote the Parquet candles, inside the mounted ./data volume (ADR-05).
+  PARQUET_ROOT: /data/ohlcv
+  # How many backtest workers run (below). The api reads it too, to divide its time estimates.
+  TRADEFORGE_WORKERS: ${TRADEFORGE_WORKERS:-1}
+
 services:
   postgres:
     # Pinned to a minor, not `16-alpine`: floating tags mean two developers can
     # run different databases while believing they run the same one.
-    image: postgres:16.14-alpine
+    image: postgres:18.6-alpine
     container_name: tradeforge-postgres
     restart: unless-stopped
+    # Parallel queries share memory through /dev/shm, which Docker caps at 64 MB: on 01/10 two
+    # reads of a 175-thousand-run sweep failed with `DiskFull: could not resize shared memory
+    # segment` while the workers ran. Takes effect when the container is recreated.
+    shm_size: 1g
+    # ⚠️ **Memory sized for the machine, not the image's defaults** (06/10). With 128 MB of shared
+    # buffers and 4 MB per sort, a 42 GB database leaned entirely on the VM's page cache; with 16
+    # workers beside it the cache was squeezed, every count read the disk, the workers sat idle
+    # waiting on it and runs failed with `Cannot allocate memory`. Sized for the 43 GB the Docker
+    # VM has (`.wslconfig`): 6 GB of buffers leave room for the workers (~0.6 GB each) and the
+    # API. `random_page_cost` 1.1 because the disk is an SSD. Takes effect when recreated.
+    #
+    # The two sizes come from `.env` since 16/10 (ADR-0036): the server moves to a machine with
+    # 32 GB for everything, where 6 GB of buffers would leave no room for the workers beside it.
+    # Unset, they are the i9's values above, so a machine that never sets them sees no change.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-6GB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-20GB}
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - random_page_cost=1.1
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
@@ -22,7 +66,16 @@ services:
     volumes:
       # A named volume, not a bind mount: the database owns its own storage, with
       # its own uid/permissions, and does not leak files into the repo.
-      - postgres-data:/var/lib/postgresql/data
+      #
+      # ⚠️ `/var/lib/postgresql`, NOT `/var/lib/postgresql/data`. From 18 the official image
+      # stores the cluster in a major-version subdirectory (`.../18/docker`) so that
+      # `pg_upgrade --link` can work without crossing a mount boundary, and it *refuses to
+      # start* when it finds a mount at the old path — the container crash-loops with an
+      # explanation nobody reads until they look at the logs.
+      #
+      # This is the half of the 16 -> 18 upgrade that no CI run could have caught: the workflow's
+      # service container mounts no volume at all, so it never meets the question.
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       # Postgres accepts TCP connections seconds before it will answer a query.
       # `pg_isready` is the difference between "the process started" and "the
@@ -34,7 +87,7 @@ services:
       start_period: 10s
 
   redis:
-    image: redis:7.4.9-alpine
+    image: redis:8.10.1-alpine
     container_name: tradeforge-redis
     restart: unless-stopped
     # Persist to disk: Redis carries order and fill events. Losing them on a
@@ -50,6 +103,131 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+
+  # One-shot: bring the schema to head, then exit. api and worker wait on it completing, so
+  # migrations run exactly once — never a race between two replicas each trying to migrate the
+  # same database on startup.
+  # ⚠️ No seed here (02/10): the example instruments (`tradeforge-db seed`) came back on every
+  # deploy, and `US500` and `AAPL` sat in the symbol pickers beside the broker's real `Usa500`,
+  # with no candles and no symbol to collect them by. The collector registers every instrument it
+  # collects; a fresh clone without a broker runs the seed by hand (README, step 2).
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: tradeforge-api
+    command: ['tradeforge-db', 'upgrade']
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: tradeforge-api
+    command:
+      - uvicorn
+      - tradeforge_api.main:create_app
+      - --factory
+      - --host
+      - '0.0.0.0'
+      - --port
+      - '8000'
+    environment:
+      <<: *backend-env
+      # A native crash (segfault) prints every thread's Python stack to the log instead of
+      # dying silently — the API segfaulted six times on 26/09 with nothing in its log.
+      PYTHONFAULTHANDLER: '1'
+    ports:
+      - '8000:8000'
+    volumes:
+      # Read-only: the API serves candles the collector wrote; it never writes into this tree.
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: tradeforge-api
+    # Not `arq tradeforge_api.worker.WorkerSettings`: the same worker on `OneTripWorker`, which
+    # claims its next job in one round trip to Redis (`claim`, 06/10). The old command still
+    # works; from across the internet it idles ~15–30 s between batches.
+    command: ['python', '-m', 'tradeforge_api.worker_main']
+    environment: *backend-env
+    # One core per worker, and as many workers as TRADEFORGE_WORKERS asks for (23/09). A backtest
+    # is synchronous CPU: one worker runs one at a time on one core, so the count is the speed and
+    # the cap is what leaves the rest of the machine to whoever is using it. On his i9-14900K
+    # (32 threads) 12 workers hold a sweep near 40% of the CPU.
+    # ⚠️ Changing either value recreates the workers. Since 16/10 a recreated worker first
+    # finishes the batch it holds (`stop_grace_period` below), so nothing is lost, but the change
+    # can take as long as the longest batch in flight.
+    #
+    # ⚠️ **A memory ceiling per worker, swap included** (15/10). Six workers on a sweep of eleven
+    # years of M5 grew to ~3 GB each; with Postgres' 6 GB of buffers that was the whole 24 GB VM,
+    # and the VM froze — Postgres and Redis with it, and the live signals went without candles
+    # for fourteen minutes. With a ceiling, the kernel kills the one worker that crossed it, in
+    # its own cgroup; arq hands its batch to another worker when the job's lease runs out, and
+    # the database stays up. Measured on 15/10 inside a worker: a batch of 24 Usa500 M5 runs over
+    # 2015–2025 (607 thousand bars) peaked at 3.1 GB; with the batch's writes and the candle
+    # cache's other series, the kernel saw ~3.5 GB. 5 GB is that with room, not an estimate of a
+    # heavier chart: an M1 batch is already cut to six runs (`batching._SMALLER`). `memswap_limit`
+    # equal to the ceiling means no swap at all: a worker that swaps slows the whole VM down
+    # before it is ever killed.
+    deploy:
+      replicas: ${TRADEFORGE_WORKERS:-1}
+      resources:
+        limits:
+          cpus: '1'
+          memory: ${TRADEFORGE_WORKER_MEMORY:-5g}
+    memswap_limit: ${TRADEFORGE_WORKER_MEMORY:-5g}
+    # ⚠️ **Long enough for the batch it holds** (16/10, ADR-0036). Told to stop, a worker
+    # finishes its job before it exits (`STOP_WAIT_SECONDS`, 14 min); Docker's default ten
+    # seconds would kill it in the middle. This has to stay above that number
+    # (`tests/test_worker_stop_grace.py`). `docker compose stop -t N` still overrides it.
+    stop_grace_period: 15m
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    image: tradeforge-web
+    ports:
+      - '${WEB_PORT:-5173}:80'
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres-data:

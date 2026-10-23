@@ -2,14 +2,85 @@
 // non-2xx into a typed `ApiError` carrying the parsed `detail` — so a caller (and a test) can
 // branch on the status and read the backend's message instead of a bare rejection.
 
+import type { RankKey } from '../sweep/ranking'
 import type {
   Backtest,
+  BacktestFilters,
+  BacktestsPage,
+  BasketOut,
+  CatalogEntry,
+  CatalogPage,
+  CandlesResponse,
+  Collection,
   CreateBacktestRequest,
+  CreateBasketRequest,
+  CreateCatalogEntry,
+  UpdateCatalogEntry,
+  CreateCollection,
+  CreateStudyRequest,
+  ClusterListItem,
+  ClusterOut,
+  CreateClusterRequest,
+  CreateHoldoutRequest,
+  CreateSweepTemplateRequest,
+  QueueMarket,
+  SweepTemplateListItem,
+  SweepTemplateOut,
+  CreateSweepWalkForwardRequest,
+  CreatedSweepWalkForward,
+  SweepWalkForwardOut,
+  CreateMonteCarloRequest,
+  CreateSlicingRequest,
+  CreateSweepRequest,
+  CreateWalkForwardRequest,
   CreatedBacktest,
+  CreatedBasket,
+  CreatedStudy,
+  CreatedSweep,
+  CreatedWalkForward,
   EquityPoint,
+  KillSwitch,
   Instrument,
+  LiveSessionDetail,
+  LiveSessionsPage,
+  OverlaysResponse,
+  PlanCollectionRequest,
+  PlannedCollection,
+  PreviewStudyRequest,
+  PreviewSweepRequest,
+  SessionEventsPage,
+  Snapshot,
+  StrategiesPage,
+  StrategyFilters,
   StrategyOut,
+  StudyOut,
+  StudyPreview,
+  BestCellOut,
+  SweepPauseOut,
+  BestMapOut,
+  BestMetric,
+  HoldoutOut,
+  MonteCarloOut,
+  SlicingOut,
+  SweepOut,
+  SweepPreview,
+  SweepDashboard,
+  SweepRunsPage,
+  SweepsPage,
+  LaunchWindow,
+  SymbolHistory,
+  SymbolSearch,
+  SymbolBrowse,
+  Markets,
   TradesPage,
+  WalkForwardOut,
+  LiveMarketsOut,
+  LiveSetup,
+  LiveSetupNew,
+  LiveSetupPatch,
+  RestartMarketRequest,
+  SignalRow,
+  YearCut,
 } from './types'
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api'
@@ -24,7 +95,12 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   // Built up rather than spread with `undefined` values: under exactOptionalPropertyTypes a
   // present-but-undefined `body` is not the same as an absent one, and `fetch` wants it absent.
   const init: RequestInit = { method }
@@ -32,9 +108,18 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     init.headers = { 'Content-Type': 'application/json' }
     init.body = JSON.stringify(body)
   }
+  if (signal !== undefined) init.signal = signal
   const response = await fetch(`${BASE_URL}${path}`, init)
   const text = await response.text()
-  const payload: unknown = text ? JSON.parse(text) : null
+  const payload = parsed(text)
+  if (payload === NOT_JSON) {
+    // ⚠️ **The proxy's own page, not the API's answer** (26/09): nginx answers 502 with HTML when
+    // the API is down or restarting, and parsing that surfaced as "Unexpected token '<'".
+    throw new ApiError(
+      response.status,
+      `the server did not answer (HTTP ${String(response.status)}); try again in a moment`,
+    )
+  }
   if (!response.ok) {
     const detail =
       payload && typeof payload === 'object' && 'detail' in payload ? payload.detail : payload
@@ -43,14 +128,331 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return payload as T
 }
 
+const NOT_JSON = Symbol('not JSON')
+
+function parsed(text: string): unknown {
+  if (!text) return null
+  try {
+    return JSON.parse(text) as unknown
+  } catch {
+    return NOT_JSON
+  }
+}
+
+/**
+ * A query string from the fields that are actually set.
+ *
+ * An absent filter and an empty one are different requests: `?symbol=` asks the API for runs whose
+ * symbol is the empty string, which matches nothing, while omitting it asks for every symbol. The
+ * run log's "All" option produces `undefined`, so it has to disappear from the URL entirely.
+ */
+function query(params: Record<string, string | number | undefined>): string {
+  const search = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== '') search.set(key, String(value))
+  }
+  const text = search.toString()
+  return text ? `?${text}` : ''
+}
+
 export const api = {
   listInstruments: (): Promise<Instrument[]> => request('GET', '/instruments'),
+  // The broker's catalogue, served from the snapshot the host agent wrote. Not a round trip to
+  // MetaTrader: the API runs in a Linux container and cannot reach it (ADR-02, ADR-0021).
+  searchSymbols: (q: string, limit?: number): Promise<SymbolSearch> =>
+    request('GET', `/symbols/search${query({ q, limit })}`),
+  // The broker's list by market — the browser's tabs, then one page of a tab (02/10).
+  getMarkets: (): Promise<Markets> => request('GET', '/symbols/markets'),
+  browseSymbols: (params: {
+    market?: string
+    q?: string
+    collected?: boolean
+    offset?: number
+    limit?: number
+  }): Promise<SymbolBrowse> =>
+    request(
+      'GET',
+      `/symbols/browse${query({ ...params, collected: params.collected ? 'true' : undefined })}`,
+    ),
+  // Asks the host agent to photograph the catalogue again. Returns as soon as the job is
+  // queued — it cannot know whether a terminal is even running.
+  syncSymbols: (): Promise<{ job: string }> => request('POST', '/symbols/sync'),
+  // What the last probe found. 404 when nobody has asked yet, which is a different thing from a
+  // symbol with no bars — one invites a click and the other does not.
+  getSymbolHistory: (symbol: string, timeframe: string): Promise<SymbolHistory> =>
+    request('GET', `/symbols/${encodeURIComponent(symbol)}/history${query({ timeframe })}`),
+  // Measuring is slow enough to be a job: a cold H4 took 207 s on this project's own broker.
+  probeSymbol: (symbol: string, timeframe: string): Promise<{ job: string }> =>
+    request('POST', `/symbols/${encodeURIComponent(symbol)}/probe${query({ timeframe })}`),
+  // ⚠️ 202 **with a body**, unlike the sync above. A collection takes minutes and can fail with
+  // a reason worth reading, so the rows it returns are the only handle anybody has on either.
+  // One row per symbol asked for, in the order they were asked for.
+  createCollection: (body: CreateCollection): Promise<Collection[]> =>
+    request('POST', '/collections', body),
+  // A POST that writes nothing: which of these markets a run over this window would find short.
+  planCollections: (body: PlanCollectionRequest): Promise<PlannedCollection[]> =>
+    request('POST', '/collections/plan', body),
+  getCollection: (id: string): Promise<Collection> => request('GET', `/collections/${id}`),
+  listCollections: (): Promise<Collection[]> => request('GET', '/collections'),
+  listBacktests: (filters: BacktestFilters = {}): Promise<BacktestsPage> =>
+    request('GET', `/backtests${query({ ...filters })}`),
+  // The shelf. Separate from `/strategies` because that endpoint answers "what documents exist",
+  // which is a different question from "what is worth running" — and its names are generated
+  // from the documents, so they are not labels anybody chose.
+  listCatalog: (limit?: number, offset?: number): Promise<CatalogPage> =>
+    request('GET', `/catalog${query({ limit, offset })}`),
+  createCatalogEntry: (body: CreateCatalogEntry): Promise<CatalogEntry> =>
+    request('POST', '/catalog', body),
+  // 204, so nothing comes back. The caller refetches the list rather than patching it in place:
+  // a shelf two tabs can write to is a shelf whose local copy is a guess.
+  deleteCatalogEntry: (id: string): Promise<null> => request('DELETE', `/catalog/${id}`),
+  // Only the fields sent change; the server answers with the entry as it now stands.
+  updateCatalogEntry: (id: string, body: UpdateCatalogEntry): Promise<CatalogEntry> =>
+    request('PATCH', `/catalog/${id}`, body),
   createStrategy: (definition: unknown): Promise<StrategyOut> =>
     request('POST', '/strategies', definition),
+  getStrategy: (id: string): Promise<StrategyOut> => request('GET', `/strategies/${id}`),
+  // Editing is a new version, not an update: the API inserts the next version linked to this
+  // parent. It is what makes iterating on a strategy possible at all — `POST` always writes
+  // version 1, and name+version is unique, so re-saving under the same name can only conflict.
+  updateStrategy: (id: string, definition: unknown): Promise<StrategyOut> =>
+    request('PUT', `/strategies/${id}`, definition),
   createBacktest: (payload: CreateBacktestRequest): Promise<CreatedBacktest> =>
     request('POST', '/backtests', payload),
   getBacktest: (id: string): Promise<Backtest> => request('GET', `/backtests/${id}`),
+  /** The same point as a new run that keeps everything — see `Recorded`. */
+  rerunBacktest: (id: string): Promise<CreatedBacktest> =>
+    request('POST', `/backtests/${id}/rerun`),
   getTrades: (id: string, limit = 100, offset = 0): Promise<TradesPage> =>
     request('GET', `/backtests/${id}/trades?limit=${String(limit)}&offset=${String(offset)}`),
   getEquity: (id: string): Promise<EquityPoint[]> => request('GET', `/backtests/${id}/equity`),
+  /** The run cut to whole years `[first, last]` in R. ⚠️ A 422 is an answer, not a failure: its
+   *  `detail` says why this run cannot stand for that window (`year_cut`). */
+  getYearCut: (id: string, first: number, last: number): Promise<YearCut> =>
+    request('GET', `/backtests/${id}/years${query({ first, last })}`),
+  // No window parameters, and that is the endpoint's design rather than an omission: the run
+  // already recorded which candles it read, so the chart cannot be asked for a period the run
+  // did not execute over. A client that assembled the window itself could get it subtly wrong,
+  // and a chart disagreeing with the trades drawn on it says nothing about the disagreement.
+  getCandles: (id: string): Promise<CandlesResponse> => request('GET', `/backtests/${id}/candles`),
+  // Recomputed per request rather than stored: an indicator series is derivable from the candles
+  // and the parameters, and the engine is deterministic, so what comes back is what the run
+  // computed. Separate from `getCandles` because a strategy can legitimately have no curves.
+  getOverlays: (id: string): Promise<OverlaysResponse> =>
+    request('GET', `/backtests/${id}/overlays`),
+  // One snapshot at a time. The list deliberately does not carry them — fifty bars per trade
+  // would be megabytes assembled to be thrown away — so this is the only way to get one.
+  getTradeSnapshot: (id: string, tradeId: number): Promise<Snapshot> =>
+    request('GET', `/backtests/${id}/trades/${String(tradeId)}/snapshot`),
+  // One POST enqueues every run in the basket, or none of them: an unknown symbol is refused
+  // whole rather than leaving half a comparison behind. The 422's `detail` names every bad
+  // symbol at once, which is why `ApiError` carries it.
+  createBasket: (payload: CreateBasketRequest): Promise<CreatedBasket> =>
+    request('POST', '/baskets', payload),
+  getBasket: (id: string): Promise<BasketOut> => request('GET', `/baskets/${id}`),
+  createStudy: (payload: CreateStudyRequest): Promise<CreatedStudy> =>
+    request('POST', '/studies', payload),
+  // A POST that writes nothing: it asks what the grid would produce. Whether a point can run is
+  // the DSL's semantics, which live in Python once — so the screen asks rather than reimplements,
+  // and its answer cannot drift from the one the launch will give.
+  previewStudy: (payload: PreviewStudyRequest): Promise<StudyPreview> =>
+    request('POST', '/studies/preview', payload),
+  getStudy: (id: string): Promise<StudyOut> => request('GET', `/studies/${id}`),
+  createSweep: (payload: CreateSweepRequest): Promise<CreatedSweep> =>
+    request('POST', '/sweeps', payload),
+  // ⚠️ `none` is what the screen polls: a sweep of 22 thousand runs with all of them was 89 MB a
+  // poll (24/09). The runs then come a ranked page at a time.
+  getSweep: (id: string, runs: 'all' | 'none' = 'all'): Promise<SweepOut> =>
+    request('GET', `/sweeps/${id}${runs === 'none' ? '?runs=none' : ''}`),
+  getSweepRuns: (
+    id: string,
+    page: {
+      entryId: string
+      rankBy: RankKey
+      offset: number
+      limit: number
+      allRuns?: boolean
+      showClones?: boolean
+    },
+  ): Promise<SweepRunsPage> =>
+    request(
+      'GET',
+      // ⚠️ Without `all_runs` the server leaves out what is under its chart's ranking floor, and
+      // without `show_clones` every run that made the trades of one launched before it (01/10).
+      `/sweeps/${id}/runs${query({ entry_id: page.entryId, rank_by: page.rankBy, offset: page.offset, limit: page.limit, all_runs: page.allRuns ? 'true' : undefined, show_clones: page.showClones ? 'true' : undefined })}`,
+    ),
+  // A sweep's best points, run again on a window none of them was chosen on (24/09) — itself a
+  // sweep, read back by `getSweep` and compared by `getHoldout`.
+  createHoldout: (sweepId: string, payload: CreateHoldoutRequest): Promise<CreatedSweep> =>
+    request('POST', `/sweeps/${sweepId}/holdout`, payload),
+  getHoldout: (id: string): Promise<HoldoutOut> => request('GET', `/sweeps/${id}/holdout`),
+  // Take a sweep's waiting runs out of the queue, and queue them again from the table (02/10).
+  pauseSweep: (id: string): Promise<SweepPauseOut> => request('POST', `/sweeps/${id}/pause`),
+  resumeSweep: (id: string): Promise<SweepPauseOut> => request('POST', `/sweeps/${id}/resume`),
+  // The best runs by market, setup and chart across every sweep (02/10): the map, then a cell.
+  getBestMap: (metric: BestMetric, everyRun: boolean): Promise<BestMapOut> =>
+    request('GET', `/best/map${query({ metric, every_run: everyRun ? 'true' : undefined })}`),
+  getBestCell: (cell: BestCellQuery): Promise<BestCellOut> =>
+    request(
+      'GET',
+      `/best/cell${query({ symbol: cell.symbol, entry_id: cell.entryId, timeframe: cell.timeframe, metric: cell.metric, every_run: cell.everyRun ? 'true' : undefined })}`,
+    ),
+  // A finished test cut by year or into blocks of trades, and kept (25/09). Runs nothing.
+  createSlicing: (id: string, payload: CreateSlicingRequest): Promise<SlicingOut> =>
+    request('POST', `/sweeps/${id}/slicings`, payload),
+  listSlicings: (id: string): Promise<SlicingOut[]> => request('GET', `/sweeps/${id}/slicings`),
+  // Templates (26/09): a sweep without its markets, and its queue of markets run one at a time.
+  createSweepTemplate: (payload: CreateSweepTemplateRequest): Promise<SweepTemplateOut> =>
+    request('POST', '/sweep-templates', payload),
+  listSweepTemplates: (): Promise<SweepTemplateListItem[]> => request('GET', '/sweep-templates'),
+  getSweepTemplate: (id: string): Promise<SweepTemplateOut> =>
+    request('GET', `/sweep-templates/${id}`),
+  queueMarkets: (id: string, markets: QueueMarket[]): Promise<SweepTemplateOut> =>
+    request('POST', `/sweep-templates/${id}/queue`, { markets }),
+  pauseTemplate: (id: string): Promise<SweepTemplateOut> =>
+    request('POST', `/sweep-templates/${id}/pause`),
+  resumeTemplate: (id: string): Promise<SweepTemplateOut> =>
+    request('POST', `/sweep-templates/${id}/resume`),
+  removeTemplateItem: (id: string, itemId: string): Promise<SweepTemplateOut> =>
+    request('DELETE', `/sweep-templates/${id}/items/${itemId}`),
+  // Finished sweeps of one template read together as one (26/09). Runs nothing.
+  combineSweeps: (sweepIds: string[]): Promise<CreatedSweep> =>
+    request('POST', '/sweeps/combine', { sweep_ids: sweepIds }),
+  // A sweep walked forward fold by fold (25/09): trainings queued at once, tests as they end.
+  createSweepWalkForward: (
+    sweepId: string,
+    payload: CreateSweepWalkForwardRequest,
+  ): Promise<CreatedSweepWalkForward> => request('POST', `/sweeps/${sweepId}/walkforward`, payload),
+  listSweepWalkForwards: (sweepId: string): Promise<SweepWalkForwardOut[]> =>
+    request('GET', `/sweeps/${sweepId}/walkforwards`),
+  getSweepWalkForward: (id: string): Promise<SweepWalkForwardOut> =>
+    request('GET', `/sweep-walkforwards/${id}`),
+  // Several finished runs replayed on one shared account (25/09). Replayed by the worker.
+  createCluster: (payload: CreateClusterRequest): Promise<ClusterOut> =>
+    request('POST', '/clusters', payload),
+  // The API's ceiling (200), paged on the screen: the default 50 hid the oldest (04/10).
+  listClusters: (): Promise<ClusterListItem[]> => request('GET', '/clusters?limit=200'),
+  getCluster: (id: string): Promise<ClusterOut> => request('GET', `/clusters/${id}`),
+  // A finished test's points resampled, and kept (25/09). Runs nothing; takes seconds.
+  createMonteCarlo: (id: string, payload: CreateMonteCarloRequest): Promise<MonteCarloOut> =>
+    request('POST', `/sweeps/${id}/montecarlos`, payload),
+  listMonteCarlos: (id: string): Promise<MonteCarloOut[]> =>
+    request('GET', `/sweeps/${id}/montecarlos`),
+  listSweeps: (page: { limit: number; offset: number }): Promise<SweepsPage> =>
+    request('GET', `/sweeps${query(page)}`),
+  getSweepDashboard: (launched: LaunchWindow): Promise<SweepDashboard> =>
+    request('GET', `/sweeps/dashboard${query({ ...launched })}`),
+  // The same doctrine as `previewStudy`, one axis up: a POST that writes nothing, asked while
+  // the form is still being filled in. ⚠️ It answers three different noes — a combination the
+  // DSL refuses, a market with no candles in the window, and a sweep with nothing to run — and the
+  // screen has to keep them apart, because the fixes are to edit, to collect, and to shrink.
+  // ⚠️ Cancellable: a preview of a large grid is minutes of server CPU, and the server stops
+  // when the question it was asked is withdrawn (26/09).
+  previewSweep: (payload: PreviewSweepRequest, signal?: AbortSignal): Promise<SweepPreview> =>
+    request('POST', '/sweeps/preview', payload, signal),
+  // Takes a study, not a grid: the comparison a walk-forward exists to support only holds if
+  // both halves searched the same parameter space over the same market, and a grid retyped
+  // here could differ by one value while still looking like the same experiment.
+  createWalkForward: (payload: CreateWalkForwardRequest): Promise<CreatedWalkForward> =>
+    request('POST', '/walkforwards', payload),
+  getWalkForward: (id: string): Promise<WalkForwardOut> => request('GET', `/walkforwards/${id}`),
+  // The same `query` helper the run log's filters use: an absent filter and an empty one are
+  // different requests, and that distinction is already written down once.
+  listStrategies: (filters: StrategyFilters = {}): Promise<StrategiesPage> =>
+    request(
+      'GET',
+      `/strategies${query({ ...filters, include_generated: filters.include_generated === true ? 'true' : undefined })}`,
+    ),
+
+  // ⚠️ The list is the one endpoint here that cannot be taken down by Redis — it is pure Postgres
+  // on the server, on purpose, because it is the screen somebody opens when they suspect
+  // something is wrong. The detail below is the one that asks Redis, and answers 503 rather than
+  // guessing at the stop state.
+  listLiveSessions: (status?: string): Promise<LiveSessionsPage> =>
+    // The API's ceiling, paged on screen: its default of 50 hid the older sessions (04/10).
+    request('GET', `/live-sessions${query({ status, limit: 200 })}`),
+  getLiveSession: (id: string): Promise<LiveSessionDetail> =>
+    request('GET', `/live-sessions/${id}`),
+  listSessionEvents: (id: string, limit?: number): Promise<SessionEventsPage> =>
+    request('GET', `/live-sessions/${id}/events${query({ limit })}`),
+  // Asks the session to finish the bar it is on and stop. **It does not close the position** —
+  // exits, cancels and tightening stops pass a stopped session's safeguards by design, and what
+  // stops is the management, not the trade. The screen has to say so beside the button.
+  //
+  // Returns the detail, and `status` will still say `running`: only the session writes
+  // `stopped_at`, when it has actually finished. `stop_requested_at` is what says the ask landed.
+  stopLiveSession: (id: string): Promise<LiveSessionDetail> =>
+    request('POST', `/live-sessions/${id}/stop`),
+
+  getKillSwitch: (): Promise<KillSwitch> => request('GET', '/executor/kill-switch'),
+  // ⚠️ **One-way from here, by decision.** There is no release endpoint and there must not be:
+  // an endpoint that can un-kill is an endpoint a retry can un-kill. Releasing is
+  // `redis-cli DEL executor:kill-switch`, from a shell, by somebody who has looked.
+  engageKillSwitch: (): Promise<KillSwitch> => request('POST', '/executor/kill-switch'),
+
+  // Live Signal (09/10): the setups the live signals follow, their markets and their history.
+  listLiveSetups: (): Promise<LiveSetup[]> => request('GET', '/live-setups'),
+  watchBacktest: (backtestId: string): Promise<LiveSetup> =>
+    request('POST', '/live-setups/from-run', { backtest_id: backtestId }),
+  changeLiveSetup: (id: string, patch: LiveSetupPatch): Promise<LiveSetup> =>
+    request('PATCH', `/live-setups/${id}`, patch),
+  removeLiveSetup: (id: string): Promise<null> => request('DELETE', `/live-setups/${id}`),
+  addLiveMarket: (id: string, instrumentId: string): Promise<LiveSetup> =>
+    request('POST', `/live-setups/${id}/markets`, {
+      instrument_id: instrumentId,
+    }),
+  changeLiveMarket: (id: string, instrumentId: string, active: boolean): Promise<LiveSetup> =>
+    request('PATCH', `/live-setups/${id}/markets/${instrumentId}`, { active }),
+  removeLiveMarket: (id: string, instrumentId: string): Promise<LiveSetup> =>
+    request('DELETE', `/live-setups/${id}/markets/${instrumentId}`),
+  registerLiveSetup: (body: LiveSetupNew): Promise<LiveSetup> =>
+    request('POST', '/live-setups/new', body),
+  editLiveSetup: (id: string, definition: Record<string, unknown>): Promise<LiveSetup> =>
+    request('POST', `/live-setups/${id}/version`, { definition }),
+  listLiveSignals: (id: string): Promise<SignalRow[]> =>
+    request('GET', `/live-setups/${id}/signals?limit=200`),
+  // The same setups by asset, the way the sessions run (ADR-0033): asset → timeframe → setups,
+  // with the supervisor's own word on what runs where.
+  listLiveMarkets: (): Promise<LiveMarketsOut> => request('GET', '/live-markets'),
+  // ⚠️ Asks the supervisor, through Redis, to stop every session of one market and start them
+  // again together: the signals armed there are cancelled on the channel. 503 without Redis.
+  restartMarket: (body: RestartMarketRequest): Promise<{ requested: boolean }> =>
+    request('POST', '/live-markets/restart', body),
+}
+
+/**
+ * The address of a path under the REST API's prefix, for the browser to open itself — a file to
+ * download or a document to read in a new tab, rather than a response for `request` to parse.
+ *
+ * Prefixed from `BASE_URL` for the reason `socketUrl` gives: a link hard-coded to `/api` points at
+ * the wrong host the moment the API is served from anywhere else.
+ */
+export function apiUrl(path: string): string {
+  return `${BASE_URL}${path}`
+}
+
+/**
+ * The `ws://` (or `wss://`) address of a path served under the same prefix as the REST API.
+ *
+ * ⚠️ Derived rather than configured, and derived from `BASE_URL` rather than from the page. The
+ * API prefix is `/api` in dev and in the built image, and an absolute `VITE_API_URL` in anything
+ * else; a socket URL assembled from `window.location` alone would ignore that and connect to the
+ * wrong host the moment the two differ.
+ *
+ * ⚠️ `wss` under `https`, always. A browser refuses a plain `ws://` from a secure page, and the
+ * failure arrives as a closed socket with no reason attached.
+ */
+export function socketUrl(path: string): string {
+  const url = new URL(`${BASE_URL}${path}`, window.location.href)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  return url.toString()
+}
+
+/** The cell `getBestCell` asks for. */
+export interface BestCellQuery {
+  symbol: string
+  entryId: string
+  timeframe: string
+  metric: BestMetric
+  everyRun: boolean
 }

@@ -4,15 +4,12 @@
     "codebase. Checked by scripts/check_js_audit.py in the `Dependency audit` job; see ADR-0017.",
     "An entry is a written, dated argument, not a mute button: the build fails on any advisory",
     "with no entry, on any entry past its review_by, and on any entry that matches nothing in",
-    "today's report. Every field is required, and unknown fields are refused."
+    "today's report. Every field is required, and unknown fields are refused.",
+    "Empty is the good state, and it is not the same as absent: the file has to exist and parse,",
+    "and an empty list means every advisory in today's report has to be zero. GHSA-qwww-vcr4-c8h2",
+    "(react-router CSRF in RSC Mode) lived here from 27/07 to 24/08/2026 and was removed when",
+    "react-router 7.18.2 fixed it on the 7.x line - the entry then matched nothing, and the gate",
+    "failed on that, which is exactly what it is for. See ADR-0017 and docs/adr history."
   ],
-  "allow": [
-    {
-      "id": "GHSA-qwww-vcr4-c8h2",
-      "package": "react-router",
-      "reason": "CSRF in react-router's RSC Mode (CWE-352, 'action execution before 400 response'). The 'action' is a server-side react-router action, and apps/web has no server: it is a static SPA built by `vite build`, and its only router usage is declarative (BrowserRouter/Routes/Route/Link/NavLink/useNavigate/useParams/MemoryRouter). There is no createBrowserRouter, no data router, no loader or action, and zero @react-router/* packages in the lockfile — RSC Mode requires @react-router/dev plus a server runtime, neither of which is installed. There is also no fixed release on the 7.x line: 7.18.1 is the latest, the vulnerable range runs to 8.2.0, and npm's only offer is a downgrade to 7.11.0. Revisit when react-router 8.3 is reachable, or sooner if apps/web ever adopts a data router or a server runtime.",
-      "decided_by": "Guilherme Farias Cascapera",
-      "review_by": "2026-10-27"
-    }
-  ]
+  "allow": []
 }

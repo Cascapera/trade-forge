@@ -17,8 +17,50 @@
     "build": "npm run build --workspaces --if-present",
     "dev": "npm run dev -w @tradeforge/web"
   },
+  "devDependenciesComment": [
+    "`vitest` and `@vitest/coverage-v8` are here, at the root, and the root runs no tests of",
+    "its own. They are hoisted on purpose, and it took two rounds to land:",
+    "1. `@testing-library/jest-dom` 7.0.1 declares vitest as an OPTIONAL peer and ships a",
+    "   `dist/vitest.mjs` that imports it at runtime. npm hoists jest-dom to the root but nests",
+    "   vitest under each workspace, because `@vitest/coverage-v8` peers on an EXACT vitest",
+    "   version — so the import resolved from the root, found nothing, and all 51 suites failed",
+    "   to load with `Cannot find package 'vitest'`.",
+    "2. Declaring vitest alone moved the failure one level down: the root vitest then could not",
+    "   find `@vitest/coverage-v8`, still nested. A shared runner needs its plugin beside it.",
+    "Keep both in step with the workspaces. The day jest-dom stops shipping that entry point,",
+    "both can go."
+  ],
   "devDependencies": {
-    "@commitlint/cli": "^21.2.1",
-    "@commitlint/config-conventional": "^21.2.0"
+    "@commitlint/cli": "^21.2.2",
+    "@commitlint/config-conventional": "^21.2.0",
+    "@vitest/coverage-v8": "^5.0.0",
+    "vitest": "^5.0.0"
+  },
+  "typescriptComment": [
+    "⚠️ TypeScript is held at 6.0.x on purpose, behind the latest. `typescript-eslint` peers on",
+    "`typescript >=4.8.4 <6.1.0` in every version it has shipped so far, and this repo ran 7.0.2",
+    "against it for a while — which npm never complained about, because `npm ci` installs the",
+    "recorded tree without recomputing peers. The lockfile hid an unsupported pair, and the only",
+    "way to find out was to change a range and watch npm refuse to resolve.",
+    "Raise it when typescript-eslint declares support, and bump both in the same change."
+  ],
+  "overridesComment": [
+    "Transitive pins held ahead of what our direct dependencies ask for. Every key under",
+    "`overrides` is read by npm as a package name, so this note lives outside it.",
+    "Each entry is an advisory whose fix exists but is out of reach: npm will not raise a",
+    "transitive dependency on its own, so `npm audit fix` reports nothing to do while the",
+    "audit job keeps failing. Prefer an entry here over one in .github/audit-allowlist.json",
+    "whenever a real patch exists — an allowlist entry argues a vulnerability away, this one",
+    "closes it. Drop an entry once every dependent asks for the fixed version by itself.",
+    "js-yaml: GHSA-5p4m-2wfm-xmqj, quadratic CPU on !!omap. Reached only through",
+    "@commitlint/cli and json-schema-to-typescript, both dev-only and build-time. 4.3.1 is",
+    "the patch on the 4.x line (npm tag v4-legacy); both dependents ask for ^4.",
+    "nanoid: GHSA-2v37-7h3g-55p8, custom generators loop forever at size zero. Reached only",
+    "through vite -> postcss, dev-only and build-time. 3.3.18 is the patch on the 3.x line",
+    "(npm tag legacy), same bin and engines as 3.3.16."
+  ],
+  "overrides": {
+    "js-yaml": "^4.3.1",
+    "nanoid": "^3.3.18"
   }
 }

@@ -14,6 +14,7 @@ function cell(over: Partial<BestMapCell>): BestMapCell {
     unbounded: false,
     run_id: 'r1',
     sweep_id: 's1',
+    engine_version: '0.7.0',
     ranked: 10,
     ...over,
   }

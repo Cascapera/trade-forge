@@ -30,6 +30,7 @@ const MAP: BestMapOut = {
       unbounded: false,
       run_id: 'r1',
       sweep_id: 's1',
+      engine_version: '0.5.0',
       ranked: 120,
     },
     {
@@ -42,6 +43,7 @@ const MAP: BestMapOut = {
       unbounded: false,
       run_id: 'r2',
       sweep_id: 's1',
+      engine_version: '0.6.0',
       ranked: 80,
     },
   ],

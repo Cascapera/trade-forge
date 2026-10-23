@@ -3043,6 +3043,9 @@ class BestMapCell(BaseModel):
     """A drawdown ratio with a gain and no drawdown: above every finite one, with no number."""
     run_id: uuid.UUID
     sweep_id: uuid.UUID | None
+    engine_version: str
+    """The engine the best run was measured on (23/10, #476's fallout): runs of every engine rank
+    side by side, so a cell may be won by a run from an older one."""
     ranked: int
     """How many runs of the cell were ranked — the draws its best is the best of."""
 
@@ -3052,7 +3055,8 @@ class BestMapOut(BaseModel):
     every_run: bool
     """Every run with a value, not only those over the chart's ranking floor."""
     engine_version: str
-    """The engine whose runs were ranked: runs of an older one are left out."""
+    """The engine the API is running (23/10): runs of every engine rank now, so this is only the
+    current reference; each cell carries its own `engine_version` with the run that won it."""
     cells: list[BestMapCell]
     as_of: dt.datetime | None = None
     """When the map was computed (05/10): it is served from the last one kept, computed again

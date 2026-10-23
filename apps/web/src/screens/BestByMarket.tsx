@@ -76,8 +76,9 @@ export function BestByMarket(): React.JSX.Element {
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold text-slate-100">Best by market</h1>
         <p className="text-sm text-slate-400">
-          Each setup&apos;s best run on each market and chart, across every sweep on engine{' '}
-          {map.data?.engine_version ?? '…'}. In sample and not validated: a cell is the best of the
+          Each setup&apos;s best run on each market and chart, across every sweep and every engine
+          — the one the API runs now is {map.data?.engine_version ?? '…'}, and each cell carries
+          the engine of the run that won it. In sample and not validated: a cell is the best of the
           runs it ranked, and part of being best is the luck of the search.
           {map.data?.as_of != null && map.data.refreshing !== true && (
             <span className="text-slate-500"> Updated {clock(map.data.as_of)}.</span>
@@ -309,8 +310,8 @@ function Cell({
         type="button"
         onClick={onChoose}
         aria-pressed={selected}
-        aria-label={`${cell.symbol}, ${column.entryName} ${column.timeframe}: ${value}, best of ${String(cell.ranked)} runs`}
-        title={`${column.entryName} ${column.timeframe} on ${cell.symbol}: ${value} — best of ${count(cell.ranked)} runs`}
+        aria-label={`${cell.symbol}, ${column.entryName} ${column.timeframe}: ${value}, best of ${String(cell.ranked)} runs on engine ${cell.engine_version}`}
+        title={`${column.entryName} ${column.timeframe} on ${cell.symbol}: ${value} — best of ${count(cell.ranked)} runs, engine ${cell.engine_version}`}
         className={`block w-full min-w-16 rounded px-1 py-1.5 text-center tabular-nums text-slate-100 hover:ring-2 hover:ring-slate-300 ${selected ? 'ring-2 ring-sky-400' : ''}`}
         style={{ backgroundColor: fillOf(cell, metric, extent) }}
       >

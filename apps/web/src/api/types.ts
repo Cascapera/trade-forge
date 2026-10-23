@@ -2024,6 +2024,9 @@ export interface BestMapCell {
   unbounded: boolean
   run_id: string
   sweep_id: string | null
+  /** The engine the best run was measured on (23/10): runs of every engine rank side by side,
+   *  so a cell may be won by a run from an older one. */
+  engine_version: string
   /** How many runs of the cell were ranked — the draws its best is the best of. */
   ranked: number
 }

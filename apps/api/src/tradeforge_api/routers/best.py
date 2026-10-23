@@ -4,14 +4,18 @@ His ask: a page that shows, market by market, which setup did best on which char
 is not a wall of numbers, to choose ideas to validate later. `GET /best/map` is the overview, one
 cell per (market, setup, chart); `GET /best/cell` is one cell's top runs.
 
-⚠️ **What is ranked.** Finished runs of ordinary sweeps on the current engine, over their chart's
-ranking floor (`RANK_MIN_TRADES`) unless every run is asked for. Left out:
+⚠️ **What is ranked.** Finished runs of ordinary sweeps on every engine (23/10, his call), over
+their chart's ranking floor (`RANK_MIN_TRADES`) unless every run is asked for. Left out:
 
 * **reserved-window tests** (`Sweep.holdout_of`): they are the validation, and ranking them beside
   in-sample runs would mix "the best found" with "what held up";
 * **a walk-forward's training sweeps** (`SweepWalkForwardFold.train_sweep_id`): the same points
-  again over parts of a window, which would count one result several times;
-* **runs of an older engine**: their numbers came from other rules (`ENGINE_VERSION`).
+  again over parts of a window, which would count one result several times.
+
+Runs of older engines rank beside the current one so an engine bump that only changes a payload
+shape (0.6.0 → 0.7.0 in #476) does not wipe seven million runs from the map on the day it merges.
+A cell may therefore be won by a run whose engine measured trades differently; metric still decides,
+and each cell carries the `engine_version` of its run.
 
 Nothing here validates anything: each point carries what its reserved-window tests found, or that
 none was run.
@@ -101,9 +105,13 @@ def _ranked_runs(*, every_run: bool) -> list[ColumnElement[bool]]:
     trained = select(SweepWalkForwardFold.train_sweep_id).where(
         SweepWalkForwardFold.train_sweep_id.is_not(None)
     )
+    # Runs of every engine rank side by side (23/10, his call): an engine bump that only changed
+    # the signal snapshot shape (0.6.0 → 0.7.0, #476) would otherwise wipe seven million runs from
+    # the map on the day it merged, with no number of them really changing. Trade-off: a cell can
+    # be won by a run whose engine really did measure trades differently. Metric still decides,
+    # so a better new run wins its cell; and `engine_version` on each cell tells which was used.
     return [
         Backtest.status == BacktestStatus.DONE,
-        Backtest.engine_version == ENGINE_VERSION,
         Sweep.holdout_of.is_(None),
         Sweep.holdout_rule.is_(None),
         Sweep.id.not_in(trained),
@@ -208,6 +216,7 @@ def compute_best_map(session: Session, metric: BestMetric, *, every_run: bool) -
             Backtest.sweep_id,
             Backtest.instrument_id,
             Backtest.timeframe,
+            Backtest.engine_version,
             own.c.entry_id,
             value.label("value"),
             unbounded.label("unbounded"),
@@ -257,6 +266,7 @@ def compute_best_map(session: Session, metric: BestMetric, *, every_run: bool) -
                 unbounded=bool(row.unbounded),
                 run_id=row.run_id,
                 sweep_id=row.sweep_id,
+                engine_version=row.engine_version,
                 ranked=row.ranked,
             )
             for row in rows

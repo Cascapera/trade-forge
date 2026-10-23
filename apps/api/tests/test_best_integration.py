@@ -96,6 +96,7 @@ class TestTheMap:
         assert cell["sweep_id"] == sweep_id
         assert Decimal(cell["value"]) == Decimal(30)
         assert cell["ranked"] == 3
+        assert cell["engine_version"] == body["engine_version"]
         # No broker list in this database: the asset class names the market.
         assert cell["market"] == "Forex"
 
@@ -189,15 +190,10 @@ class TestTheMap:
         assert best(every_run=False) == run_of[5]
         assert best(every_run=True) == run_of[7]
 
-    def test_tests_training_sweeps_and_older_engines_are_not_ranked(
+    def test_tests_and_training_sweeps_are_not_ranked(
         self, client: Any, session_factory: Callable[[], Session]
     ) -> None:
         entry, sweep_id, run_of = swept(client, session_factory, {5: "10", 7: "20", 9: "30"})
-        with session_factory() as session:
-            old = session.get(Backtest, uuid.UUID(run_of[9]))
-            assert old is not None
-            old.engine_version = "0.0.1"
-            session.commit()
         test = client.post(
             f"/sweeps/{sweep_id}/holdout",
             json={
@@ -215,8 +211,29 @@ class TestTheMap:
         cells = client.get("/best/map", params={"metric": "net_r"}).json()["cells"]
 
         (cell,) = [one for one in cells if one["entry_id"] == entry]
-        assert cell["run_id"] == run_of[7]
-        assert cell["ranked"] == 2
+        assert cell["run_id"] == run_of[9]
+        assert cell["ranked"] == 3
+
+    def test_older_engine_runs_still_rank(
+        self, client: Any, session_factory: Callable[[], Session]
+    ) -> None:
+        """23/10, his call: an engine bump that only changed a payload shape (0.6.0 → 0.7.0, #476)
+        would wipe seven million runs from the map on the day it merged. Trade-off: a cell may be
+        won by a run from an older engine; metric still decides, so a better new run wins its cell,
+        and each cell carries the engine of its winning run."""
+        entry, _sweep, run_of = swept(client, session_factory, {5: "10", 7: "20", 9: "30"})
+        with session_factory() as session:
+            old = session.get(Backtest, uuid.UUID(run_of[9]))
+            assert old is not None
+            old.engine_version = "0.0.1"
+            session.commit()
+
+        cells = client.get("/best/map", params={"metric": "net_r"}).json()["cells"]
+
+        (cell,) = [one for one in cells if one["entry_id"] == entry]
+        assert cell["run_id"] == run_of[9]
+        assert cell["ranked"] == 3
+        assert cell["engine_version"] == "0.0.1"
 
     def test_the_brokers_tree_names_the_market(
         self, client: Any, session_factory: Callable[[], Session]
